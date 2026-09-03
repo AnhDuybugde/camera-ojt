@@ -1,0 +1,29 @@
+camera:
+  source: 0
+  frame_width: 1280
+  frame_height: 720
+  fps: 25
+
+detection:
+  model_path: models/yolov8n.pt
+  confidence_threshold: 0.35
+  person_class_id: 0
+
+tracking:
+  max_lost_frames: 30
+  min_track_length: 5
+  iou_threshold: 0.3
+
+analytics:
+  density_grid:
+    rows: 4
+    cols: 6
+  zones:
+    - name: entrance
+      points: []
+    - name: room_center
+      points: []
+
+output:
+  save_video: true
+  output_dir: output

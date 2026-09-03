@@ -1,0 +1,30 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environment
+.env
+.env.*
+
+# Large/local artifacts
+data/raw/*
+data/processed/*
+data/samples/*
+models/*
+output/*
+
+# Keep folder structure
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/samples/.gitkeep
+!models/.gitkeep
+!output/.gitkeep
+
+# IDE/OS
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
