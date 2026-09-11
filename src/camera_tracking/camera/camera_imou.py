@@ -35,23 +35,28 @@ if not cap1.isOpened():
 if not cap2.isOpened():
     print("Không mở được camera mắt 2")
 
-while True:
-    ret1, frame1 = cap1.read()
-    ret2, frame2 = cap2.read()
+print("Đang chạy camera. Nhấn 'q' hoặc ESC để thoát.")
 
-    if ret1:
-        # Sau này xử lý Computer Vision ở đây
-        # result = model(frame1)
-        cv2.imshow("IMOU - Camera 1", frame1)
+try:
+    while True:
+        ret1, frame1 = cap1.read()
+        ret2, frame2 = cap2.read()
 
-    if ret2:
-        # Sau này xử lý Computer Vision ở đây
-        cv2.imshow("IMOU - Camera 2", frame2)
+        if ret1:
+            # Sau này xử lý Computer Vision ở đây
+            # result = model(frame1)
+            cv2.imshow("IMOU - Camera 1", frame1)
 
-    # Nhấn q để thoát
-    if cv2.waitKey(1) & 0xFF == ord("q"):
-        break
+        if ret2:
+            # Sau này xử lý Computer Vision ở đây
+            cv2.imshow("IMOU - Camera 2", frame2)
 
-cap1.release()
-cap2.release()
-cv2.destroyAllWindows()
+        # Nhấn 'q' hoặc ESC để thoát
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q") or key == 27:
+            print("Đã nhấn phím thoát. Đang đóng camera...")
+            break
+finally:
+    cap1.release()
+    cap2.release()
+    cv2.destroyAllWindows()

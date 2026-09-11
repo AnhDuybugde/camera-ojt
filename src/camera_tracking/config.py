@@ -64,6 +64,27 @@ class CountingLineConfig(StrictModel):
     )
 
 
+class SeatZoneConfig(StrictModel):
+    seat_id: str
+    name: str = ""
+    polygon: list[Point]
+    channel: str = "A"
+
+
+class CorridorZoneConfig(StrictModel):
+    hallway: list[Point] = Field(default_factory=list)
+    exit_door: list[Point] = Field(default_factory=list)
+
+
+class WorkstateConfig(StrictModel):
+    leave_grace_s: float = Field(default=10.0, ge=0)
+    corridor_match_window_s: float = Field(default=300.0, ge=0)
+    restroom_return_window_s: float = Field(default=900.0, ge=0)
+    similarity_threshold: float = Field(default=0.55, ge=0, le=1)
+    seats: list[SeatZoneConfig] = Field(default_factory=list)
+    corridor: CorridorZoneConfig = Field(default_factory=CorridorZoneConfig)
+
+
 class AnalyticsConfig(StrictModel):
     floor_width_m: float = Field(gt=0)
     floor_height_m: float = Field(gt=0)
@@ -89,6 +110,7 @@ class AppConfig(StrictModel):
     tracking: TrackingConfig = Field(default_factory=TrackingConfig)
     analytics: AnalyticsConfig
     output: OutputConfig = Field(default_factory=OutputConfig)
+    workstate: WorkstateConfig = Field(default_factory=WorkstateConfig)
 
 
 def load_config(path: str | Path) -> AppConfig:

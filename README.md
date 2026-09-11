@@ -45,6 +45,33 @@ Video mau:
 python scripts\run_pipeline.py --source data\raw\room.mp4 --max-frames 300
 ```
 
+## Chay MVP workstate 2 camera (1 nguoi/ghe)
+
+Logic: moi ghe chi giu 1 nguoi (box lon nhat trong ROI). Channel B chi xet
+nguoi trong vung hallway/exit, toi da 3 nguoi lon nhat, bo box nho hon
+`--min-area` de giam nhieu.
+
+Camera IMOU that (lay RTSP tu `.env`):
+
+```powershell
+python scripts\run_workstate.py --config config\default.yaml --display
+```
+
+Chay voi video/file rieng:
+
+```powershell
+python scripts\run_workstate.py --source-a 0 --source-b data\samples\hallway.mp4 --display
+python scripts\run_workstate.py --source-a data\raw\room.mp4 --source-b data\raw\hallway.mp4 --max-frames 500
+```
+
+Loc manh hon neu van nhieu box rac:
+
+```powershell
+python scripts\run_workstate.py --source-a 0 --source-b data\samples\hallway.mp4 --min-area 5000 --max-persons-b 2 --display
+```
+
+Event log: `output\workstate_events.jsonl`. Nhan `q` hoac ESC de thoat.
+
 Nhan `q` de dong cua so khi dung `--display`. Ket qua mac dinh nam trong `output/`.
 Lan chay dau, Ultralytics se tai `yolo11n.pt` khoang 5.4 MB; file weights duoc Git bo qua.
 

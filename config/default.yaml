@@ -9,7 +9,7 @@ camera:
 detection:
   # Ultralytics downloads this small model on first use.
   model_path: yolo11n.pt
-  confidence_threshold: 0.35
+  confidence_threshold: 0.5
   person_class_id: 0
   image_size: 640
   device: cpu
@@ -56,3 +56,23 @@ output:
   output_dir: output
   video_filename: annotated.mp4
   report_filename: report.json
+
+# MVP trạng thái nhân viên xuyên 2 camera (tọa độ pixel ảnh 1280x720).
+# Hãy chỉnh polygon cho khớp góc camera thực tế của bạn.
+workstate:
+  leave_grace_s: 10.0
+  corridor_match_window_s: 300.0
+  restroom_return_window_s: 900.0
+  similarity_threshold: 0.55
+  seats:
+    - seat_id: seat_01
+      name: "Bàn 1"
+      channel: A
+      polygon: [[400, 300], [640, 300], [640, 600], [400, 600]]
+    - seat_id: seat_02
+      name: "Bàn 2"
+      channel: A
+      polygon: [[680, 300], [920, 300], [920, 600], [680, 600]]
+  corridor:
+    hallway: [[100, 200], [1180, 200], [1180, 620], [100, 620]]
+    exit_door: [[950, 200], [1180, 200], [1180, 400], [950, 400]]
