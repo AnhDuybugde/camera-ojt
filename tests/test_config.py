@@ -10,4 +10,6 @@ class ConfigTest(TestCase):
 
         self.assertEqual(config.camera.source, 0)
         self.assertEqual(config.detection.model_path, "yolo11n.pt")
+        self.assertEqual(config.detection.confidence_threshold, 0.25)
+        self.assertEqual(config.detection.image_size, 960)
         self.assertEqual(len(config.analytics.calibration.image_points), 4)

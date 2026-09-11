@@ -63,28 +63,37 @@ class YoloPersonDetector:
         return self._model
 
     def detect(self, image: np.ndarray) -> list[Detection]:
+        return self.detect_batch([image])[0]
+
+    def detect_batch(self, images: list[np.ndarray]) -> list[list[Detection]]:
+        if not images:
+            return []
         results = self._load_model().predict(
-            source=image,
+            source=images,
             classes=[self.person_class_id],
             conf=self.confidence,
             imgsz=self.image_size,
             device=self.device,
+            half=self.device.startswith("cuda"),
             verbose=False,
         )
+        return [self._convert_result(result) for result in results]
+
+    @staticmethod
+    def _convert_result(result: Any) -> list[Detection]:
         detections: list[Detection] = []
-        for result in results:
-            if result.boxes is None:
-                continue
-            for xyxy, score, class_id in zip(
-                result.boxes.xyxy.cpu().numpy(),
-                result.boxes.conf.cpu().numpy(),
-                result.boxes.cls.cpu().numpy(),
-            ):
-                detections.append(
-                    Detection(
-                        bbox=BoundingBox(*(float(value) for value in xyxy)),
-                        confidence=float(score),
-                        class_id=int(class_id),
-                    )
+        if result.boxes is None:
+            return detections
+        for xyxy, score, class_id in zip(
+            result.boxes.xyxy.cpu().numpy(),
+            result.boxes.conf.cpu().numpy(),
+            result.boxes.cls.cpu().numpy(),
+        ):
+            detections.append(
+                Detection(
+                    bbox=BoundingBox(*(float(value) for value in xyxy)),
+                    confidence=float(score),
+                    class_id=int(class_id),
                 )
+            )
         return detections

@@ -9,9 +9,10 @@ camera:
 detection:
   # auto = cuda neu co GPU, khong thi mps, khong thi cpu.
   model_path: yolo11n.pt
-  confidence_threshold: 0.5
+  # Tuned on the IMOU office view: keeps partially occluded seated people.
+  confidence_threshold: 0.25
   person_class_id: 0
-  image_size: 640
+  image_size: 960
   device: auto
 
 tracking:
