@@ -50,6 +50,7 @@ from camera_tracking.workstate import (
     SeatZone,
     WorkStateConfig,
     WorkStateEngine,
+    select_seat_occupant,
 )
 
 reconfigure_stdout = getattr(sys.stdout, "reconfigure", None)
@@ -206,6 +207,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=Path("config/default.yaml"))
     parser.add_argument("--source-a", default=None, help="Override camera A.")
     parser.add_argument("--source-b", default=None, help="Override camera B.")
+    parser.add_argument(
+        "--model",
+        help="Override YOLO weights from config, for example yolo26s.pt.",
+    )
+    parser.add_argument(
+        "--imgsz",
+        type=int,
+        help="Override YOLO inference image size from config.",
+    )
     parser.add_argument("--channel-a", type=int, default=1, help="Kenh IMOU cho cam A.")
     parser.add_argument("--channel-b", type=int, default=2, help="Kenh IMOU cho cam B.")
     parser.add_argument(
@@ -310,8 +320,11 @@ def main() -> None:
               "Vi du: --source-b data/samples/hallway.mp4")
         raise SystemExit(2)
     device = resolve_device(args.device or config.detection.device)
+    model_path = args.model or config.detection.model_path
+    image_size = args.imgsz or config.detection.image_size
     print(
-        f"Device: {device} | Camera A: {source_label(source_a)} | "
+        f"Device: {device} | Model: {model_path} @ {image_size}px | "
+        f"Camera A: {source_label(source_a)} | "
         f"Camera B: {source_label(source_b)}"
     )
 
@@ -332,11 +345,11 @@ def main() -> None:
         print("Cảnh báo: chưa cấu hình ghế nào, dùng seat_01 mặc định (không có ROI).")
 
     detector = YoloPersonDetector(
-        model_path=config.detection.model_path,
+        model_path=model_path,
         # ByteTrack uses weak detections to recover an existing person through occlusion.
         confidence=min(0.10, config.detection.confidence_threshold),
         person_class_id=config.detection.person_class_id,
-        image_size=config.detection.image_size,
+        image_size=image_size,
         device=device,
     )
     effective_fps = max(1, round(config.camera.fps / config.camera.process_every_n_frames))
@@ -401,6 +414,7 @@ def main() -> None:
     window_a_shown = False
     window_b_shown = False
     reported_ambiguous_seats: set[str] = set()
+    seat_occupant_ids: dict[str, int] = {}
 
     def log_events(events) -> None:
         for event in events:
@@ -468,21 +482,24 @@ def main() -> None:
                 best_per_seat = {}
                 ambiguous_seats: set[str] = set()
                 for seat in seats:
-                    inside = [t for t in confirmed_a if seat.contains(t.bbox)]
-                    if not inside:
-                        presence[seat.seat_id] = False
-                        continue
-                    if len(inside) > 1:
+                    best, ambiguous = select_seat_occupant(
+                        seat,
+                        confirmed_a,
+                        preferred_track_id=seat_occupant_ids.get(seat.seat_id),
+                    )
+                    if ambiguous:
                         ambiguous_seats.add(seat.seat_id)
                         if process_frame and seat.seat_id not in reported_ambiguous_seats:
                             print(
-                                f"ROI {seat.seat_id} chua {len(inside)} nguoi; "
+                                f"ROI {seat.seat_id} co hai ung vien gan ngang nhau; "
                                 "tam dung cap nhat trang thai ROI nay."
                             )
                             reported_ambiguous_seats.add(seat.seat_id)
                         continue
-                    # Giới hạn 1 người/ghế: lấy box lớn nhất.
-                    best = max(inside, key=lambda t: t.bbox.area)
+                    if best is None:
+                        presence[seat.seat_id] = False
+                        continue
+                    seat_occupant_ids[seat.seat_id] = best.track_id
                     best_per_seat[seat.seat_id] = best
                     presence[seat.seat_id] = True
                     if process_frame:

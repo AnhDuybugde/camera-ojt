@@ -1,14 +1,14 @@
 # Camera Tracking
 
 Pipeline Python theo doi luu luong nguoi, mat do va huong di chuyen trong phong tu
-camera gan tren tuong. He thong dung YOLO11n tren CPU va chieu diem chan cua moi nguoi
+camera gan tren tuong. He thong dung YOLO26s tren device tu dong va chieu diem chan cua moi nguoi
 tu anh camera xuong mat san bang homography.
 
 ## Sau stage
 
 1. Foundation: config co validation, domain models va cac interface tach roi.
 2. Camera input: webcam, video file hoac RTSP qua OpenCV.
-3. Detection: YOLO11n, chi lay class `person`, lazy-load model.
+3. Detection: YOLO26s, chi lay class `person`, lazy-load model.
 4. Tracking: gan ID bang IoU tracker cho camera co dinh.
 5. Floor analytics: trajectory theo met, occupancy, zone, density, heatmap, movement
    vector va dem vao/ra qua line.
@@ -63,13 +63,14 @@ Tuy chinh khi can:
 ```powershell
 python scripts\run_workstate.py --source-a 0 --source-b data\samples\hallway.mp4 --display
 python scripts\run_workstate.py --device cpu --display
+python scripts\run_workstate.py --model yolo11n.pt --imgsz 960 --display
 python scripts\run_workstate.py --min-area 5000 --max-persons-b 2 --display
 ```
 
 Event log: `output\workstate_events.jsonl`. Nhan `q` hoac ESC de thoat.
 
 Nhan `q` de dong cua so khi dung `--display`. Ket qua mac dinh nam trong `output/`.
-Lan chay dau, Ultralytics se tai `yolo11n.pt` khoang 5.4 MB; file weights duoc Git bo qua.
+Lan chay dau, Ultralytics se tai `yolo26s.pt` khoang 20 MB; file weights duoc Git bo qua.
 
 Neu OpenCV bao `The function is not implemented` tai `cvShowImage`, kiem tra va loai bo
 cac ban OpenCV cai chong nhau:

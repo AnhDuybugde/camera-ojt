@@ -8,11 +8,12 @@ camera:
 
 detection:
   # auto = cuda neu co GPU, khong thi mps, khong thi cpu.
-  model_path: yolo11n.pt
+  # YOLO26s @ 800px was benchmarked on RTX 3050 6 GB for this two-camera view.
+  model_path: yolo26s.pt
   # Tuned on the IMOU office view: keeps partially occluded seated people.
   confidence_threshold: 0.25
   person_class_id: 0
-  image_size: 960
+  image_size: 800
   device: auto
 
 tracking:

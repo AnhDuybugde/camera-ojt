@@ -4,15 +4,17 @@ from unittest import TestCase
 
 import numpy as np
 
-from camera_tracking.domain import BoundingBox
+from camera_tracking.domain import BoundingBox, Track
 from camera_tracking.workstate import (
     HistogramEmbedding,
+    SeatZone,
     WorkState,
     WorkStateConfig,
     WorkStateEngine,
     bbox_center_in_polygon,
     cosine_similarity,
     point_in_polygon,
+    select_seat_occupant,
 )
 
 
@@ -32,6 +34,30 @@ class RoiTest(TestCase):
         square = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
         self.assertTrue(bbox_center_in_polygon(BoundingBox(4, 4, 6, 6), square))
         self.assertFalse(bbox_center_in_polygon(BoundingBox(20, 20, 30, 30), square))
+
+    def test_selects_person_closest_to_seat_edge(self) -> None:
+        seat = SeatZone("seat_01", "Seat 1", [(0, 0), (100, 0), (100, 100), (0, 100)])
+        rear = Track(10, BoundingBox(35, 10, 65, 45), 0.9, 1, 2, True)
+        occupant = Track(20, BoundingBox(35, 35, 65, 90), 0.9, 1, 2, True)
+
+        selected, ambiguous = select_seat_occupant(seat, [rear, occupant])
+
+        self.assertFalse(ambiguous)
+        self.assertEqual(selected, occupant)
+
+    def test_keeps_preferred_person_when_multiple_are_in_roi(self) -> None:
+        seat = SeatZone("seat_01", "Seat 1", [(0, 0), (100, 0), (100, 100), (0, 100)])
+        preferred = Track(10, BoundingBox(10, 20, 40, 70), 0.9, 1, 2, True)
+        closer = Track(20, BoundingBox(35, 35, 65, 90), 0.9, 1, 2, True)
+
+        selected, ambiguous = select_seat_occupant(
+            seat,
+            [preferred, closer],
+            preferred_track_id=10,
+        )
+
+        self.assertFalse(ambiguous)
+        self.assertEqual(selected, preferred)
 
 
 class ReidTest(TestCase):

@@ -11,6 +11,7 @@ from camera_tracking.workstate.roi import (
     SeatZone,
     bbox_center_in_polygon,
     point_in_polygon,
+    select_seat_occupant,
 )
 from camera_tracking.workstate.states import WorkState
 
@@ -26,4 +27,5 @@ __all__ = [
     "bbox_center_in_polygon",
     "cosine_similarity",
     "point_in_polygon",
+    "select_seat_occupant",
 ]

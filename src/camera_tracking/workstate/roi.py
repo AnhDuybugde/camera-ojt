@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import hypot
 
-from camera_tracking.domain import BoundingBox, Point
+from camera_tracking.domain import BoundingBox, Point, Track
 
 
 def point_in_polygon(point: Point, polygon: list[Point]) -> bool:
@@ -40,6 +41,44 @@ class SeatZone:
 
     def contains(self, bbox: BoundingBox) -> bool:
         return bbox_center_in_polygon(bbox, self.polygon)
+
+
+def select_seat_occupant(
+    seat: SeatZone,
+    tracks: list[Track],
+    *,
+    preferred_track_id: int | None = None,
+    ambiguity_margin: float = 0.12,
+) -> tuple[Track | None, bool]:
+    """Select the track closest to the seat-facing edge of a desk ROI."""
+    candidates = [track for track in tracks if seat.contains(track.bbox)]
+    if not candidates:
+        return None, False
+
+    if preferred_track_id is not None:
+        preferred = next(
+            (track for track in candidates if track.track_id == preferred_track_id),
+            None,
+        )
+        if preferred is not None:
+            return preferred, False
+
+    xs = [point[0] for point in seat.polygon]
+    ys = [point[1] for point in seat.polygon]
+    width = max(1.0, max(xs) - min(xs))
+    height = max(1.0, max(ys) - min(ys))
+    anchor_x = (min(xs) + max(xs)) / 2.0
+    anchor_y = max(ys)
+
+    def distance(track: Track) -> float:
+        foot_x = (track.bbox.x1 + track.bbox.x2) / 2.0
+        foot_y = track.bbox.y2
+        return hypot((foot_x - anchor_x) / width, (foot_y - anchor_y) / height)
+
+    ranked = sorted(candidates, key=distance)
+    if len(ranked) > 1 and distance(ranked[1]) - distance(ranked[0]) < ambiguity_margin:
+        return None, True
+    return ranked[0], False
 
 
 @dataclass(slots=True)

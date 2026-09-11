@@ -3,6 +3,6 @@ numpy>=1.26.0
 pydantic>=2.7.0
 PyYAML>=6.0.1
 python-dotenv>=1.0.0
-ultralytics>=8.3.0
+ultralytics>=8.4.0
 lap>=0.5.12
 pytest>=8.2.0

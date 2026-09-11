@@ -22,10 +22,10 @@ class CameraConfig(StrictModel):
 
 
 class DetectionConfig(StrictModel):
-    model_path: str = "yolo11n.pt"
+    model_path: str = "yolo26s.pt"
     confidence_threshold: float = Field(default=0.35, ge=0, le=1)
     person_class_id: int = 0
-    image_size: int = 640
+    image_size: int = 800
     device: str = "auto"
 
 

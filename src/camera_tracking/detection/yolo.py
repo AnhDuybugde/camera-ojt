@@ -38,10 +38,10 @@ class YoloPersonDetector:
 
     def __init__(
         self,
-        model_path: str = "yolo11n.pt",
+        model_path: str = "yolo26s.pt",
         confidence: float = 0.35,
         person_class_id: int = 0,
-        image_size: int = 640,
+        image_size: int = 800,
         device: str = "auto",
     ) -> None:
         self.model_path = model_path
