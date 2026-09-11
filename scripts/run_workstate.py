@@ -1,8 +1,8 @@
 """Demo MVP: detect + track 2 channel IMOU, Re-ID histogram, state machine.
 
-Channel A (làm việc): YOLO detect -> IoU track -> kiểm tra ROI ghế.
+Channel A (làm việc): YOLO -> ByteTrack -> persistent ID -> kiểm tra ROI ghế.
   Rời ROI > leave_grace_s -> AWAY_SHORT + lưu embedding lúc rời.
-Channel B (hành lang): YOLO detect -> IoU track -> trích embedding + zone.
+Channel B (hành lang): YOLO -> ByteTrack -> persistent ID -> embedding + zone.
   Khớp với AWAY_SHORT trong 5 phút -> RESTROOM, quá timeout -> OUT_OF_OFFICE.
 
 Chạy:
@@ -19,6 +19,8 @@ import json
 import os
 import sys
 import time
+from contextlib import ExitStack
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
@@ -36,7 +38,11 @@ import numpy as np
 from camera_tracking.config import load_config
 from camera_tracking.detection import YoloPersonDetector, resolve_device
 from camera_tracking.domain import BoundingBox
-from camera_tracking.tracking import ByteTrackTracker, StablePersonCount
+from camera_tracking.tracking import (
+    ByteTrackTracker,
+    PersistentIdentityTracker,
+    StablePersonCount,
+)
 from camera_tracking.visualization import draw_person_tracks
 from camera_tracking.workstate import (
     CorridorZones,
@@ -46,10 +52,12 @@ from camera_tracking.workstate import (
     WorkStateEngine,
 )
 
-try:
-    sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
-    pass
+reconfigure_stdout = getattr(sys.stdout, "reconfigure", None)
+if reconfigure_stdout is not None:
+    try:
+        reconfigure_stdout(encoding="utf-8")
+    except (OSError, ValueError) as error:
+        print(f"Khong the dat UTF-8 cho terminal: {error}", file=sys.stderr)
 
 
 def normalize_source(src) -> int | str:
@@ -80,7 +88,7 @@ def open_capture(
     attempts: int = 3,
     retry_delay_s: float = 1.0,
     camera_name: str | None = None,
-) -> "cv2.VideoCapture":
+) -> cv2.VideoCapture:
     source = normalize_source(source)
     if isinstance(source, int):
         # Webcam trên Windows cần DSHOW, không dùng FFMPEG.
@@ -124,6 +132,56 @@ def open_capture(
     return cap
 
 
+@dataclass
+class ResilientCapture:
+    source: int | str
+    name: str
+    capture: cv2.VideoCapture
+    open_attempts: int
+    max_reconnects: int = 3
+    failure_threshold: int = 5
+    failure_count: int = 0
+    reconnect_count: int = 0
+    exhausted: bool = False
+
+    def read(self) -> tuple[bool, np.ndarray | None]:
+        ok, frame = False, None
+        if self.capture.isOpened():
+            try:
+                ok, frame = self.capture.read()
+            except cv2.error:
+                ok, frame = False, None
+        if ok and frame is not None:
+            self.failure_count = 0
+            return True, frame
+
+        self.failure_count += 1
+        if self.failure_count < max(1, self.failure_threshold):
+            return False, None
+        if self.reconnect_count >= max(0, self.max_reconnects):
+            self.exhausted = True
+            return False, None
+
+        self.reconnect_count += 1
+        self.failure_count = 0
+        self.capture.release()
+        print(
+            f"Camera {self.name}: mat stream, dang ket noi lai "
+            f"({self.reconnect_count}/{self.max_reconnects})..."
+        )
+        self.capture = open_capture(
+            self.source,
+            attempts=self.open_attempts,
+            camera_name=self.name,
+        )
+        if not self.capture.isOpened() and self.reconnect_count >= self.max_reconnects:
+            self.exhausted = True
+        return False, None
+
+    def close(self) -> None:
+        self.capture.release()
+
+
 def imou_url(channel: int, subtype: int = 1) -> str | None:
     ip = os.getenv("IMOU_IP", "")
     user = os.getenv("IMOU_USER", "")
@@ -164,6 +222,12 @@ def parse_args() -> argparse.Namespace:
         default=3,
         help="So lan thu mo moi RTSP stream (mac dinh: 3).",
     )
+    parser.add_argument(
+        "--max-reconnects",
+        type=int,
+        default=3,
+        help="So lan ket noi lai neu stream bi mat khi dang chay.",
+    )
     parser.add_argument("--event-log", type=Path, default=Path("output/workstate_events.jsonl"))
     parser.add_argument("--min-area", type=float, default=2000.0,
                         help="Bo box nguoi nho hon nguong (px^2) de giam nhieu.")
@@ -193,12 +257,28 @@ def normalize_frame_size(frame: np.ndarray, width: int, height: int) -> np.ndarr
     return cv2.resize(frame, (width, height), interpolation=interpolation)
 
 
-def draw_zones(frame: np.ndarray, seats: list[SeatZone], corridor=None) -> np.ndarray:
+def draw_zones(
+    frame: np.ndarray,
+    seats: list[SeatZone],
+    corridor=None,
+    ambiguous_seats: set[str] | None = None,
+) -> np.ndarray:
+    ambiguous_seats = ambiguous_seats or set()
     for seat in seats:
+        ambiguous = seat.seat_id in ambiguous_seats
+        color = (0, 0, 255) if ambiguous else (0, 255, 0)
+        label = f"{seat.seat_id}:AMBIGUOUS" if ambiguous else seat.seat_id
         pts = np.asarray(seat.polygon, dtype=np.int32)
-        cv2.polylines(frame, [pts], True, (0, 255, 0), 2)
-        cv2.putText(frame, seat.seat_id, tuple(map(int, seat.polygon[0])),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.polylines(frame, [pts], True, color, 2)
+        cv2.putText(
+            frame,
+            label,
+            tuple(map(int, seat.polygon[0])),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            color,
+            2,
+        )
     if corridor is not None:
         for poly, color, label in [
             (corridor.hallway, (255, 0, 0), "hallway"),
@@ -263,16 +343,29 @@ def main() -> None:
     tracker_a = ByteTrackTracker(
         frame_rate=effective_fps,
         track_buffer=30,
+        match_threshold=0.9,
         min_hits=config.tracking.min_hits,
     )
     tracker_b = ByteTrackTracker(
         frame_rate=effective_fps,
         track_buffer=30,
+        match_threshold=0.9,
         min_hits=config.tracking.min_hits,
+    )
+    embedder = HistogramEmbedding()
+    identity_a = PersistentIdentityTracker(
+        embedder,
+        max_missing_frames=240,
+        max_center_distance_ratio=0.35,
+        match_threshold=0.34,
+    )
+    identity_b = PersistentIdentityTracker(
+        embedder,
+        max_missing_frames=120,
+        max_center_distance_ratio=0.35,
     )
     count_a = StablePersonCount(rise_frames=3, fall_frames=12)
     count_b = StablePersonCount(rise_frames=3, fall_frames=12)
-    embedder = HistogramEmbedding()
 
     cap_a = open_capture(source_a, attempts=args.open_attempts, camera_name="A")
     cap_b = open_capture(source_b, attempts=args.open_attempts, camera_name="B")
@@ -282,9 +375,24 @@ def main() -> None:
         print(f"Không mở được camera B: {source_label(source_b)}")
     if not cap_a.isOpened() and not cap_b.isOpened():
         raise SystemExit(1)
+    stream_a = ResilientCapture(
+        source_a,
+        "A",
+        cap_a,
+        args.open_attempts,
+        max_reconnects=max(0, args.max_reconnects),
+    )
+    stream_b = ResilientCapture(
+        source_b,
+        "B",
+        cap_b,
+        args.open_attempts,
+        max_reconnects=max(0, args.max_reconnects),
+    )
 
     args.event_log.parent.mkdir(parents=True, exist_ok=True)
-    log_file = open(args.event_log, "w", encoding="utf-8")
+    resources = ExitStack()
+    log_file = resources.enter_context(args.event_log.open("a", encoding="utf-8"))
     print("Đang chạy MVP. Nhấn 'q' hoặc ESC để thoát.")
     start = time.time()
     frame_idx = 0
@@ -292,6 +400,7 @@ def main() -> None:
     last_tracks_b = []
     window_a_shown = False
     window_b_shown = False
+    reported_ambiguous_seats: set[str] = set()
 
     def log_events(events) -> None:
         for event in events:
@@ -310,11 +419,14 @@ def main() -> None:
     try:
         while True:
             now = time.time() - start
-            ret_a, frame_a = cap_a.read() if cap_a.isOpened() else (False, None)
-            ret_b, frame_b = cap_b.read() if cap_b.isOpened() else (False, None)
+            ret_a, frame_a = stream_a.read()
+            ret_b, frame_b = stream_b.read()
             if not ret_a and not ret_b:
-                print("Hết stream cả 2 camera.")
-                break
+                if stream_a.exhausted and stream_b.exhausted:
+                    print("Hết stream cả 2 camera.")
+                    break
+                time.sleep(0.05)
+                continue
             process_frame = frame_idx % config.camera.process_every_n_frames == 0
 
             if ret_a and frame_a is not None:
@@ -345,7 +457,8 @@ def main() -> None:
                 if process_frame:
                     tracks_a = tracker_a.update(batch_detections["A"])
                     tracks_a = [t for t in tracks_a if t.bbox.area >= args.min_area]
-                    confirmed_a = [t for t in tracks_a if t.confirmed] or tracks_a
+                    confirmed_raw_a = [track for track in tracks_a if track.confirmed]
+                    confirmed_a = identity_a.update(frame_a, confirmed_raw_a)
                     last_tracks_a = confirmed_a
                     count_a.update(len(confirmed_a))
                 else:
@@ -353,10 +466,20 @@ def main() -> None:
                 presence: dict[str, bool] = {}
                 embs_a: dict[str, np.ndarray | None] = {}
                 best_per_seat = {}
+                ambiguous_seats: set[str] = set()
                 for seat in seats:
                     inside = [t for t in confirmed_a if seat.contains(t.bbox)]
                     if not inside:
                         presence[seat.seat_id] = False
+                        continue
+                    if len(inside) > 1:
+                        ambiguous_seats.add(seat.seat_id)
+                        if process_frame and seat.seat_id not in reported_ambiguous_seats:
+                            print(
+                                f"ROI {seat.seat_id} chua {len(inside)} nguoi; "
+                                "tam dung cap nhat trang thai ROI nay."
+                            )
+                            reported_ambiguous_seats.add(seat.seat_id)
                         continue
                     # Giới hạn 1 người/ghế: lấy box lớn nhất.
                     best = max(inside, key=lambda t: t.bbox.area)
@@ -367,7 +490,11 @@ def main() -> None:
                 if seats and process_frame:
                     log_events(engine.update_office(now, presence, embs_a))
                 if args.display:
-                    vis = draw_zones(frame_a.copy(), seats)
+                    vis = draw_zones(
+                        frame_a.copy(),
+                        seats,
+                        ambiguous_seats=ambiguous_seats,
+                    )
                     draw_person_tracks(vis, confirmed_a, display_count=count_a.value)
                     for seat in seats:
                         best = best_per_seat.get(seat.seat_id)
@@ -387,7 +514,8 @@ def main() -> None:
                 if process_frame:
                     tracks_b = tracker_b.update(batch_detections["B"])
                     tracks_b = [t for t in tracks_b if t.bbox.area >= args.min_area]
-                    confirmed_b = [t for t in tracks_b if t.confirmed] or tracks_b
+                    confirmed_raw_b = [track for track in tracks_b if track.confirmed]
+                    confirmed_b = identity_b.update(frame_b, confirmed_raw_b)
                     last_tracks_b = confirmed_b
                     count_b.update(len(confirmed_b))
                 else:
@@ -429,10 +557,10 @@ def main() -> None:
             if args.max_frames is not None and frame_idx >= args.max_frames:
                 break
     finally:
-        cap_a.release()
-        cap_b.release()
+        stream_a.close()
+        stream_b.close()
         cv2.destroyAllWindows()
-        log_file.close()
+        resources.close()
     print(f"Xong. Trạng thái cuối: { {s: engine.state_of(s).value for s in engine.seat_ids} }")
     print(f"Event log: {args.event_log}")
 

@@ -34,7 +34,7 @@ class WorkStateConfig:
 @dataclass(slots=True)
 class SeatStatus:
     seat_id: str
-    state: WorkState = WorkState.WORKING
+    state: WorkState = WorkState.UNKNOWN
     last_in_seat_s: float | None = None
     away_candidate_since_s: float | None = None
     away_since_s: float | None = None
@@ -89,7 +89,17 @@ class WorkStateEngine:
             if is_present:
                 st.last_in_seat_s = timestamp_s
                 st.away_candidate_since_s = None
-                if st.state == WorkState.RETURNED:
+                if st.state == WorkState.UNKNOWN:
+                    out.append(
+                        self._emit(
+                            timestamp_s,
+                            seat_id,
+                            st.state,
+                            WorkState.WORKING,
+                            "xác nhận có mặt tại vị trí",
+                        )
+                    )
+                elif st.state == WorkState.RETURNED:
                     # Đủ lâu ở ghế -> về WORKING hẳn.
                     if timestamp_s - st.last_event_s >= self.config.returned_promote_s:
                         out.append(
@@ -244,12 +254,14 @@ class WorkStateEngine:
                                    WorkState.OUT_OF_OFFICE,
                                    f"quá {cfg.restroom_return_window_s:g}s chưa quay lại")
                     )
-            elif st.state == WorkState.RETURNED:
-                if timestamp_s - st.last_event_s >= cfg.returned_promote_s:
-                    out.append(
-                        self._emit(timestamp_s, seat_id, st.state,
-                                   WorkState.WORKING, "ổn định lại vị trí")
-                    )
+            elif (
+                st.state == WorkState.RETURNED
+                and timestamp_s - st.last_event_s >= cfg.returned_promote_s
+            ):
+                out.append(
+                    self._emit(timestamp_s, seat_id, st.state,
+                               WorkState.WORKING, "ổn định lại vị trí")
+                )
         return out
 
     def state_of(self, seat_id: str) -> WorkState:

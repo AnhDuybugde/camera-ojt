@@ -5,7 +5,12 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 
-from scripts.run_workstate import _substream_fallback, normalize_frame_size, open_capture
+from scripts.run_workstate import (
+    ResilientCapture,
+    _substream_fallback,
+    normalize_frame_size,
+    open_capture,
+)
 
 
 class OpenCaptureTest(TestCase):
@@ -72,3 +77,28 @@ class OpenCaptureTest(TestCase):
         fallback_source = capture.open.call_args.args[0]
         self.assertIn("subtype=1", fallback_source)
         sleep.assert_not_called()
+
+    @patch("scripts.run_workstate.open_capture")
+    def test_lost_stream_is_reopened(self, reopen: MagicMock) -> None:
+        initial = MagicMock()
+        initial.isOpened.return_value = True
+        initial.read.return_value = (False, None)
+        recovered = MagicMock()
+        recovered.isOpened.return_value = True
+        reopen.return_value = recovered
+        stream = ResilientCapture(
+            "rtsp://camera/live",
+            "A",
+            initial,
+            open_attempts=2,
+            max_reconnects=1,
+            failure_threshold=1,
+        )
+
+        ok, frame = stream.read()
+
+        self.assertFalse(ok)
+        self.assertIsNone(frame)
+        self.assertIs(stream.capture, recovered)
+        initial.release.assert_called_once()
+        reopen.assert_called_once()

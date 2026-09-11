@@ -6,6 +6,7 @@ from enum import Enum
 
 
 class WorkState(str, Enum):
+    UNKNOWN = "UNKNOWN"  # chưa có quan sát đủ tin cậy để kết luận
     WORKING = "WORKING"  # đang ngồi tại vị trí (detect trong ROI bàn, channel A)
     AWAY_SHORT = "AWAY_SHORT"  # vừa rời vị trí, trong thời gian ân hạn chờ xác nhận
     RESTROOM = "RESTROOM"  # thấy lại ở channel B (hành lang) trong cửa sổ thời gian

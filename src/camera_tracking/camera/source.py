@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Self
 
 import cv2
 
@@ -26,7 +27,7 @@ class OpenCVFrameSource:
         self.process_every_n_frames = max(1, process_every_n_frames)
         self._capture: cv2.VideoCapture | None = None
 
-    def __enter__(self) -> OpenCVFrameSource:
+    def __enter__(self) -> Self:
         source: int | str = self.source
         if isinstance(source, str) and source.isdigit():
             source = int(source)

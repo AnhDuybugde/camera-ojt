@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-
 Point = tuple[float, float]
 
 

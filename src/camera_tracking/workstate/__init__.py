@@ -1,7 +1,17 @@
 """Workstate modules: seat ROI, Re-ID, and cross-camera state machine (MVP)."""
-from camera_tracking.workstate.engine import SeatStatus, StateEvent, WorkStateConfig, WorkStateEngine
+from camera_tracking.workstate.engine import (
+    SeatStatus,
+    StateEvent,
+    WorkStateConfig,
+    WorkStateEngine,
+)
 from camera_tracking.workstate.reid import HistogramEmbedding, cosine_similarity
-from camera_tracking.workstate.roi import CorridorZones, SeatZone, bbox_center_in_polygon, point_in_polygon
+from camera_tracking.workstate.roi import (
+    CorridorZones,
+    SeatZone,
+    bbox_center_in_polygon,
+    point_in_polygon,
+)
 from camera_tracking.workstate.states import WorkState
 
 __all__ = [

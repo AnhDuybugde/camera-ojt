@@ -4,6 +4,7 @@ from unittest import TestCase
 
 import numpy as np
 
+from camera_tracking.domain import BoundingBox
 from camera_tracking.workstate import (
     HistogramEmbedding,
     WorkState,
@@ -13,7 +14,6 @@ from camera_tracking.workstate import (
     cosine_similarity,
     point_in_polygon,
 )
-from camera_tracking.domain import BoundingBox
 
 
 def unit_vector(first_nonzero_at: int, dim: int = 8) -> np.ndarray:
@@ -64,12 +64,21 @@ class EngineTest(TestCase):
             ),
         )
 
+    def test_unobserved_seat_remains_unknown(self) -> None:
+        engine = self.make_engine()
+
+        self.assertEqual(engine.state_of("seat_01"), WorkState.UNKNOWN)
+        self.assertEqual(engine.update_office(0.0, {}), [])
+        self.assertEqual(engine.tick(3600.0), [])
+        self.assertEqual(engine.state_of("seat_01"), WorkState.UNKNOWN)
+
     def test_leave_then_restroom_then_return(self) -> None:
         engine = self.make_engine()
         emb = unit_vector(0)
 
         # Đang ngồi.
-        self.assertEqual(engine.update_office(0.0, {"seat_01": True}, {"seat_01": emb}), [])
+        events = engine.update_office(0.0, {"seat_01": True}, {"seat_01": emb})
+        self.assertEqual(events[0].new, WorkState.WORKING)
         # Rời 5s (chưa quá grace 10s) -> chưa chuyển.
         self.assertEqual(engine.update_office(5.0, {"seat_01": False}), [])
         self.assertEqual(engine.state_of("seat_01"), WorkState.WORKING)

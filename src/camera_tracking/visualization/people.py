@@ -12,7 +12,7 @@ def draw_person_tracks(
     frame: np.ndarray,
     tracks: Iterable[Track],
     *,
-    color: tuple[int, int, int] = (0, 200, 255),
+    color: tuple[int, int, int] | None = None,
     title: str = "People",
     display_count: int | None = None,
 ) -> np.ndarray:
@@ -21,12 +21,13 @@ def draw_person_tracks(
     frame_height, frame_width = frame.shape[:2]
     for track in visible_tracks:
         box = track.bbox
+        track_color = color or _track_color(track.track_id)
         x1, y1, x2, y2 = map(round, (box.x1, box.y1, box.x2, box.y2))
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), track_color, 2)
 
-        label = f"Person {track.track_id}  {track.confidence:.2f}"
+        label = f"ID {track.track_id}  {track.confidence:.2f}"
         (label_width, label_height), baseline = cv2.getTextSize(
-            label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2
+            label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1
         )
         label_top = max(0, y1 - label_height - baseline - 6)
         label_left = min(max(0, x1), max(0, frame_width - label_width - 8))
@@ -34,7 +35,7 @@ def draw_person_tracks(
             frame,
             (label_left, label_top),
             (label_left + label_width + 8, label_top + label_height + baseline + 6),
-            color,
+            track_color,
             -1,
         )
         cv2.putText(
@@ -42,9 +43,9 @@ def draw_person_tracks(
             label,
             (label_left + 4, label_top + label_height + 2),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
+            0.48,
             (20, 20, 20),
-            2,
+            1,
             cv2.LINE_AA,
         )
 
@@ -68,3 +69,17 @@ def draw_person_tracks(
         cv2.LINE_AA,
     )
     return frame
+
+
+def _track_color(track_id: int) -> tuple[int, int, int]:
+    palette = (
+        (0, 200, 255),
+        (80, 210, 90),
+        (255, 170, 50),
+        (210, 100, 255),
+        (255, 220, 70),
+        (80, 180, 255),
+        (220, 130, 80),
+        (120, 220, 190),
+    )
+    return palette[(max(1, track_id) - 1) % len(palette)]

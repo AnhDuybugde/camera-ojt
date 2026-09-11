@@ -120,5 +120,5 @@ def load_config(path: str | Path) -> AppConfig:
     with config_path.open("r", encoding="utf-8") as file:
         data = yaml.safe_load(file) or {}
     if not isinstance(data, dict):
-        raise ValueError(f"Config root must be a mapping: {config_path}")
+        raise TypeError(f"Config root must be a mapping: {config_path}")
     return AppConfig.model_validate(data)

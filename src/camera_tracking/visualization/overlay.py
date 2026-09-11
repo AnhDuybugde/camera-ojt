@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from itertools import pairwise
+
 import cv2
 import numpy as np
 
@@ -50,7 +52,7 @@ class OverlayRenderer:
             )
             trajectory = snapshot.trajectories.get(track.track_id, [])
             image_points = [self.projector.unproject(point) for point in trajectory]
-            for start, end in zip(image_points, image_points[1:]):
+            for start, end in pairwise(image_points):
                 cv2.line(canvas, _pixel(start), _pixel(end), (0, 190, 255), 2)
 
         panel_width = min(310, canvas.shape[1])
@@ -120,7 +122,7 @@ class OverlayRenderer:
             )
         for track_id, trajectory in snapshot.trajectories.items():
             points = [floor_pixel(point) for point in trajectory]
-            for start, end in zip(points, points[1:]):
+            for start, end in pairwise(points):
                 cv2.line(canvas, start, end, (0, 0, 0), 2, cv2.LINE_AA)
             if track_id in snapshot.floor_positions:
                 cv2.circle(canvas, points[-1], 4, (255, 255, 255), -1)
