@@ -7,12 +7,12 @@ camera:
   process_every_n_frames: 2
 
 detection:
-  # Ultralytics downloads this small model on first use.
+  # auto = cuda neu co GPU, khong thi mps, khong thi cpu.
   model_path: yolo11n.pt
   confidence_threshold: 0.5
   person_class_id: 0
   image_size: 640
-  device: cpu
+  device: auto
 
 tracking:
   max_lost_frames: 15

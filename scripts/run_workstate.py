@@ -29,7 +29,7 @@ import numpy as np
 from dotenv import load_dotenv
 
 from camera_tracking.config import load_config
-from camera_tracking.detection import YoloPersonDetector
+from camera_tracking.detection import YoloPersonDetector, resolve_device
 from camera_tracking.domain import BoundingBox
 from camera_tracking.tracking import IoUTracker
 from camera_tracking.workstate import (
@@ -68,6 +68,8 @@ def parse_args() -> argparse.Namespace:
                         help="Bo box nguoi nho hon nguong (px^2) de giam nhieu.")
     parser.add_argument("--max-persons-b", type=int, default=3,
                         help="Channel B chi xet toi da N nguoi lon nhat trong vung.")
+    parser.add_argument("--device", default=None,
+                        help="cuda / mps / cpu / auto (mac dinh lay theo config).")
     return parser.parse_args()
 
 
@@ -109,10 +111,11 @@ def main() -> None:
     source_a = args.source_a or imou_url(args.channel_a) or config.camera.source
     source_b = args.source_b or imou_url(args.channel_b)
     if source_b is None:
-        print("Thiếu --source-b và không có IMOU_* trong .env. "
-              "Ví dụ: --source-b data/samples/hallway.mp4")
+        print("Thieu --source-b va khong co IMOU_* trong .env. "
+              "Vi du: --source-b data/samples/hallway.mp4")
         raise SystemExit(2)
-    print(f"Camera A: {source_a}\nCamera B: {source_b}")
+    device = resolve_device(args.device or config.detection.device)
+    print(f"Device: {device} | Camera A: {source_a} | Camera B: {source_b}")
 
     seats = [SeatZone(s.seat_id, s.name or s.seat_id, [tuple(p) for p in s.polygon], s.channel)
              for s in ws.seats]
@@ -135,7 +138,7 @@ def main() -> None:
         confidence=config.detection.confidence_threshold,
         person_class_id=config.detection.person_class_id,
         image_size=config.detection.image_size,
-        device=config.detection.device,
+        device=device,
     )
     tracker_a = IoUTracker(config.tracking.iou_threshold,
                            config.tracking.max_lost_frames, config.tracking.min_hits)

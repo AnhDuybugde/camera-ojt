@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from camera_tracking.camera import OpenCVFrameSource
 from camera_tracking.config import load_config
+from camera_tracking.detection import resolve_device
 from camera_tracking.pipeline import build_pipeline
 
 
@@ -23,6 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source", help="Override webcam index, video path, or RTSP URL.")
     parser.add_argument("--max-frames", type=int, help="Stop after this many processed frames.")
     parser.add_argument("--display", action="store_true", help="Show the annotated video window.")
+    parser.add_argument("--device", default=None, help="cuda / mps / cpu / auto.")
     return parser.parse_args()
 
 
@@ -33,6 +35,9 @@ def main() -> None:
         config.camera.source = int(args.source) if args.source.isdigit() else args.source
     if args.display:
         config.output.display = True
+    if args.device is not None:
+        config.detection.device = args.device
+    print(f"Device: {resolve_device(config.detection.device)}")
 
     pipeline = build_pipeline(config)
     with OpenCVFrameSource(

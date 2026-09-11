@@ -26,7 +26,7 @@ class DetectionConfig(StrictModel):
     confidence_threshold: float = Field(default=0.35, ge=0, le=1)
     person_class_id: int = 0
     image_size: int = 640
-    device: str = "cpu"
+    device: str = "auto"
 
 
 class TrackingConfig(StrictModel):

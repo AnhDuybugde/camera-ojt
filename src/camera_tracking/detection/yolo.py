@@ -7,6 +7,32 @@ import numpy as np
 from camera_tracking.domain import BoundingBox, Detection
 
 
+def resolve_device(requested: str = "auto") -> str:
+    """Chon device tot nhat: cuda neu co, khong thi mps, khong thi cpu."""
+    name = (requested or "auto").strip().lower()
+    if name not in ("auto", ""):
+        if name.startswith("cuda"):
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    return name
+            except ImportError:
+                pass
+            return "cpu"
+        return name
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+    except ImportError:
+        pass
+    return "cpu"
+
+
 class YoloPersonDetector:
     """Ultralytics YOLO adapter; model loading is delayed until the first frame."""
 
@@ -16,13 +42,13 @@ class YoloPersonDetector:
         confidence: float = 0.35,
         person_class_id: int = 0,
         image_size: int = 640,
-        device: str = "cpu",
+        device: str = "auto",
     ) -> None:
         self.model_path = model_path
         self.confidence = confidence
         self.person_class_id = person_class_id
         self.image_size = image_size
-        self.device = device
+        self.device = resolve_device(device)
         self._model: Any = None
 
     def _load_model(self) -> Any:

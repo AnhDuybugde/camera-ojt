@@ -47,27 +47,23 @@ python scripts\run_pipeline.py --source data\raw\room.mp4 --max-frames 300
 
 ## Chay MVP workstate 2 camera (1 nguoi/ghe)
 
-Logic: moi ghe chi giu 1 nguoi (box lon nhat trong ROI). Channel B chi xet
-nguoi trong vung hallway/exit, toi da 3 nguoi lon nhat, bo box nho hon
-`--min-area` de giam nhieu.
-
-Camera IMOU that (lay RTSP tu `.env`):
+Lenh ngan 1 command 2 channel (RTSP tu `.env`, device auto cuda/mps/cpu):
 
 ```powershell
-python scripts\run_workstate.py --config config\default.yaml --display
+python scripts\run_workstate.py --display
 ```
 
-Chay voi video/file rieng:
+Logic: moi ghe chi giu 1 nguoi (box lon nhat trong ROI). Channel B chi xet
+nguoi trong vung hallway/exit, toi da 3 nguoi lon nhat, bo box nho hon
+`--min-area` de giam nhieu. Device `auto` trong `config\default.yaml`
+(mac dinh cuda neu co GPU).
+
+Tuy chinh khi can:
 
 ```powershell
 python scripts\run_workstate.py --source-a 0 --source-b data\samples\hallway.mp4 --display
-python scripts\run_workstate.py --source-a data\raw\room.mp4 --source-b data\raw\hallway.mp4 --max-frames 500
-```
-
-Loc manh hon neu van nhieu box rac:
-
-```powershell
-python scripts\run_workstate.py --source-a 0 --source-b data\samples\hallway.mp4 --min-area 5000 --max-persons-b 2 --display
+python scripts\run_workstate.py --device cpu --display
+python scripts\run_workstate.py --min-area 5000 --max-persons-b 2 --display
 ```
 
 Event log: `output\workstate_events.jsonl`. Nhan `q` hoac ESC de thoat.
