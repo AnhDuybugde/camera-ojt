@@ -10,6 +10,8 @@ __pycache__/
 .env.*
 
 # Large/local artifacts
+*.pt
+*.onnx
 data/raw/*
 data/processed/*
 data/samples/*

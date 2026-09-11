@@ -3,27 +3,56 @@ camera:
   frame_width: 1280
   frame_height: 720
   fps: 25
+  # Process half the frames to reduce CPU load.
+  process_every_n_frames: 2
 
 detection:
-  model_path: models/yolov8n.pt
+  # Ultralytics downloads this small model on first use.
+  model_path: yolo11n.pt
   confidence_threshold: 0.35
   person_class_id: 0
+  image_size: 640
+  device: cpu
 
 tracking:
-  max_lost_frames: 30
-  min_track_length: 5
+  max_lost_frames: 15
+  min_hits: 2
   iou_threshold: 0.3
 
 analytics:
+  floor_width_m: 8.0
+  floor_height_m: 6.0
+  trajectory_length: 120
+  # Replace these example image pixels with four measured floor landmarks.
+  # Point order must match between image_points and floor_points.
+  calibration:
+    image_points:
+      - [240, 700]
+      - [1040, 700]
+      - [820, 260]
+      - [460, 260]
+    floor_points:
+      - [0.0, 0.0]
+      - [8.0, 0.0]
+      - [8.0, 6.0]
+      - [0.0, 6.0]
   density_grid:
     rows: 4
     cols: 6
   zones:
     - name: entrance
-      points: []
+      points: [[0.0, 0.0], [8.0, 0.0], [8.0, 1.5], [0.0, 1.5]]
     - name: room_center
-      points: []
+      points: [[2.0, 1.5], [6.0, 1.5], [6.0, 5.0], [2.0, 5.0]]
+  counting_line:
+    start: [0.0, 1.5]
+    end: [8.0, 1.5]
+    entry_direction: positive_to_negative
 
 output:
   save_video: true
+  save_report: true
+  display: false
   output_dir: output
+  video_filename: annotated.mp4
+  report_filename: report.json

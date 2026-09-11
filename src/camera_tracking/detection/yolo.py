@@ -1,0 +1,64 @@
+from __future__ import annotations
+
+from typing import Any
+
+import numpy as np
+
+from camera_tracking.domain import BoundingBox, Detection
+
+
+class YoloPersonDetector:
+    """Ultralytics YOLO adapter; model loading is delayed until the first frame."""
+
+    def __init__(
+        self,
+        model_path: str = "yolo11n.pt",
+        confidence: float = 0.35,
+        person_class_id: int = 0,
+        image_size: int = 640,
+        device: str = "cpu",
+    ) -> None:
+        self.model_path = model_path
+        self.confidence = confidence
+        self.person_class_id = person_class_id
+        self.image_size = image_size
+        self.device = device
+        self._model: Any = None
+
+    def _load_model(self) -> Any:
+        if self._model is None:
+            try:
+                from ultralytics import YOLO
+            except ImportError as error:
+                raise RuntimeError(
+                    "Ultralytics is not installed. Run: pip install -r requirements.txt"
+                ) from error
+            self._model = YOLO(self.model_path)
+        return self._model
+
+    def detect(self, image: np.ndarray) -> list[Detection]:
+        results = self._load_model().predict(
+            source=image,
+            classes=[self.person_class_id],
+            conf=self.confidence,
+            imgsz=self.image_size,
+            device=self.device,
+            verbose=False,
+        )
+        detections: list[Detection] = []
+        for result in results:
+            if result.boxes is None:
+                continue
+            for xyxy, score, class_id in zip(
+                result.boxes.xyxy.cpu().numpy(),
+                result.boxes.conf.cpu().numpy(),
+                result.boxes.cls.cpu().numpy(),
+            ):
+                detections.append(
+                    Detection(
+                        bbox=BoundingBox(*(float(value) for value in xyxy)),
+                        confidence=float(score),
+                        class_id=int(class_id),
+                    )
+                )
+        return detections

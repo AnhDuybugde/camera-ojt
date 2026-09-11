@@ -1,9 +1,26 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "camera-tracking"
 version = "0.1.0"
 description = "Camera-based people flow, density, and movement tracking for indoor rooms."
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "numpy>=1.26.0",
+    "opencv-python>=4.10.0",
+    "pydantic>=2.7.0",
+    "PyYAML>=6.0.1",
+    "python-dotenv>=1.0.0",
+    "ultralytics>=8.3.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.2.0", "ruff>=0.5.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

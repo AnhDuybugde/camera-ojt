@@ -15,5 +15,6 @@ Camera theo doi luu luong nguoi trong phong, mat do, luong di chuyen dua tren ca
 ## Gia dinh ky thuat ban dau
 
 - Camera gan tren tuong, goc nhin nghieng hoac ngang.
-- Can hieu chinh vung phong bang polygon zones trong file config.
+- Can hieu chinh mat san bang cac cap diem image/floor de tao homography.
+- Zone, counting line, density va trajectory dung toa do san theo met.
 - File video/model weights khong commit len Git.
