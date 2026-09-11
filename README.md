@@ -45,7 +45,7 @@ Video mau:
 python scripts\run_pipeline.py --source data\raw\room.mp4 --max-frames 300
 ```
 
-## Chay MVP workstate 2 camera (1 nguoi/ghe)
+## Chay tracking ID 2 camera
 
 Lenh ngan 1 command 2 channel (RTSP tu `.env`, device auto cuda/mps/cpu):
 
@@ -53,21 +53,25 @@ Lenh ngan 1 command 2 channel (RTSP tu `.env`, device auto cuda/mps/cpu):
 python scripts\run_workstate.py --display
 ```
 
-Logic: moi ghe chi giu 1 nguoi (box lon nhat trong ROI). Channel B chi xet
-nguoi trong vung hallway/exit, toi da 3 nguoi lon nhat, bo box nho hon
-`--min-area` de giam nhieu. Device `auto` trong `config\default.yaml`
-(mac dinh cuda neu co GPU).
+Logic: moi channel chay YOLO -> ByteTrack (tracking ngan han). Mot
+GlobalIdentityManager dung chung cho ca 2 channel giu Global Person ID on dinh
+xuyen tracklet, xuyen mat dau dai va xuyen channel (appearance gallery +
+cost matrix + Hungarian + gating + lifecycle ACTIVE/TEMP_LOST/LONG_LOST/UNRESOLVED).
+Lop business theo channel (WORKING/AWAY_TEMP/POSSIBLY_OUT/RETURNING) chay rieng
+va khong anh huong ID. Bo box nho hon `--min-area` de giam nhieu. Device `auto`
+trong `config\default.yaml` (mac dinh cuda neu co GPU). Cau hinh identity nam
+trong block `identity:` cua `config\default.yaml`.
 
 Tuy chinh khi can:
 
 ```powershell
 python scripts\run_workstate.py --source-a 0 --source-b data\samples\hallway.mp4 --display
 python scripts\run_workstate.py --device cpu --display
-python scripts\run_workstate.py --model yolo11n.pt --imgsz 960 --display
-python scripts\run_workstate.py --min-area 5000 --max-persons-b 2 --display
+python scripts\run_workstate.py --model yolo26s.pt --imgsz 960 --display
+python scripts\run_workstate.py --min-area 5000 --display
 ```
 
-Event log: `output\workstate_events.jsonl`. Nhan `q` hoac ESC de thoat.
+Nhan `q` hoac ESC de thoat.
 
 Nhan `q` de dong cua so khi dung `--display`. Ket qua mac dinh nam trong `output/`.
 Lan chay dau, Ultralytics se tai `yolo26s.pt` khoang 20 MB; file weights duoc Git bo qua.

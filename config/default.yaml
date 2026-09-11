@@ -21,6 +21,22 @@ tracking:
   min_hits: 2
   iou_threshold: 0.3
 
+# Global Identity Manager: giu Global Person ID on dinh xuyên tracklet,
+# xuyên mat dau dai va xuyên channel (xem tracking/global_identity.py).
+identity:
+  gallery_size: 8
+  appearance_weight: 0.55
+  spatial_weight: 0.20
+  time_weight: 0.15
+  channel_weight: 0.10
+  match_threshold: 0.40
+  max_center_distance_ratio: 0.35
+  min_appearance_similarity: 0.30
+  temp_lost_s: 5.0
+  long_lost_s: 60.0
+  unresolved_keep_s: 300.0
+  min_gallery_confidence: 0.25
+
 analytics:
   floor_width_m: 8.0
   floor_height_m: 6.0
@@ -58,23 +74,3 @@ output:
   output_dir: output
   video_filename: annotated.mp4
   report_filename: report.json
-
-# MVP trạng thái nhân viên xuyên 2 camera (tọa độ pixel ảnh 1280x720).
-# Hãy chỉnh polygon cho khớp góc camera thực tế của bạn.
-workstate:
-  leave_grace_s: 10.0
-  corridor_match_window_s: 300.0
-  restroom_return_window_s: 900.0
-  similarity_threshold: 0.55
-  seats:
-    - seat_id: seat_01
-      name: "Bàn 1"
-      channel: A
-      polygon: [[400, 300], [640, 300], [640, 600], [400, 600]]
-    - seat_id: seat_02
-      name: "Bàn 2"
-      channel: A
-      polygon: [[680, 300], [920, 300], [920, 600], [680, 600]]
-  corridor:
-    hallway: [[100, 200], [1180, 200], [1180, 620], [100, 620]]
-    exit_door: [[950, 200], [1180, 200], [1180, 400], [950, 400]]

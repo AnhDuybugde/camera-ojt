@@ -35,6 +35,23 @@ class TrackingConfig(StrictModel):
     iou_threshold: float = Field(default=0.3, ge=0, le=1)
 
 
+class GlobalIdentityConfig(StrictModel):
+    """Cau hinh Global Identity Manager (xem tracking/global_identity.py)."""
+
+    gallery_size: int = Field(default=8, ge=1)
+    appearance_weight: float = Field(default=0.55, ge=0)
+    spatial_weight: float = Field(default=0.20, ge=0)
+    time_weight: float = Field(default=0.15, ge=0)
+    channel_weight: float = Field(default=0.10, ge=0)
+    match_threshold: float = Field(default=0.40, ge=0, le=1)
+    max_center_distance_ratio: float = Field(default=0.35, gt=0)
+    min_appearance_similarity: float = Field(default=0.30, ge=0, le=1)
+    temp_lost_s: float = Field(default=5.0, ge=0)
+    long_lost_s: float = Field(default=60.0, ge=0)
+    unresolved_keep_s: float = Field(default=300.0, ge=0)
+    min_gallery_confidence: float = Field(default=0.25, ge=0, le=1)
+
+
 class CalibrationConfig(StrictModel):
     image_points: list[Point]
     floor_points: list[Point]
@@ -64,27 +81,6 @@ class CountingLineConfig(StrictModel):
     )
 
 
-class SeatZoneConfig(StrictModel):
-    seat_id: str
-    name: str = ""
-    polygon: list[Point]
-    channel: str = "A"
-
-
-class CorridorZoneConfig(StrictModel):
-    hallway: list[Point] = Field(default_factory=list)
-    exit_door: list[Point] = Field(default_factory=list)
-
-
-class WorkstateConfig(StrictModel):
-    leave_grace_s: float = Field(default=10.0, ge=0)
-    corridor_match_window_s: float = Field(default=300.0, ge=0)
-    restroom_return_window_s: float = Field(default=900.0, ge=0)
-    similarity_threshold: float = Field(default=0.55, ge=0, le=1)
-    seats: list[SeatZoneConfig] = Field(default_factory=list)
-    corridor: CorridorZoneConfig = Field(default_factory=CorridorZoneConfig)
-
-
 class AnalyticsConfig(StrictModel):
     floor_width_m: float = Field(gt=0)
     floor_height_m: float = Field(gt=0)
@@ -108,9 +104,9 @@ class AppConfig(StrictModel):
     camera: CameraConfig = Field(default_factory=CameraConfig)
     detection: DetectionConfig = Field(default_factory=DetectionConfig)
     tracking: TrackingConfig = Field(default_factory=TrackingConfig)
+    identity: GlobalIdentityConfig = Field(default_factory=GlobalIdentityConfig)
     analytics: AnalyticsConfig
     output: OutputConfig = Field(default_factory=OutputConfig)
-    workstate: WorkstateConfig = Field(default_factory=WorkstateConfig)
 
 
 def load_config(path: str | Path) -> AppConfig:

@@ -1,25 +1,28 @@
-"""Demo MVP: detect + track 2 channel IMOU, Re-ID histogram, state machine.
+"""Demo tracking Global ID 2 channel IMOU.
 
-Channel A (làm việc): YOLO -> ByteTrack -> persistent ID -> kiểm tra ROI ghế.
-  Rời ROI > leave_grace_s -> AWAY_SHORT + lưu embedding lúc rời.
-Channel B (hành lang): YOLO -> ByteTrack -> persistent ID -> embedding + zone.
-  Khớp với AWAY_SHORT trong 5 phút -> RESTROOM, quá timeout -> OUT_OF_OFFICE.
+Moi channel chay doc lap: YOLO(26s) -> ByteTrack (tracking ngan han:
+motion prediction, IoU matching, data association, track buffer).
+Mot GlobalIdentityManager dung chung cho ca 2 channel tra loi
+"day la nguoi nao" (Global Person ID on dinh xuyen tracklet, xuyen mat dau
+dai, xuyen channel) bang appearance gallery + cost matrix + Hungarian +
+gating + lifecycle ACTIVE/TEMP_LOST/LONG_LOST/UNRESOLVED.
+Lop business theo channel (ChannelBusinessTracker) tra loi rieng
+"nguoi do dang lam gi" (WORKING/AWAY_TEMP/POSSIBLY_OUT/RETURNING) va khong
+duoc phep anh huong toi ID.
 
-Chạy:
+Chay:
   python scripts/run_workstate.py --config config/default.yaml --display
   python scripts/run_workstate.py --source-a 0 --source-b data/samples/hallway.mp4 --display
 
-RTSP IMOU lấy từ .env (IMOU_IP/USER/PASSWORD) nếu không truyền --source.
-Nhấn 'q' hoặc ESC để thoát.
+RTSP IMOU lay tu .env (IMOU_IP/USER/PASSWORD) neu khong truyen --source.
+Nhan 'q' hoac ESC de thoat.
 """
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 import time
-from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
@@ -37,20 +40,16 @@ import numpy as np
 
 from camera_tracking.config import load_config
 from camera_tracking.detection import YoloPersonDetector, resolve_device
-from camera_tracking.domain import BoundingBox
 from camera_tracking.tracking import (
     ByteTrackTracker,
-    PersistentIdentityTracker,
+    GlobalIdentityConfig,
+    GlobalIdentityManager,
     StablePersonCount,
 )
 from camera_tracking.visualization import draw_person_tracks
 from camera_tracking.workstate import (
-    CorridorZones,
+    ChannelBusinessTracker,
     HistogramEmbedding,
-    SeatZone,
-    WorkStateConfig,
-    WorkStateEngine,
-    select_seat_occupant,
 )
 
 reconfigure_stdout = getattr(sys.stdout, "reconfigure", None)
@@ -62,7 +61,7 @@ if reconfigure_stdout is not None:
 
 
 def normalize_source(src) -> int | str:
-    """'0' -> 0 (webcam), '1' -> 1, còn lại giữ nguyên (file/RTSP)."""
+    """'0' -> 0 (webcam), '1' -> 1, con lai giu nguyen (file/RTSP)."""
     if isinstance(src, int):
         return src
     if isinstance(src, str):
@@ -92,7 +91,7 @@ def open_capture(
 ) -> cv2.VideoCapture:
     source = normalize_source(source)
     if isinstance(source, int):
-        # Webcam trên Windows cần DSHOW, không dùng FFMPEG.
+        # Webcam tren Windows can DSHOW, khong dung FFMPEG.
         if os.name == "nt":
             cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
         else:
@@ -203,7 +202,7 @@ def source_label(source: int | str) -> str:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="MVP workstate 2 camera (1 nguoi/ghe).")
+    parser = argparse.ArgumentParser(description="Tracking ID 2 camera (YOLO + ByteTrack + Re-ID).")
     parser.add_argument("--config", type=Path, default=Path("config/default.yaml"))
     parser.add_argument("--source-a", default=None, help="Override camera A.")
     parser.add_argument("--source-b", default=None, help="Override camera B.")
@@ -238,74 +237,42 @@ def parse_args() -> argparse.Namespace:
         default=3,
         help="So lan ket noi lai neu stream bi mat khi dang chay.",
     )
-    parser.add_argument("--event-log", type=Path, default=Path("output/workstate_events.jsonl"))
     parser.add_argument("--min-area", type=float, default=2000.0,
                         help="Bo box nguoi nho hon nguong (px^2) de giam nhieu.")
-    parser.add_argument("--max-persons-b", type=int, default=3,
-                        help="Channel B chi xet toi da N nguoi lon nhat trong vung.")
+    parser.add_argument("--match-threshold", type=float, default=None,
+                        help="Override identity match_threshold trong config.")
+    parser.add_argument("--away-grace-s", type=float, default=10.0,
+                        help="Business: vang qua N giay -> AWAY_TEMP.")
+    parser.add_argument("--out-after-s", type=float, default=60.0,
+                        help="Business: vang qua N giay -> POSSIBLY_OUT.")
+    parser.add_argument("--return-stable-s", type=float, default=3.0,
+                        help="Business: hien dien on dinh N giay -> WORKING.")
     parser.add_argument("--device", default=None,
                         help="cuda / mps / cpu / auto (mac dinh lay theo config).")
     return parser.parse_args()
 
 
-def crop_of(frame: np.ndarray, bbox: BoundingBox) -> np.ndarray | None:
-    h, w = frame.shape[:2]
-    x1 = max(0, int(bbox.x1))
-    y1 = max(0, int(bbox.y1))
-    x2 = min(w, int(bbox.x2))
-    y2 = min(h, int(bbox.y2))
-    if x2 <= x1 or y2 <= y1:
-        return None
-    return frame[y1:y2, x1:x2]
-
-
 def normalize_frame_size(frame: np.ndarray, width: int, height: int) -> np.ndarray:
-    """Put every source in the coordinate system used by configured ROI polygons."""
+    """Resize moi source ve kich thuoc chung de hien thi on dinh."""
     if frame.shape[1] == width and frame.shape[0] == height:
         return frame
     interpolation = cv2.INTER_AREA if frame.shape[1] > width else cv2.INTER_LINEAR
     return cv2.resize(frame, (width, height), interpolation=interpolation)
 
 
-def draw_zones(
-    frame: np.ndarray,
-    seats: list[SeatZone],
-    corridor=None,
-    ambiguous_seats: set[str] | None = None,
-) -> np.ndarray:
-    ambiguous_seats = ambiguous_seats or set()
-    for seat in seats:
-        ambiguous = seat.seat_id in ambiguous_seats
-        color = (0, 0, 255) if ambiguous else (0, 255, 0)
-        label = f"{seat.seat_id}:AMBIGUOUS" if ambiguous else seat.seat_id
-        pts = np.asarray(seat.polygon, dtype=np.int32)
-        cv2.polylines(frame, [pts], True, color, 2)
-        cv2.putText(
-            frame,
-            label,
-            tuple(map(int, seat.polygon[0])),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            color,
-            2,
-        )
-    if corridor is not None:
-        for poly, color, label in [
-            (corridor.hallway, (255, 0, 0), "hallway"),
-            (corridor.exit_door, (0, 0, 255), "exit"),
-        ]:
-            if len(poly) >= 3:
-                pts = np.asarray(poly, dtype=np.int32)
-                cv2.polylines(frame, [pts], True, color, 2)
-                cv2.putText(frame, label, tuple(map(int, poly[0])),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+def draw_business_states(frame: np.ndarray, tracks, states: dict[int, str]) -> np.ndarray:
+    """Ve them business state ke ben box cua tung Global ID (chi de hien thi)."""
+    for track in tracks:
+        label = f"G{track.track_id}:{states.get(track.track_id, '?')}"
+        x1, y1 = max(0, int(track.bbox.x1)), max(0, int(track.bbox.y1))
+        cv2.putText(frame, label, (x1, max(20, y1 - 24)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
     return frame
 
 
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
-    ws = config.workstate
 
     source_a = normalize_source(
         args.source_a
@@ -327,22 +294,6 @@ def main() -> None:
         f"Camera A: {source_label(source_a)} | "
         f"Camera B: {source_label(source_b)}"
     )
-
-    seats = [SeatZone(s.seat_id, s.name or s.seat_id, [tuple(p) for p in s.polygon], s.channel)
-             for s in ws.seats]
-    corridor = CorridorZones(hallway=[tuple(p) for p in ws.corridor.hallway],
-                             exit_door=[tuple(p) for p in ws.corridor.exit_door])
-    engine = WorkStateEngine(
-        seat_ids=[s.seat_id for s in seats] or ["seat_01"],
-        config=WorkStateConfig(
-            leave_grace_s=ws.leave_grace_s,
-            corridor_match_window_s=ws.corridor_match_window_s,
-            restroom_return_window_s=ws.restroom_return_window_s,
-            similarity_threshold=ws.similarity_threshold,
-        ),
-    )
-    if not seats:
-        print("Cảnh báo: chưa cấu hình ghế nào, dùng seat_01 mặc định (không có ROI).")
 
     detector = YoloPersonDetector(
         model_path=model_path,
@@ -366,16 +317,42 @@ def main() -> None:
         min_hits=config.tracking.min_hits,
     )
     embedder = HistogramEmbedding()
-    identity_a = PersistentIdentityTracker(
+    identity_cfg = config.identity
+    if args.match_threshold is not None:
+        identity_cfg = identity_cfg.model_copy(
+            update={"match_threshold": args.match_threshold}
+        )
+    # Mot GlobalIdentityManager dung chung cho ca 2 channel -> Global ID
+    # xuyen tracklet, xuyen mat dau dai, xuyen channel.
+    manager = GlobalIdentityManager(
         embedder,
-        max_missing_frames=240,
-        max_center_distance_ratio=0.35,
-        match_threshold=0.34,
+        GlobalIdentityConfig(
+            gallery_size=identity_cfg.gallery_size,
+            appearance_weight=identity_cfg.appearance_weight,
+            spatial_weight=identity_cfg.spatial_weight,
+            time_weight=identity_cfg.time_weight,
+            channel_weight=identity_cfg.channel_weight,
+            match_threshold=identity_cfg.match_threshold,
+            max_center_distance_ratio=identity_cfg.max_center_distance_ratio,
+            min_appearance_similarity=identity_cfg.min_appearance_similarity,
+            temp_lost_s=identity_cfg.temp_lost_s,
+            long_lost_s=identity_cfg.long_lost_s,
+            unresolved_keep_s=identity_cfg.unresolved_keep_s,
+            min_gallery_confidence=identity_cfg.min_gallery_confidence,
+        ),
     )
-    identity_b = PersistentIdentityTracker(
-        embedder,
-        max_missing_frames=120,
-        max_center_distance_ratio=0.35,
+    # Business theo channel: chi doc Global ID + presence, khong anh huong ID.
+    business_a = ChannelBusinessTracker(
+        channel="A",
+        away_grace_s=args.away_grace_s,
+        out_after_s=args.out_after_s,
+        return_stable_s=args.return_stable_s,
+    )
+    business_b = ChannelBusinessTracker(
+        channel="B",
+        away_grace_s=args.away_grace_s,
+        out_after_s=args.out_after_s,
+        return_stable_s=args.return_stable_s,
     )
     count_a = StablePersonCount(rise_frames=3, fall_frames=12)
     count_b = StablePersonCount(rise_frames=3, fall_frames=12)
@@ -403,36 +380,19 @@ def main() -> None:
         max_reconnects=max(0, args.max_reconnects),
     )
 
-    args.event_log.parent.mkdir(parents=True, exist_ok=True)
-    resources = ExitStack()
-    log_file = resources.enter_context(args.event_log.open("a", encoding="utf-8"))
-    print("Đang chạy MVP. Nhấn 'q' hoặc ESC để thoát.")
+    print("Dang chay tracking Global ID. Nhan 'q' hoac ESC de thoat.")
     start = time.time()
     frame_idx = 0
     last_tracks_a = []
     last_tracks_b = []
+    last_states_a: dict[int, str] = {}
+    last_states_b: dict[int, str] = {}
     window_a_shown = False
     window_b_shown = False
-    reported_ambiguous_seats: set[str] = set()
-    seat_occupant_ids: dict[str, int] = {}
-
-    def log_events(events) -> None:
-        for event in events:
-            line = (f"[{event.timestamp_s:7.1f}s] {event.seat_id}: "
-                    f"{event.prev.value} -> {event.new.value} ({event.reason}"
-                    + (f", score={event.score:.2f}" if event.score is not None else "")
-                    + ")")
-            print(line)
-            log_file.write(json.dumps({
-                "t": event.timestamp_s, "seat": event.seat_id,
-                "prev": event.prev.value, "new": event.new.value,
-                "reason": event.reason, "score": event.score,
-            }, ensure_ascii=False) + "\n")
-            log_file.flush()
 
     try:
         while True:
-            now = time.time() - start
+            now_s = time.time() - start
             ret_a, frame_a = stream_a.read()
             ret_b, frame_b = stream_b.read()
             if not ret_a and not ret_b:
@@ -466,95 +426,59 @@ def main() -> None:
                     zip(batch_names, detector.detect_batch(batch_images), strict=True)
                 )
 
-            # --- Channel A: mỗi ghế chỉ giữ 1 người (box lớn nhất trong ROI) ---
+            # --- Channel A: ByteTrack (ngan han) + Global ID (toan cuc) ---
             if ret_a and frame_a is not None:
                 if process_frame:
                     tracks_a = tracker_a.update(batch_detections["A"])
                     tracks_a = [t for t in tracks_a if t.bbox.area >= args.min_area]
-                    confirmed_raw_a = [track for track in tracks_a if track.confirmed]
-                    confirmed_a = identity_a.update(frame_a, confirmed_raw_a)
+                    confirmed_a = manager.update(
+                        channel="A",
+                        frame=frame_a,
+                        tracks=[t for t in tracks_a if t.confirmed],
+                        now_s=now_s,
+                    )
                     last_tracks_a = confirmed_a
                     count_a.update(len(confirmed_a))
+                    states_a = business_a.update(
+                        now_s, {t.track_id for t in confirmed_a}
+                    )
+                    last_states_a = {g: s.value for g, s in states_a.items()}
                 else:
                     confirmed_a = last_tracks_a
-                presence: dict[str, bool] = {}
-                embs_a: dict[str, np.ndarray | None] = {}
-                best_per_seat = {}
-                ambiguous_seats: set[str] = set()
-                for seat in seats:
-                    best, ambiguous = select_seat_occupant(
-                        seat,
-                        confirmed_a,
-                        preferred_track_id=seat_occupant_ids.get(seat.seat_id),
-                    )
-                    if ambiguous:
-                        ambiguous_seats.add(seat.seat_id)
-                        if process_frame and seat.seat_id not in reported_ambiguous_seats:
-                            print(
-                                f"ROI {seat.seat_id} co hai ung vien gan ngang nhau; "
-                                "tam dung cap nhat trang thai ROI nay."
-                            )
-                            reported_ambiguous_seats.add(seat.seat_id)
-                        continue
-                    if best is None:
-                        presence[seat.seat_id] = False
-                        continue
-                    seat_occupant_ids[seat.seat_id] = best.track_id
-                    best_per_seat[seat.seat_id] = best
-                    presence[seat.seat_id] = True
-                    if process_frame:
-                        embs_a[seat.seat_id] = embedder.extract(crop_of(frame_a, best.bbox))
-                if seats and process_frame:
-                    log_events(engine.update_office(now, presence, embs_a))
                 if args.display:
-                    vis = draw_zones(
-                        frame_a.copy(),
-                        seats,
-                        ambiguous_seats=ambiguous_seats,
-                    )
-                    draw_person_tracks(vis, confirmed_a, display_count=count_a.value)
-                    for seat in seats:
-                        best = best_per_seat.get(seat.seat_id)
-                        if best is not None:
-                            x1, y1, x2, y2 = map(int, (best.bbox.x1, best.bbox.y1,
-                                                       best.bbox.x2, best.bbox.y2))
-                            cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    for sid in engine.seat_ids:
-                        st = engine.statuses[sid].state.value
-                        cv2.putText(vis, f"{sid}:{st}", (20, 30 + 25 * engine.seat_ids.index(sid)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                    cv2.imshow("Channel A - working", vis)
+                    vis = frame_a.copy()
+                    draw_person_tracks(vis, confirmed_a, display_count=count_a.value,
+                                       title="Global")
+                    draw_business_states(vis, confirmed_a, last_states_a)
+                    cv2.imshow("Channel A - tracking", vis)
                     window_a_shown = True
 
-            # --- Channel B: chỉ xét người trong vùng + tối đa N người lớn nhất ---
+            # --- Channel B: ByteTrack (ngan han) + Global ID (toan cuc) ---
             if ret_b and frame_b is not None:
                 if process_frame:
                     tracks_b = tracker_b.update(batch_detections["B"])
                     tracks_b = [t for t in tracks_b if t.bbox.area >= args.min_area]
-                    confirmed_raw_b = [track for track in tracks_b if track.confirmed]
-                    confirmed_b = identity_b.update(frame_b, confirmed_raw_b)
+                    confirmed_b = manager.update(
+                        channel="B",
+                        frame=frame_b,
+                        tracks=[t for t in tracks_b if t.confirmed],
+                        now_s=now_s,
+                    )
                     last_tracks_b = confirmed_b
                     count_b.update(len(confirmed_b))
+                    states_b = business_b.update(
+                        now_s, {t.track_id for t in confirmed_b}
+                    )
+                    last_states_b = {g: s.value for g, s in states_b.items()}
                 else:
                     confirmed_b = last_tracks_b
-                zoned = [(t, corridor.locate(t.bbox)) for t in confirmed_b]
-                zoned = [(t, z) for t, z in zoned if z in ("hallway", "exit")]
-                # Giới hạn số người để giảm nhiễu + nhẹ Re-ID.
-                zoned.sort(key=lambda tz: tz[0].bbox.area, reverse=True)
-                zoned = zoned[:args.max_persons_b]
-                cand_embs, cand_zones = [], []
-                for t, z in zoned:
-                    cand_embs.append(embedder.extract(crop_of(frame_b, t.bbox)))
-                    cand_zones.append(z)
-                if cand_embs and process_frame:
-                    log_events(engine.update_corridor(now, cand_embs, cand_zones))
                 if args.display:
-                    vis_b = draw_zones(frame_b.copy(), [], corridor)
-                    draw_person_tracks(vis_b, confirmed_b, display_count=count_b.value)
-                    cv2.imshow("Channel B - hallway", vis_b)
+                    vis_b = frame_b.copy()
+                    draw_person_tracks(vis_b, confirmed_b, display_count=count_b.value,
+                                       title="Global")
+                    draw_business_states(vis_b, confirmed_b, last_states_b)
+                    cv2.imshow("Channel B - tracking", vis_b)
                     window_b_shown = True
-
-            log_events(engine.tick(now))
 
             if args.display:
                 key = cv2.waitKey(1) & 0xFF
@@ -562,10 +486,10 @@ def main() -> None:
                     print("Đã nhấn phím thoát.")
                     break
                 window_a_closed = window_a_shown and cv2.getWindowProperty(
-                    "Channel A - working", cv2.WND_PROP_VISIBLE
+                    "Channel A - tracking", cv2.WND_PROP_VISIBLE
                 ) < 1
                 window_b_closed = window_b_shown and cv2.getWindowProperty(
-                    "Channel B - hallway", cv2.WND_PROP_VISIBLE
+                    "Channel B - tracking", cv2.WND_PROP_VISIBLE
                 ) < 1
                 if window_a_closed or window_b_closed:
                     print("Cửa sổ đã đóng. Đang giải phóng camera...")
@@ -577,9 +501,14 @@ def main() -> None:
         stream_a.close()
         stream_b.close()
         cv2.destroyAllWindows()
-        resources.close()
-    print(f"Xong. Trạng thái cuối: { {s: engine.state_of(s).value for s in engine.seat_ids} }")
-    print(f"Event log: {args.event_log}")
+    elapsed = time.time() - start
+    gids = sorted(manager.identities)
+    print(f"Xong sau {elapsed:.1f}s. Count A: {count_a.value} | Count B: {count_b.value}")
+    print(f"Global IDs: {gids}")
+    for gid in gids:
+        record = manager.identities[gid]
+        print(f"  G{gid}: state={record.state.value} last_channel={record.channel} "
+              f"hits={record.total_hits} gallery={len(record.gallery)}")
 
 
 if __name__ == "__main__":

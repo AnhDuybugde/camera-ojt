@@ -1,31 +1,18 @@
-"""Workstate modules: seat ROI, Re-ID, and cross-camera state machine (MVP)."""
-from camera_tracking.workstate.engine import (
-    SeatStatus,
-    StateEvent,
-    WorkStateConfig,
-    WorkStateEngine,
+"""Appearance embedding + business trạng thái theo channel.
+
+Tầng identity (:mod:`camera_tracking.tracking.global_identity`) trả lời
+"đây là người nào". Module này chứa các thành phần phụ trợ không
+được phép ảnh hưởng tới ID: embedding ngoại hình và business state.
+"""
+from camera_tracking.workstate.channel_status import (
+    ChannelBusinessTracker,
+    PersonBusinessState,
 )
 from camera_tracking.workstate.reid import HistogramEmbedding, cosine_similarity
-from camera_tracking.workstate.roi import (
-    CorridorZones,
-    SeatZone,
-    bbox_center_in_polygon,
-    point_in_polygon,
-    select_seat_occupant,
-)
-from camera_tracking.workstate.states import WorkState
 
 __all__ = [
-    "CorridorZones",
+    "ChannelBusinessTracker",
     "HistogramEmbedding",
-    "SeatStatus",
-    "SeatZone",
-    "StateEvent",
-    "WorkState",
-    "WorkStateConfig",
-    "WorkStateEngine",
-    "bbox_center_in_polygon",
+    "PersonBusinessState",
     "cosine_similarity",
-    "point_in_polygon",
-    "select_seat_occupant",
 ]
