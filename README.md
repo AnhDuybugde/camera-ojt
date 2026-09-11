@@ -1,5 +1,8 @@
 # Camera Tracking
 
+> **Strategy (English): see [docs/STRATEGY.md](docs/STRATEGY.md).**
+> Quick test with a single command: `python scripts\run_workstate.py --max-frames 30`
+
 Pipeline Python theo doi luu luong nguoi, mat do va huong di chuyen trong phong tu
 camera gan tren tuong. He thong dung YOLO26s tren device tu dong va chieu diem chan cua moi nguoi
 tu anh camera xuong mat san bang homography.
