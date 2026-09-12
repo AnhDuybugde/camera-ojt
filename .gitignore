@@ -35,5 +35,11 @@ dashboard/dist/
 # IDE/OS
 .idea/
 .vscode/
+.cursor/
+.codegraph/
 Thumbs.db
 Desktop.ini
+
+# Build artifacts
+*.egg-info/
+src/*.egg-info/

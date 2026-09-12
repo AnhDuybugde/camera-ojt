@@ -48,13 +48,17 @@ from camera_tracking.tracking import (
     ByteTrackTracker,
     GlobalIdentityConfig,
     GlobalIdentityManager,
+    IdentityState,
     StablePersonCount,
 )
 from camera_tracking.visualization import draw_global_labels, draw_person_tracks
 from camera_tracking.workstate import (
+    LABEL_UNKNOWN,
     ChannelBusinessTracker,
     HistogramEmbedding,
+    IdentityReconciler,
     RoomPresenceAggregator,
+    WorkstationZone,
 )
 
 reconfigure_stdout = getattr(sys.stdout, "reconfigure", None)
@@ -386,6 +390,43 @@ def _store_or_queue(queue, supabase, kind: str, payload: dict) -> None:
         queue.push(kind, payload)
 
 
+def _merge_same_person_stale(
+    day_cache, write_queue, supabase, gid_alias,
+    gid_to_person, gid_to_display,
+    day_str: str, canon_gid: int, person_id: str, display_name: str,
+    manager, business_trackers=(),
+) -> None:
+    """Alias OTHER gids of the same face-matched person into canon_gid.
+
+    Fixes the G1-OUT + G2-Working split-brain: when the same human was
+    fragmented across IDs, the stale (non-ACTIVE) duplicate is backfilled
+    with person info + merged_into so the dashboard hides it. A duplicate
+    that is still ACTIVE (two bodies visible) is left alone: ambiguous.
+    """
+    for old_gid, pid in list(gid_to_person.items()):
+        if pid != person_id or old_gid == canon_gid or old_gid in gid_alias:
+            continue
+        record = manager.identities.get(old_gid)
+        if record is not None and record.state is IdentityState.ACTIVE:
+            continue
+        gid_alias[old_gid] = canon_gid
+        gid_to_display[old_gid] = display_name
+        for tracker in business_trackers:
+            try:
+                tracker.transfer_assignment(old_gid, canon_gid)
+            except Exception:  # noqa: BLE001 - never break the loop
+                pass
+        cached = day_cache._status.get((day_str, old_gid))
+        _store_or_queue(write_queue, supabase, "room_status", {
+            "date": day_str, "global_id": old_gid,
+            "person_id": person_id, "person_name": display_name,
+            "in_room": cached.in_room if cached else True,
+            "label": cached.label if cached else LABEL_UNKNOWN,
+            "merged_into": canon_gid,
+        })
+        print(f"[Reconcile] stale G{old_gid} -> G{canon_gid} {display_name}")
+
+
 def _reconcile_unknowns(
     day_cache, write_queue, supabase, reconciler, gid_alias,
     gid_to_person, gid_to_display, unknown_of_gid,
@@ -663,11 +704,6 @@ def main() -> None:
     from camera_tracking.store.faces import FaceCropSaver
     from camera_tracking.store.queue import WriteQueue
     from camera_tracking.store.supabase_client import SupabaseSettings, SupabaseStore
-    from camera_tracking.workstate import (
-        IdentityReconciler,
-        LABEL_UNKNOWN,
-        WorkstationZone,
-    )
 
     day_cache = DailyStateCache(
         inroom_min_interval_s=config.room_fusion.inroom_min_interval_s
@@ -746,6 +782,7 @@ def main() -> None:
     last_push_b = 0.0
     seen_gids: set[int] = set()
     ghosts_dir = Path(config.output.output_dir) / "ghosts"
+    face_marks_b: list = []  # (x1,y1,x2,y2,score,known) for cam B overlay
 
     try:
         while True:
@@ -771,6 +808,7 @@ def main() -> None:
 
             batch_detections: dict[str, list] = {}
             if process_frame:
+                face_marks_b.clear()
                 batch_names: list[str] = []
                 batch_images: list[np.ndarray] = []
                 if ret_a and frame_a is not None:
@@ -850,6 +888,11 @@ def main() -> None:
                                 crop = _person_crop(frame_b, track.bbox)
                                 if crop is None:
                                     continue
+                                # Crop origin in frame coords (same clamp as
+                                # _person_crop) to draw face boxes on vis_b.
+                                _bh, _bw = frame_b.shape[:2]
+                                _ox = max(0, min(_bw, round(track.bbox.x1)))
+                                _oy = max(0, min(_bh, round(track.bbox.y1)))
                                 try:
                                     dets = face_embedder.detect_embed(crop)
                                 except RuntimeError:
@@ -870,9 +913,18 @@ def main() -> None:
                                 if sharp < face_cfg.min_blur_variance:
                                     continue
                                 match = face_matcher.match(det.embedding)
+                                # Live feedback: face box + score on cam B
+                                # (green = known, red = unknown/low score).
+                                face_marks_b.append(
+                                    (_ox + fx1, _oy + fy1, _ox + fx2, _oy + fy2,
+                                     match.score, match.is_known))
                                 if match.is_known and match.person is not None:
                                     gid_to_score[track.track_id] = match.score
                                     gid_to_person[track.track_id] = match.person.person_id
+                                    # Show the name as soon as the face matches
+                                    # (DB tick stays debounced below).
+                                    gid_to_display[track.track_id] = \
+                                        match.person.display_name
                                     ticked = attendance.observe(
                                         day=day_str, global_id=track.track_id,
                                         person_id=match.person.person_id,
@@ -881,7 +933,6 @@ def main() -> None:
                                         wall_time_iso=wall_iso,
                                     )
                                     if ticked is not None:
-                                        gid_to_display[track.track_id] = ticked.display_name
                                         if day_cache.attendance_should_write(
                                                 day_str, ticked.person_id):
                                             _store_or_queue(write_queue, supabase, "attendance", {
@@ -914,6 +965,18 @@ def main() -> None:
                                             match.person.embedding,
                                             (business_a, business_b),
                                         )
+                                    # Same face on a stale duplicate gid:
+                                    # fold it into the live one (fixes the
+                                    # G1-OUT + G2-Working split-brain).
+                                    _merge_same_person_stale(
+                                        day_cache, write_queue, supabase,
+                                        gid_alias, gid_to_person,
+                                        gid_to_display, day_str,
+                                        track.track_id,
+                                        match.person.person_id,
+                                        match.person.display_name,
+                                        manager, (business_a, business_b),
+                                    )
                                     local = crop_saver.save_best_crop(
                                         day=day_str, owner=match.person.person_id,
                                         known=True, global_id=track.track_id,
@@ -1018,13 +1081,20 @@ def main() -> None:
             if ret_a and frame_a is not None and need_vis:
                 vis_a = frame_a.copy()
                 draw_person_tracks(vis_a, last_tracks_a, display_count=count_a.value,
-                                   title="Global")
+                                   title="Global", status=room_status_now)
                 draw_global_labels(vis_a, last_tracks_a, room_status_now, gid_to_display)
             if ret_b and frame_b is not None and need_vis:
                 vis_b = frame_b.copy()
                 draw_person_tracks(vis_b, last_tracks_b, display_count=count_b.value,
-                                   title="Global")
+                                   title="Global", status=room_status_now)
                 draw_global_labels(vis_b, last_tracks_b, room_status_now, gid_to_display)
+                for x1m, y1m, x2m, y2m, fscore, fknown in face_marks_b:
+                    fcolor = (40, 180, 40) if fknown else (60, 60, 220)
+                    cv2.rectangle(vis_b, (int(x1m), int(y1m)),
+                                  (int(x2m), int(y2m)), fcolor, 2)
+                    cv2.putText(vis_b, f"{fscore:.2f}",
+                                (int(x1m), max(0, int(y1m) - 6)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, fcolor, 2)
             if args.display:
                 if vis_a is not None:
                     cv2.imshow("Channel A - tracking", vis_a)

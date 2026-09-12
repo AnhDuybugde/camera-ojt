@@ -7,6 +7,24 @@ import numpy as np
 
 from camera_tracking.domain import Track
 
+# Box + label color by room status (BGR). Same semantics as dashboard badges.
+STATUS_COLORS: dict[str, tuple[int, int, int]] = {
+    "Working": (40, 180, 40),       # green
+    "Near seat": (0, 200, 255),     # yellow
+    "Away": (0, 200, 255),          # yellow
+    "Returning": (255, 150, 0),     # blue
+    "Out of office": (60, 60, 220),  # red
+    "Unknown": (60, 60, 220),       # red
+}
+_DEFAULT_TRACK_COLOR = (200, 200, 200)
+
+
+def status_color(label: str | None) -> tuple[int, int, int] | None:
+    """BGR color for a room-status label, None when unknown."""
+    if not label:
+        return None
+    return STATUS_COLORS.get(str(label).strip())
+
 
 def draw_person_tracks(
     frame: np.ndarray,
@@ -15,13 +33,19 @@ def draw_person_tracks(
     color: tuple[int, int, int] | None = None,
     title: str = "People",
     display_count: int | None = None,
+    status: dict[int, object] | None = None,
 ) -> np.ndarray:
-    """Draw person boxes, stable IDs, confidence, and a visible person count."""
+    """Draw person boxes, stable IDs, confidence, and a visible person count.
+
+    Box color follows the room status when provided (green/yellow/red),
+    otherwise falls back to the per-ID palette.
+    """
     visible_tracks = list(tracks)
     frame_height, frame_width = frame.shape[:2]
     for track in visible_tracks:
         box = track.bbox
-        track_color = color or _track_color(track.track_id)
+        track_color = color or _status_track_color(track.track_id, status) \
+            or _track_color(track.track_id)
         x1, y1, x2, y2 = map(round, (box.x1, box.y1, box.x2, box.y2))
         cv2.rectangle(frame, (x1, y1), (x2, y2), track_color, 2)
 
@@ -99,10 +123,23 @@ def draw_global_labels(
         if label:
             parts.append(str(label))
         text = " | ".join(parts)
+        text_color = status_color(label) or (0, 255, 255)
         x1, y1 = max(0, int(track.bbox.x1)), max(0, int(track.bbox.y1))
         cv2.putText(frame, text, (x1, max(20, y1 - 24)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
     return frame
+
+
+def _status_track_color(
+    track_id: int, status: dict[int, object] | None
+) -> tuple[int, int, int] | None:
+    if not status:
+        return None
+    entry = status.get(track_id)
+    label = getattr(entry, "label", None) if entry else None
+    if isinstance(entry, str):
+        label = entry
+    return status_color(label)
 
 
 def _track_color(track_id: int) -> tuple[int, int, int]:

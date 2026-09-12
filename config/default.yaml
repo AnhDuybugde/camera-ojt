@@ -91,8 +91,8 @@ face:
     LeHoAnhDuy: Le Ho Anh Duy
 
 attendance:
-  debounce_hits: 3
-  window_s: 5.0
+  debounce_hits: 2
+  window_s: 8.0
   active_hour_start: null
   active_hour_end: null
 

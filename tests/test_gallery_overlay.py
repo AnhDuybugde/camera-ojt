@@ -52,3 +52,35 @@ def test_draw_global_labels_hides_raw_ids() -> None:
                                  display_name="An")}
     out = draw_global_labels(frame, tracks, status, {5: "An"})
     assert out.shape == frame.shape  # khong crash; raw ByteTrack id khong duoc ve
+
+
+def test_status_colors_by_label() -> None:
+    from camera_tracking.visualization import status_color
+
+    assert status_color("Working") == (40, 180, 40)
+    assert status_color("Away") == (0, 200, 255)
+    assert status_color("Near seat") == (0, 200, 255)
+    assert status_color("Out of office") == (60, 60, 220)
+    assert status_color("Unknown") == (60, 60, 220)
+    assert status_color("Returning") == (255, 150, 0)
+    assert status_color("nope") is None
+    assert status_color(None) is None
+
+
+def test_draw_tracks_accepts_status_colors() -> None:
+    import numpy as np
+
+    from camera_tracking.domain import BoundingBox, Track
+    from camera_tracking.visualization import draw_person_tracks
+    from camera_tracking.workstate.room_fusion import RoomPersonStatus
+
+    frame = np.zeros((100, 200, 3), dtype=np.uint8)
+    tracks = [Track(track_id=5, bbox=BoundingBox(10, 10, 50, 80),
+                    confidence=0.9, age=1, hits=1, confirmed=True)]
+    status = {5: RoomPersonStatus(global_id=5, label="Away", in_room=True,
+                                  display_name=None)}
+    out = draw_person_tracks(frame, tracks, status=status)
+    assert out.shape == frame.shape
+    # Yellow (Away) box border must be present somewhere.
+    yellow = (out[:, :, 0] == 0) & (out[:, :, 1] == 200) & (out[:, :, 2] == 255)
+    assert bool(yellow.any())

@@ -36,6 +36,20 @@ def test_unknown_never_ticks() -> None:
                        wall_time_iso="2026-09-12T08:00:00") is None
 
 
+def test_window_keyed_by_person_survives_fragmentation() -> None:
+    """Same human re-ID'd as G2 then G3 still accumulates one tick."""
+    svc = FaceAttendanceService(debounce_hits=2, window_s=8.0)
+    day = "2026-09-12"
+    assert svc.observe(day=day, global_id=2, person_id="An", display_name="An",
+                       score=0.66, now_s=0.0,
+                       wall_time_iso=f"{day}T08:00:00") is None
+    ticked = svc.observe(day=day, global_id=3, person_id="An", display_name="An",
+                         score=0.7, now_s=1.0,
+                         wall_time_iso=f"{day}T08:00:01")
+    assert ticked is not None and ticked.global_id == 3
+    assert ticked.face_score == 0.7
+
+
 def test_window_expiry_resets_debounce() -> None:
     svc = FaceAttendanceService(debounce_hits=2, window_s=5.0)
     day = "2026-09-12"

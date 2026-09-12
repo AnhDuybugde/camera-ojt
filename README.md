@@ -49,8 +49,11 @@ sua `VITE_STREAM_URL` thanh `http://<IP-may-cam>:8765`, restart `npm run dev`.
 
 Trang thai: ngoi yen = Working, roi khoi diem neo = Away (ca khi van
 trong hinh), vang lau + thay o cam B = Out of office, quay lai =
-Returning. Mat la cap `U-...`, tu gop vao nguoi quen khi khop mat sau
-(log `[Reconcile]`). G non (< 5 hits) khong ghi DB.
+Returning. Overlay/box mau theo trang thai: xanh la Working, vang
+Away/Near seat, xanh duong Returning, do Out/Unknown. Ten hien ngay khi
+khop mat (tick DB van debounce 2 hits/8s, cong don xuyen ID vo vun). Mat la cap `U-...`, tu gop
+vao nguoi quen khi khop mat sau (log `[Reconcile]`). G non (< 5 hits)
+khong ghi DB.
 
 Ve san/workstation (khi co dinh camera): click tool thay vi do tay:
 

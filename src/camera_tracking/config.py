@@ -119,8 +119,8 @@ class FaceConfig(StrictModel):
 class AttendanceConfig(StrictModel):
     """Debounce tick diem danh: k hit cung person trong window moi tick."""
 
-    debounce_hits: int = Field(default=3, ge=1)
-    window_s: float = Field(default=5.0, ge=0)
+    debounce_hits: int = Field(default=2, ge=1)
+    window_s: float = Field(default=8.0, ge=0)
     # Chi tick trong khung gio nay (gio dia phuong, 24h). None = ca ngay.
     # Vi du lam viec: start 6, end 22.
     active_hour_start: int | None = Field(default=None, ge=0, le=23)

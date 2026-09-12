@@ -1,8 +1,10 @@
 """Diem danh debounce cho channel B (cua ra vao).
 
 Quy tac:
-- Moi global_id giu sliding window cac match gan nhat (timestamp, person_id, score).
-- Khi co >= debounce_hits match CUNG person trong window_s va score >= threshold
+- Moi PERSON giu sliding window cac match gan nhat (timestamp, global_id,
+  score). Window theo person (khong theo global_id) de ID vo vun giua
+  chung (G2 -> G3) van cong don du hits.
+- Khi co >= debounce_hits match CUNG person trong window_s
   -> tick attendance 1 lan/ngay (khong tick 2 lan cung nguoi cung ngay).
 - Mat la nhung chua dat debounce -> van nho de hien thi / luu best-shot.
 - Khong match ai -> unknown (de store luu crop rieng).
@@ -28,15 +30,15 @@ class AttendanceRecord:
 @dataclass(slots=True)
 class _WindowHit:
     at_s: float
-    person_id: str
+    global_id: int
     score: float
 
 
 class FaceAttendanceService:
     def __init__(
         self,
-        debounce_hits: int = 3,
-        window_s: float = 5.0,
+        debounce_hits: int = 2,
+        window_s: float = 8.0,
         active_hour_start: int | None = None,
         active_hour_end: int | None = None,
     ) -> None:
@@ -44,7 +46,7 @@ class FaceAttendanceService:
         self.window_s = max(0.0, window_s)
         self.active_hour_start = active_hour_start
         self.active_hour_end = active_hour_end
-        self._windows: dict[int, deque[_WindowHit]] = {}
+        self._windows: dict[str, deque[_WindowHit]] = {}
         self._ticked: dict[tuple[str, str], AttendanceRecord] = {}
         self._pending_best: dict[int, tuple[str, float]] = {}  # gid -> (person_id, score)
 
@@ -63,16 +65,15 @@ class FaceAttendanceService:
         """Nhan 1 match (hoac None neu unknown). Tra record khi VUA tick."""
         if person_id is None:
             return None
-        window = self._windows.setdefault(global_id, deque())
-        window.append(_WindowHit(at_s=now_s, person_id=person_id, score=score))
+        window = self._windows.setdefault(person_id, deque())
+        window.append(_WindowHit(at_s=now_s, global_id=global_id, score=score))
         cutoff = now_s - self.window_s
         while window and window[0].at_s < cutoff:
             window.popleft()
         best = self._pending_best.get(global_id)
         if best is None or score > best[1]:
             self._pending_best[guid_safe(global_id)] = (person_id, float(score))
-        same = [h for h in window if h.person_id == person_id]
-        if len(same) < self.debounce_hits:
+        if len(window) < self.debounce_hits:
             return None
         if not self._in_active_hours(wall_time_iso):
             return None
@@ -87,7 +88,7 @@ class FaceAttendanceService:
             global_id=global_id,
             first_seen_at=now_s,
             wall_time=wall_time_iso,
-            face_score=float(max(h.score for h in same)),
+            face_score=float(max(h.score for h in window)),
         )
         self._ticked[key] = record
         return record
