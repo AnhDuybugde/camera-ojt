@@ -6,8 +6,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Ép RTSP chạy bằng TCP để ổn định hơn
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+# Ép RTSP chạy bằng TCP để ổn định hơn + low latency (khong buffer frame cu)
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+    "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|max_delay;0"
+)
 
 IP = os.getenv("IMOU_IP", "")
 USER = os.getenv("IMOU_USER", "")

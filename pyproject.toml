@@ -18,8 +18,10 @@ dependencies = [
     "lap>=0.5.12",
 ]
 
-[project.optional-dependencies]
-dev = ["pytest>=8.2.0", "ruff>=0.5.0"]
+  [project.optional-dependencies]
+  dev = ["pytest>=8.2.0", "ruff>=0.5.0"]
+  face = ["insightface>=0.7.3", "onnxruntime>=1.17.0"]
+  store = ["supabase>=2.9.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

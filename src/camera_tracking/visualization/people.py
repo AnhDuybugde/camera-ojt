@@ -71,6 +71,40 @@ def draw_person_tracks(
     return frame
 
 
+def draw_global_labels(
+    frame: np.ndarray,
+    tracks: Iterable[Track],
+    status: dict[int, object] | None = None,
+    names: dict[int, str] | None = None,
+) -> np.ndarray:
+    """Ve label hien thi: `G{gid} [| Ten] [| Label EN]`.
+
+    - Chi hien Global ID (track.track_id da la global id tu manager).
+    - Ten chi hien khi da tick diem danh (caller truyen vao).
+    - Label ASCII (Working/Away/Out of office/Returning/Unknown) vi
+      font Hershey cua OpenCV khong ve duoc tieng Viet co dau.
+    - Khong hien ByteTrack raw ID (current ID) bao gio.
+    """
+    status = status or {}
+    names = names or {}
+    for track in tracks:
+        gid = track.track_id
+        parts = [f"G{gid}"]
+        name = names.get(gid)
+        label = getattr(status.get(gid), "label", None) if status.get(gid) else None
+        if isinstance(status.get(gid), str):
+            label = status.get(gid)
+        if name:
+            parts.append(str(name))
+        if label:
+            parts.append(str(label))
+        text = " | ".join(parts)
+        x1, y1 = max(0, int(track.bbox.x1)), max(0, int(track.bbox.y1))
+        cv2.putText(frame, text, (x1, max(20, y1 - 24)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    return frame
+
+
 def _track_color(track_id: int) -> tuple[int, int, int]:
     palette = (
         (0, 200, 255),

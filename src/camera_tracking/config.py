@@ -23,7 +23,7 @@ class CameraConfig(StrictModel):
 
 class DetectionConfig(StrictModel):
     model_path: str = "yolo26s.pt"
-    confidence_threshold: float = Field(default=0.35, ge=0, le=1)
+    confidence_threshold: float = Field(default=0.4, ge=0, le=1)
     person_class_id: int = 0
     image_size: int = 800
     device: str = "auto"
@@ -31,7 +31,7 @@ class DetectionConfig(StrictModel):
 
 class TrackingConfig(StrictModel):
     max_lost_frames: int = Field(default=15, ge=0)
-    min_hits: int = Field(default=2, ge=1)
+    min_hits: int = Field(default=3, ge=1)
     iou_threshold: float = Field(default=0.3, ge=0, le=1)
 
 
@@ -100,6 +100,82 @@ class OutputConfig(StrictModel):
     report_filename: str = "report.json"
 
 
+class FaceConfig(StrictModel):
+    """Nhan dien khuon mat channel B (diem danh). InsightFace buffalo_s."""
+
+    enabled: bool = True
+    gallery_dir: Path = Path("data/images")
+    model_pack: str = "buffalo_s"
+    match_threshold: float = Field(default=0.5, ge=0, le=1)
+    min_face_px: int = Field(default=60, ge=8)
+    min_blur_variance: float = Field(default=60.0, ge=0)
+    min_person_area_px: float = Field(default=8000.0, ge=0)
+    process_every_k: int = Field(default=3, ge=1)
+    det_size: int = Field(default=640, ge=160)
+    # Ten hien thi: {"LeHoAnhDuy": "Le Ho Anh Duy"}; mac dinh dung stem file.
+    name_map: dict[str, str] = Field(default_factory=dict)
+
+
+class AttendanceConfig(StrictModel):
+    """Debounce tick diem danh: k hit cung person trong window moi tick."""
+
+    debounce_hits: int = Field(default=3, ge=1)
+    window_s: float = Field(default=5.0, ge=0)
+    # Chi tick trong khung gio nay (gio dia phuong, 24h). None = ca ngay.
+    # Vi du lam viec: start 6, end 22.
+    active_hour_start: int | None = Field(default=None, ge=0, le=23)
+    active_hour_end: int | None = Field(default=None, ge=0, le=23)
+
+
+class RoomFusionConfig(StrictModel):
+    """Fuse trang thai phong tu channel A (room) + B (door)."""
+
+    leave_confirm_window_s: float = Field(default=300.0, ge=0)
+    inroom_min_interval_s: float = Field(default=3600.0, ge=0)
+    flush_s: float = Field(default=15.0, ge=1)
+
+
+class WorkstationConfig(StrictModel):
+    """One desk/seat: core + extended polygons in FLOOR METERS.
+
+    Same coordinate frame as analytics.calibration floor_points
+    (homography maps bbox foot points into it).
+    """
+
+    name: str
+    core: list[Point]
+    extended: list[Point]
+
+
+class WorkstateConfig(StrictModel):
+    """Position-based work state (replaces motion-based seat logic)."""
+
+    grace_s: float = Field(default=3.0, ge=0)
+    dwell_s: float = Field(default=2.0, ge=0)
+    assign_dwell_s: float = Field(default=5.0, ge=0)
+    hysteresis_m: float = Field(default=0.3, ge=0)
+    motion_influence: float = Field(default=0.0, ge=0, le=1)
+    prune_after_s: float = Field(default=300.0, ge=0)
+    tentative_min_hits: int = Field(default=5, ge=1)
+    person_map: dict[str, str] = Field(default_factory=dict)
+    # INTERIM (no fixed camera / no ROI yet): normalized 0..1 bbox-center
+    # displacement from the first-seen anchor counting as leave-seat.
+    # 0 disables -> pure presence mode.
+    move_ratio: float = Field(default=0.15, ge=0, le=1)
+    settle_ratio: float = Field(default=0.02, ge=0, le=1)
+
+
+class StoreConfig(StrictModel):
+    """Luu tru daily: local faces + Supabase (optional, bat khi co .env)."""
+
+    local_faces_dir: Path = Path("data/faces")
+    queue_db: Path = Path("output/queue.db")
+    supabase_enabled: bool = False
+    max_crops_per_owner_day: int = Field(default=5, ge=1)
+    face_jpeg_quality: int = Field(default=80, ge=10, le=100)
+    face_max_side_px: int = Field(default=512, ge=64)
+
+
 class AppConfig(StrictModel):
     camera: CameraConfig = Field(default_factory=CameraConfig)
     detection: DetectionConfig = Field(default_factory=DetectionConfig)
@@ -107,6 +183,12 @@ class AppConfig(StrictModel):
     identity: GlobalIdentityConfig = Field(default_factory=GlobalIdentityConfig)
     analytics: AnalyticsConfig
     output: OutputConfig = Field(default_factory=OutputConfig)
+    face: FaceConfig = Field(default_factory=FaceConfig)
+    attendance: AttendanceConfig = Field(default_factory=AttendanceConfig)
+    room_fusion: RoomFusionConfig = Field(default_factory=RoomFusionConfig)
+    workstations: list[WorkstationConfig] = Field(default_factory=list)
+    workstate: WorkstateConfig = Field(default_factory=WorkstateConfig)
+    store: StoreConfig = Field(default_factory=StoreConfig)
 
 
 def load_config(path: str | Path) -> AppConfig:

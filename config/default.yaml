@@ -10,15 +10,16 @@ detection:
   # auto = cuda neu co GPU, khong thi mps, khong thi cpu.
   # YOLO26s @ 800px was benchmarked on RTX 3050 6 GB for this two-camera view.
   model_path: yolo26s.pt
-  # Tuned on the IMOU office view: keeps partially occluded seated people.
-  confidence_threshold: 0.25
+  # Precision-first: only confident boxes enter tracking (no low-conf
+  # recovery, so brief occlusions may fragment IDs instead of misassigning).
+  confidence_threshold: 0.4
   person_class_id: 0
   image_size: 800
   device: auto
 
 tracking:
   max_lost_frames: 15
-  min_hits: 2
+  min_hits: 3
   iou_threshold: 0.3
 
 # Global Identity Manager: giu Global Person ID on dinh xuyên tracklet,
@@ -74,3 +75,61 @@ output:
   output_dir: output
   video_filename: annotated.mp4
   report_filename: report.json
+
+# Face attendance (channel B = cua ra vao). InsightFace buffalo_s.
+face:
+  enabled: true
+  gallery_dir: data/images
+  model_pack: buffalo_s
+  match_threshold: 0.5
+  min_face_px: 60
+  min_blur_variance: 60.0
+  min_person_area_px: 8000.0
+  process_every_k: 3
+  det_size: 640
+  name_map:
+    LeHoAnhDuy: Le Ho Anh Duy
+
+attendance:
+  debounce_hits: 3
+  window_s: 5.0
+  active_hour_start: null
+  active_hour_end: null
+
+room_fusion:
+  leave_confirm_window_s: 300.0
+  inroom_min_interval_s: 3600.0
+  flush_s: 15.0
+
+# Workstations in FLOOR METERS (same frame as analytics.calibration
+# floor_points). Measure your desks and fill in; empty list = legacy
+# presence-only business logic (visible = Working).
+# Example:
+# workstations:
+#   - name: desk1
+#     core: [[2.0, 2.5], [3.2, 2.5], [3.2, 3.5], [2.0, 3.5]]
+#     extended: [[1.2, 1.7], [4.0, 1.7], [4.0, 4.3], [1.2, 4.3]]
+workstations: []
+
+# Position-based work state (foot point -> workstation ROI -> stabilizer).
+workstate:
+  grace_s: 3.0            # out of zone shorter than this keeps old state
+  dwell_s: 2.0            # new zone held this long before commit
+  assign_dwell_s: 5.0     # dwell in a core before it becomes "my" workstation
+  hysteresis_m: 0.3       # spatial band against border flicker
+  motion_influence: 0.0   # 0 = pure position+time (motion never decides)
+  prune_after_s: 300.0    # forget per-ID memory after this absence
+  tentative_min_hits: 5   # identity younger than this never touches the DB
+  person_map: {}          # {"LeHoAnhDuy": "desk1"} stable seat override
+  # INTERIM (camera chua co dinh / chua ve ROI): lech tam bbox (0..1) khoi
+  # diem neo vuot nguong nay -> Away. 0 = tat, chi dung hien dien.
+  move_ratio: 0.15
+  settle_ratio: 0.02
+
+store:
+  local_faces_dir: data/faces
+  queue_db: output/queue.db
+  supabase_enabled: true
+  max_crops_per_owner_day: 5
+  face_jpeg_quality: 80
+  face_max_side_px: 512

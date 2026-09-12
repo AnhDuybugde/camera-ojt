@@ -8,6 +8,8 @@ __pycache__/
 # Local environment
 .env
 .env.*
+!dashboard/.env.example
+!.env.example
 
 # Large/local artifacts
 *.pt
@@ -15,13 +17,18 @@ __pycache__/
 data/raw/*
 data/processed/*
 data/samples/*
+data/faces/*
+data/images/*
 models/*
 output/*
+dashboard/node_modules/
+dashboard/dist/
 
 # Keep folder structure
 !data/raw/.gitkeep
 !data/processed/.gitkeep
 !data/samples/.gitkeep
+!data/images/.gitkeep
 !models/.gitkeep
 !output/.gitkeep
 
