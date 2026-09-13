@@ -79,6 +79,8 @@ class GlobalIdentityConfig:
     # Gating: pairs less similar than this in appearance are implausible
     # (only when both sides actually have an embedding).
     min_appearance_similarity: float = 0.30
+    # Strong evidence for merging two simultaneously active cross-camera IDs.
+    active_duplicate_similarity: float = 0.60
     # Lifecycle windows (seconds when timestamps are given, else steps).
     temp_lost_s: float = 5.0
     long_lost_s: float = 60.0
@@ -119,6 +121,7 @@ class IdentityRecord:
     disappear_channel: str = ""
     tracklet_keys: set[str] = field(default_factory=set)
     last_match_score: float = 0.0
+    employee_id: str | None = None
 
 
 class GlobalIdentityManager:
@@ -229,9 +232,106 @@ class GlobalIdentityManager:
                 age=self._step - self._identities[assignments[track.track_id]].first_seen_step + 1,
                 hits=self._identities[assignments[track.track_id]].total_hits,
                 confirmed=track.confirmed,
+                local_track_id=(
+                    track.local_track_id
+                    if track.local_track_id is not None
+                    else track.track_id
+                ),
+                global_person_id=assignments[track.track_id],
+                employee_id=self._identities[assignments[track.track_id]].employee_id,
             )
             for track in tracks
         ]
+
+    def bind_employee(self, global_id: int, employee_id: str) -> None:
+        """Attach durable face identity metadata without changing Global ID.
+
+        Global IDs describe session-level association; employee IDs are the
+        durable face result. Keeping the binding here makes that distinction
+        available to downstream consumers without making face recognition a
+        prerequisite for tracking.
+        """
+        record = self._identities.get(global_id)
+        if record is not None and employee_id:
+            record.employee_id = employee_id
+
+    def employee_id_of(self, global_id: int) -> str | None:
+        record = self._identities.get(global_id)
+        return record.employee_id if record is not None else None
+
+    def merge_identity(self, duplicate_gid: int, canonical_gid: int) -> bool:
+        """Redirect a duplicate Global ID into an older canonical ID."""
+        if duplicate_gid == canonical_gid:
+            return False
+        duplicate = self._identities.get(duplicate_gid)
+        canonical = self._identities.get(canonical_gid)
+        if duplicate is None or canonical is None:
+            return False
+        if (
+            duplicate.employee_id
+            and canonical.employee_id
+            and duplicate.employee_id != canonical.employee_id
+        ):
+            return False
+        if canonical.employee_id is None:
+            canonical.employee_id = duplicate.employee_id
+        canonical.gallery.extend(duplicate.gallery)
+        canonical.tracklet_keys.update(duplicate.tracklet_keys)
+        canonical.total_hits += duplicate.total_hits
+        if duplicate.last_seen_step > canonical.last_seen_step:
+            canonical.bbox = duplicate.bbox
+            canonical.center = duplicate.center
+            canonical.channel = duplicate.channel
+            canonical.last_seen_step = duplicate.last_seen_step
+            canonical.last_seen_s = duplicate.last_seen_s
+            canonical.last_match_score = duplicate.last_match_score
+        for key, gid in list(self._tracklet_to_gid.items()):
+            if gid == duplicate_gid:
+                self._tracklet_to_gid[key] = canonical_gid
+        del self._identities[duplicate_gid]
+        return True
+
+    def reconcile_active_duplicates(self) -> dict[int, int]:
+        """Merge very-high-similarity active identities across cameras."""
+        active = [
+            record for record in self._identities.values()
+            if record.state in (IdentityState.ACTIVE, IdentityState.TEMP_LOST)
+        ]
+        aliases: dict[int, int] = {}
+        for index, left in enumerate(active):
+            if left.global_id not in self._identities:
+                continue
+            for right in active[index + 1:]:
+                if right.global_id not in self._identities:
+                    continue
+                # Same-camera duplicates are possible when detector output
+                # contains a nested box or ByteTrack fragments one person.
+                # Only merge them when their boxes genuinely overlap; this
+                # prevents two nearby, similarly dressed people from being
+                # collapsed into one Global ID.
+                if (
+                    left.channel == right.channel
+                    and not _same_camera_duplicate(left, right)
+                ):
+                    continue
+                if (
+                    left.employee_id
+                    and right.employee_id
+                    and left.employee_id != right.employee_id
+                ):
+                    continue
+                similarity = _gallery_pair_similarity(left.gallery, right.gallery)
+                if similarity < self.config.active_duplicate_similarity:
+                    continue
+                verified = [
+                    record.global_id for record in (left, right)
+                    if record.employee_id
+                ]
+                canonical = min(verified or [left.global_id, right.global_id])
+                duplicate = right.global_id if canonical == left.global_id else left.global_id
+                if self.merge_identity(duplicate, canonical):
+                    aliases[duplicate] = canonical
+        return aliases
 
     # ------------------------------------------------------------- matching
     def _associate(
@@ -333,7 +433,9 @@ class GlobalIdentityManager:
             and max(1, int(track.bbox.width)) >= self.config.min_gallery_crop_pixels
             and max(1, int(track.bbox.height)) >= self.config.min_gallery_crop_pixels
         ):
-            record.gallery.append(np.asarray(embedding, dtype=np.float32).ravel())
+            normalized = _normalize_embedding(embedding)
+            if normalized is not None:
+                record.gallery.append(normalized)
         record.bbox = track.bbox
         record.center = _center(track.bbox)
         record.channel = channel
@@ -357,7 +459,9 @@ class GlobalIdentityManager:
         self._next_global_id += 1
         gallery: deque[np.ndarray] = deque(maxlen=self.config.gallery_size)
         if embedding is not None:
-            gallery.append(np.asarray(embedding, dtype=np.float32).ravel())
+            normalized = _normalize_embedding(embedding)
+            if normalized is not None:
+                gallery.append(normalized)
         record = IdentityRecord(
             global_id=gid,
             gallery=gallery,
@@ -486,11 +590,56 @@ def _gallery_similarity(
     """Best cosine similarity against the gallery (robust to pose changes)."""
     if embedding is None or not gallery:
         return 0.0
-    query = np.asarray(embedding, dtype=np.float32).ravel()
+    query = _normalize_embedding(embedding)
+    if query is None:
+        return 0.0
     best = 0.0
     for stored in gallery:
         best = max(best, _cosine_similarity(query, stored))
     return best
+
+
+def _gallery_pair_similarity(
+    left: deque[np.ndarray], right: deque[np.ndarray]
+) -> float:
+    """Return the best normalized similarity between two identity galleries."""
+    if not left or not right:
+        return 0.0
+    return max(
+        _cosine_similarity(first, second)
+        for first in left
+        for second in right
+    )
+
+
+def _same_camera_duplicate(left: IdentityRecord, right: IdentityRecord) -> bool:
+    """Whether two same-camera records look like overlapping duplicate boxes."""
+    if left.bbox is None or right.bbox is None:
+        return False
+    intersection = _bbox_intersection(left.bbox, right.bbox)
+    if intersection <= 0:
+        return False
+    smaller_area = min(left.bbox.area, right.bbox.area)
+    union = left.bbox.area + right.bbox.area - intersection
+    if smaller_area <= 0 or union <= 0:
+        return False
+    containment = intersection / smaller_area
+    iou = intersection / union
+    return containment >= 0.85 or iou >= 0.50
+
+
+def _bbox_intersection(left: BoundingBox, right: BoundingBox) -> float:
+    return max(0.0, min(left.x2, right.x2) - max(left.x1, right.x1)) * max(
+        0.0, min(left.y2, right.y2) - max(left.y1, right.y1)
+    )
+
+
+def _normalize_embedding(embedding: np.ndarray | None) -> np.ndarray | None:
+    if embedding is None:
+        return None
+    vector = np.asarray(embedding, dtype=np.float32).ravel()
+    norm = float(np.linalg.norm(vector))
+    return vector / norm if norm > 1e-12 else None
 
 
 def _cosine_similarity(left: np.ndarray | None, right: np.ndarray | None) -> float:

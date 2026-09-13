@@ -77,6 +77,7 @@ class ByteTrackTracker:
                     age=self._ages[track_id],
                     hits=self._hits[track_id],
                     confirmed=self._hits[track_id] >= self.min_hits,
+                    local_track_id=track_id,
                 )
             )
         return output

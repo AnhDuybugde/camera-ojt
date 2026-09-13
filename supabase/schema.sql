@@ -10,6 +10,14 @@ create table if not exists public.persons (
   created_at timestamptz not null default now()
 );
 
+-- Initial enrolled employee for data/images/LeHoAnhDuy.jpg.
+insert into public.persons (person_id, display_name, photo_url, active)
+values ('1', 'Le Ho Anh Duy', 'data/images/LeHoAnhDuy.jpg', true)
+on conflict (person_id) do update set
+  display_name = excluded.display_name,
+  photo_url = excluded.photo_url,
+  active = excluded.active;
+
 create table if not exists public.attendance_daily (
   date date not null,
   person_id text not null references public.persons(person_id) on delete cascade,
@@ -36,6 +44,16 @@ create table if not exists public.room_status_daily (
   updated_at timestamptz not null default now(),
   edited_by text,
   primary key (date, global_id)
+);
+
+create table if not exists public.employee_current_state (
+  employee_id text primary key references public.persons(person_id) on delete cascade,
+  state text not null,
+  since timestamptz not null default now(),
+  camera_id text,
+  global_id integer,
+  confidence double precision,
+  updated_at timestamptz not null default now()
 );
 
 create table if not exists public.room_events (
@@ -72,6 +90,7 @@ create table if not exists public.roles (
 alter table public.persons enable row level security;
 alter table public.attendance_daily enable row level security;
 alter table public.room_status_daily enable row level security;
+alter table public.employee_current_state enable row level security;
 alter table public.room_events enable row level security;
 alter table public.face_crops enable row level security;
 alter table public.roles enable row level security;
@@ -79,6 +98,7 @@ alter table public.roles enable row level security;
 create policy "read all" on public.persons for select to authenticated using (true);
 create policy "read all" on public.attendance_daily for select to authenticated using (true);
 create policy "read all" on public.room_status_daily for select to authenticated using (true);
+create policy "read all" on public.employee_current_state for select to authenticated using (true);
 create policy "read all" on public.room_events for select to authenticated using (true);
 create policy "read all" on public.face_crops for select to authenticated using (true);
 create policy "self role" on public.roles for select to authenticated
@@ -97,6 +117,12 @@ create policy "admin write attendance" on public.attendance_daily
     exists (select 1 from public.roles r where r.user_id = auth.uid() and r.role = 'admin')
   );
 create policy "admin write room status" on public.room_status_daily
+  for all to authenticated using (
+    exists (select 1 from public.roles r where r.user_id = auth.uid() and r.role = 'admin')
+  ) with check (
+    exists (select 1 from public.roles r where r.user_id = auth.uid() and r.role = 'admin')
+  );
+create policy "admin write current state" on public.employee_current_state
   for all to authenticated using (
     exists (select 1 from public.roles r where r.user_id = auth.uid() and r.role = 'admin')
   ) with check (

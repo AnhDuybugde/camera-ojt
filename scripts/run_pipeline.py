@@ -14,7 +14,10 @@ from camera_tracking.pipeline import build_pipeline
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run camera tracking pipeline.")
+    parser = argparse.ArgumentParser(
+        description="Run the legacy single-camera analytics demo. "
+        "Use run_workstate.py for the production two-camera path."
+    )
     parser.add_argument(
         "--config",
         type=Path,
@@ -56,6 +59,7 @@ def main() -> None:
         f"Done: occupancy={snapshot.occupancy}, entries={snapshot.entries}, "
         f"exits={snapshot.exits}, report={config.output.output_dir / config.output.report_filename}"
     )
+    print(f"Stage metrics: {pipeline.metrics.snapshot()}")
 
 
 if __name__ == "__main__":

@@ -24,6 +24,8 @@ class CameraConfig(StrictModel):
 class DetectionConfig(StrictModel):
     model_path: str = "yolo26s.pt"
     confidence_threshold: float = Field(default=0.4, ge=0, le=1)
+    nms_iou_threshold: float = Field(default=0.50, ge=0, le=1)
+    nested_box_containment_threshold: float = Field(default=0.85, ge=0, le=1)
     person_class_id: int = 0
     image_size: int = 800
     device: str = "auto"
@@ -33,6 +35,7 @@ class TrackingConfig(StrictModel):
     max_lost_frames: int = Field(default=15, ge=0)
     min_hits: int = Field(default=3, ge=1)
     iou_threshold: float = Field(default=0.3, ge=0, le=1)
+    byte_match_threshold: float = Field(default=0.50, ge=0, le=1)
 
 
 class GlobalIdentityConfig(StrictModel):
@@ -46,10 +49,14 @@ class GlobalIdentityConfig(StrictModel):
     match_threshold: float = Field(default=0.40, ge=0, le=1)
     max_center_distance_ratio: float = Field(default=0.35, gt=0)
     min_appearance_similarity: float = Field(default=0.30, ge=0, le=1)
+    active_duplicate_similarity: float = Field(default=0.60, ge=0, le=1)
     temp_lost_s: float = Field(default=5.0, ge=0)
     long_lost_s: float = Field(default=60.0, ge=0)
     unresolved_keep_s: float = Field(default=300.0, ge=0)
     min_gallery_confidence: float = Field(default=0.25, ge=0, le=1)
+    reid_backend: Literal["osnet", "histogram"] = "osnet"
+    reid_model: str = "osnet_x1_0"
+    reid_device: Literal["auto", "cpu", "cuda"] = "auto"
 
 
 class CalibrationConfig(StrictModel):
@@ -106,20 +113,22 @@ class FaceConfig(StrictModel):
     enabled: bool = True
     gallery_dir: Path = Path("data/images")
     model_pack: str = "buffalo_s"
-    match_threshold: float = Field(default=0.5, ge=0, le=1)
-    min_face_px: int = Field(default=60, ge=8)
-    min_blur_variance: float = Field(default=60.0, ge=0)
-    min_person_area_px: float = Field(default=8000.0, ge=0)
+    match_threshold: float = Field(default=0.3, ge=0, le=1)
+    min_face_px: int = Field(default=32, ge=8)
+    min_blur_variance: float = Field(default=20.0, ge=0)
+    min_person_area_px: float = Field(default=2000.0, ge=0)
     process_every_k: int = Field(default=3, ge=1)
     det_size: int = Field(default=640, ge=160)
     # Ten hien thi: {"LeHoAnhDuy": "Le Ho Anh Duy"}; mac dinh dung stem file.
     name_map: dict[str, str] = Field(default_factory=dict)
+    # Employee ID trong database: {"LeHoAnhDuy": "1"}.
+    employee_map: dict[str, str] = Field(default_factory=dict)
 
 
 class AttendanceConfig(StrictModel):
     """Debounce tick diem danh: k hit cung person trong window moi tick."""
 
-    debounce_hits: int = Field(default=2, ge=1)
+    debounce_hits: int = Field(default=1, ge=1)
     window_s: float = Field(default=8.0, ge=0)
     # Chi tick trong khung gio nay (gio dia phuong, 24h). None = ca ngay.
     # Vi du lam viec: start 6, end 22.

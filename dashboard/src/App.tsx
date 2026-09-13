@@ -48,6 +48,15 @@ type LivePerson = {
   in_room: boolean
 }
 
+type PendingAttendance = {
+  date: string
+  person_id: string
+  person_name: string
+  global_id: number
+  check_in_at: string
+  face_score: number
+}
+
 const STREAM_URL = (import.meta.env.VITE_STREAM_URL as string | undefined)?.replace(/\/$/, '') ?? ''
 
 // Old rows in the DB may still carry Vietnamese labels; normalize to EN.
@@ -94,6 +103,8 @@ export default function App() {
   const [msg, setMsg] = useState('')
   const [isError, setIsError] = useState(false)
   const [livePeople, setLivePeople] = useState<LivePerson[]>([])
+  const [pendingAttendance, setPendingAttendance] = useState<PendingAttendance[]>([])
+  const [sendingAttendance, setSendingAttendance] = useState(false)
   const [liveOk, setLiveOk] = useState(false)
 
   useEffect(() => {
@@ -111,8 +122,8 @@ export default function App() {
     setIsError(error)
   }
 
-  async function load() {
-    note('Loading...')
+  async function load(showLoading = true) {
+    if (showLoading) note('Loading...')
     const [a, r, e] = await Promise.all([
       supabase.from('attendance_daily').select('*').eq('date', day).order('check_in_at'),
       // Hide rows merged into a canonical Global ID by face reconcile.
@@ -138,6 +149,14 @@ export default function App() {
   }, [day])
 
   useEffect(() => {
+    const timer = setInterval(() => {
+      void load(false)
+    }, 5000)
+    return () => clearInterval(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [day])
+
+  useEffect(() => {
     if (!STREAM_URL) return
     let alive = true
     async function poll() {
@@ -147,6 +166,7 @@ export default function App() {
         const data = await res.json()
         if (!alive) return
         setLivePeople((data.people ?? []) as LivePerson[])
+        setPendingAttendance((data.pending_attendance ?? []) as PendingAttendance[])
         setLiveOk(true)
       } catch {
         if (alive) setLiveOk(false)
@@ -156,6 +176,22 @@ export default function App() {
     const timer = setInterval(poll, 2000)
     return () => { alive = false; clearInterval(timer) }
   }, [])
+
+  async function sendPendingAttendance() {
+    if (!STREAM_URL || pendingAttendance.length === 0) return
+    setSendingAttendance(true)
+    try {
+      const res = await fetch(STREAM_URL + '/attendance/send')
+      const data = await res.json()
+      note('Sent ' + (data.sent ?? 0) + ' attendance record(s).' +
+        (data.failed ? ' Failed: ' + data.failed + '.' : ''))
+      await load(false)
+    } catch {
+      note('Could not send attendance to Supabase.', true)
+    } finally {
+      setSendingAttendance(false)
+    }
+  }
 
   async function login(e: React.FormEvent) {
     e.preventDefault()
@@ -231,7 +267,7 @@ export default function App() {
           Date:{' '}
           <input type="date" value={day} onChange={(e) => setDay(e.target.value)} />
         </label>
-        <button onClick={load}>Reload</button>
+        <button onClick={() => load()}>Reload</button>
         <span className="spacer">
           {user ? (
             <span className="user-chip">
@@ -283,6 +319,24 @@ export default function App() {
 
       <section className="card">
         <h2>Attendance ({attendance.length})</h2>
+        {pendingAttendance.length > 0 && (
+          <div className="pending-attendance">
+            <p>
+              Pending local attendance: {pendingAttendance.length}
+              {' '}
+              <button onClick={sendPendingAttendance} disabled={sendingAttendance}>
+                {sendingAttendance ? 'Sending...' : 'Send to Supabase'}
+              </button>
+            </p>
+            <ul>
+              {pendingAttendance.map((r) => (
+                <li key={r.date + '-' + r.person_id}>
+                  G{r.global_id} — {r.person_name} — score {r.face_score.toFixed(2)}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         <table>
           <thead>
             <tr>

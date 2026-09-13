@@ -71,11 +71,11 @@ class ChannelBusinessTracker:
     """
 
     channel: str = "A"
-    away_grace_s: float = 3.0
+    away_grace_s: float = 1.5
     out_after_s: float = 20.0
     return_stable_s: float = 2.0
     workstations: list[WorkstationZone] = field(default_factory=list)
-    grace_s: float = 3.0
+    grace_s: float = 1.5
     dwell_s: float = 2.0
     assign_dwell_s: float = 5.0
     hysteresis_m: float = 0.3

@@ -49,7 +49,8 @@ def draw_person_tracks(
         x1, y1, x2, y2 = map(round, (box.x1, box.y1, box.x2, box.y2))
         cv2.rectangle(frame, (x1, y1), (x2, y2), track_color, 2)
 
-        label = f"ID {track.track_id}  {track.confidence:.2f}"
+        # track_id is the shared Global ID after identity association.
+        label = f"G{track.track_id}  {track.confidence:.2f}"
         (label_width, label_height), baseline = cv2.getTextSize(
             label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1
         )
@@ -100,6 +101,7 @@ def draw_global_labels(
     tracks: Iterable[Track],
     status: dict[int, object] | None = None,
     names: dict[int, str] | None = None,
+    employee_ids: dict[int, str] | None = None,
 ) -> np.ndarray:
     """Ve label hien thi: `G{gid} [| Ten] [| Label EN]`.
 
@@ -111,6 +113,7 @@ def draw_global_labels(
     """
     status = status or {}
     names = names or {}
+    employee_ids = employee_ids or {}
     for track in tracks:
         gid = track.track_id
         parts = [f"G{gid}"]
@@ -119,7 +122,11 @@ def draw_global_labels(
         if isinstance(status.get(gid), str):
             label = status.get(gid)
         if name:
-            parts.append(str(name))
+            employee_id = employee_ids.get(gid)
+            # OpenCV Hershey fonts are ASCII-only; Unicode separators become
+            # question marks in the live overlay.
+            identity = f"ID {employee_id} - {name}" if employee_id else str(name)
+            parts.append(f"({identity})")
         if label:
             parts.append(str(label))
         text = " | ".join(parts)

@@ -2,11 +2,32 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Self
+from threading import Lock
 
 import cv2
+from typing_extensions import Self
 
 from camera_tracking.domain import Frame
+
+
+class FrameHub:
+    """Thread-safe latest-frame store shared by camera consumers."""
+
+    def __init__(self) -> None:
+        self._frames: dict[str, Frame] = {}
+        self._lock = Lock()
+
+    def publish(self, channel: str, frame: Frame) -> None:
+        with self._lock:
+            self._frames[channel] = frame
+
+    def latest(self, channel: str) -> Frame | None:
+        with self._lock:
+            return self._frames.get(channel)
+
+    def snapshot(self) -> dict[str, Frame]:
+        with self._lock:
+            return dict(self._frames)
 
 
 class OpenCVFrameSource:

@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-
 LABEL_WORKING = "Working"
 LABEL_AWAY_SEAT = "Away"
 LABEL_NEAR_SEAT = "Near seat"

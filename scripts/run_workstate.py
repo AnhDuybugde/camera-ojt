@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -42,13 +43,15 @@ os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
 import cv2
 import numpy as np
 
+from camera_tracking.camera import FrameHub
 from camera_tracking.config import load_config
 from camera_tracking.detection import YoloPersonDetector, resolve_device
+from camera_tracking.domain import Frame, Track, TrackEvent
+from camera_tracking.runtime import StageMetrics
 from camera_tracking.tracking import (
     ByteTrackTracker,
     GlobalIdentityConfig,
     GlobalIdentityManager,
-    IdentityState,
     StablePersonCount,
 )
 from camera_tracking.visualization import draw_global_labels, draw_person_tracks
@@ -57,7 +60,9 @@ from camera_tracking.workstate import (
     ChannelBusinessTracker,
     HistogramEmbedding,
     IdentityReconciler,
+    OsnetEmbedding,
     RoomPresenceAggregator,
+    WorkstateConsumer,
     WorkstationZone,
 )
 
@@ -256,7 +261,7 @@ def parse_args() -> argparse.Namespace:
                         help="Bo box nguoi nho hon nguong (px^2) de giam nhieu.")
     parser.add_argument("--match-threshold", type=float, default=None,
                         help="Override identity match_threshold trong config.")
-    parser.add_argument("--away-grace-s", type=float, default=3.0,
+    parser.add_argument("--away-grace-s", type=float, default=1.5,
                         help="Business: absent/seat-leave over N sec -> AWAY.")
     parser.add_argument("--out-after-s", type=float, default=20.0,
                         help="Business: absent over N sec -> POSSIBLY_OUT.")
@@ -347,15 +352,32 @@ def _person_crop(frame: np.ndarray, bbox) -> np.ndarray | None:
     return frame[y1:y2, x1:x2]
 
 
-def _flush_queue(queue, supabase) -> tuple[int, int]:
+def _flush_queue(
+    queue,
+    supabase,
+    *,
+    defer_attendance: bool = False,
+    attendance_only: bool = False,
+) -> tuple[int, int]:
     """Day pending writes len Supabase. Tra (ok, fail). Gap loi thi dung lai."""
     ok = fail = 0
     for row_id, kind, payload, _attempts in queue.peek(100):
+        is_check_in = kind == "event" and payload.get("event") == "CHECK_IN"
+        is_known_crop = kind == "face_crop" and "/known/" in payload.get(
+            "storage_path", ""
+        ).replace("\\", "/")
+        is_attendance = kind == "attendance" or is_check_in or is_known_crop
+        if attendance_only and not is_attendance:
+            continue
+        if defer_attendance and is_attendance:
+            continue
         done = False
         if kind == "attendance":
             done = supabase.upsert_attendance(payload)
         elif kind == "room_status":
             done = supabase.upsert_room_status(payload)
+        elif kind == "current_state":
+            done = supabase.upsert_current_state(payload)
         elif kind == "event":
             done = supabase.insert_event(payload)
         elif kind == "face_crop":
@@ -368,26 +390,43 @@ def _flush_queue(queue, supabase) -> tuple[int, int]:
         else:
             queue.bump(row_id)
             fail += 1
-            break
+            # One stale/unsupported row (for example an old schema write)
+            # must not block newer attendance records behind it.
+            continue
     return ok, fail
 
 
-def _store_or_queue(queue, supabase, kind: str, payload: dict) -> None:
-    """Ghi thang Supabase neu online, khong thi day vao queue (chong mat data)."""
-    direct = False
-    if supabase.ready or supabase.settings.enabled:
+def _pending_attendance_rows(
+    attendance,
+    queue,
+    sent_keys: set[tuple[str, str]],
+) -> list[dict]:
+    """Serialize in-memory and queued attendance for the dashboard."""
+    rows = {
+        (record.day, record.person_id): {
+            "date": record.day,
+            "person_id": record.person_id,
+            "person_name": record.display_name,
+            "global_id": record.global_id,
+            "check_in_at": record.wall_time,
+            "face_score": record.face_score,
+        }
+        for record in attendance.records_for_day(
+            datetime.now().astimezone().date().isoformat()
+        )
+    }
+    for _row_id, kind, payload, _attempts in queue.peek(500):
         if kind == "attendance":
-            direct = supabase.upsert_attendance(payload)
-        elif kind == "room_status":
-            direct = supabase.upsert_room_status(payload)
-        elif kind == "event":
-            direct = supabase.insert_event(payload)
-        elif kind == "face_crop":
-            direct = supabase.upload_face_crop(
-                payload.get("local_path", ""), payload.get("storage_path", "")
-            )
-    if not direct:
-        queue.push(kind, payload)
+            rows[(payload["date"], payload["person_id"])] = payload
+    return [
+        row for key, row in rows.items()
+        if key not in sent_keys
+    ]
+
+
+def _store_or_queue(queue, supabase, kind: str, payload: dict) -> None:
+    """Queue a write; the inference loop must never block on Supabase."""
+    queue.push(kind, payload)
 
 
 def _merge_same_person_stale(
@@ -396,24 +435,42 @@ def _merge_same_person_stale(
     day_str: str, canon_gid: int, person_id: str, display_name: str,
     manager, business_trackers=(),
 ) -> None:
-    """Alias OTHER gids of the same face-matched person into canon_gid.
+    """Alias duplicate Global IDs of the same face-matched person.
 
     Fixes the G1-OUT + G2-Working split-brain: when the same human was
-    fragmented across IDs, the stale (non-ACTIVE) duplicate is backfilled
-    with person info + merged_into so the dashboard hides it. A duplicate
-    that is still ACTIVE (two bodies visible) is left alone: ambiguous.
+    fragmented across IDs, the older Global ID is kept as canonical and the
+    newer duplicate is backfilled with person info + merged_into.
     """
-    for old_gid, pid in list(gid_to_person.items()):
-        if pid != person_id or old_gid == canon_gid or old_gid in gid_alias:
+    matching_gids = {
+        gid for gid, pid in gid_to_person.items()
+        if pid == person_id and gid not in gid_alias
+    }
+    # Include identities that were previously face-bound but are currently
+    # Away/TEMP_LOST and therefore no longer present in the live maps.
+    matching_gids.update(
+        gid for gid, record in manager.identities.items()
+        if record.employee_id == person_id and gid not in gid_alias
+    )
+    candidate_gids = {canon_gid, *matching_gids}
+    verified_gids = {
+        gid for gid in candidate_gids
+        if manager.employee_id_of(gid) == person_id
+        or gid_to_person.get(gid) == person_id
+    }
+    canonical_gid = min(verified_gids or candidate_gids)
+    for old_gid in sorted(matching_gids):
+        if old_gid == canonical_gid:
             continue
-        record = manager.identities.get(old_gid)
-        if record is not None and record.state is IdentityState.ACTIVE:
+        if not manager.merge_identity(old_gid, canonical_gid):
             continue
-        gid_alias[old_gid] = canon_gid
+        gid_alias[old_gid] = canonical_gid
+        gid_to_person[canonical_gid] = person_id
+        gid_to_display[canonical_gid] = display_name
+        gid_to_person[old_gid] = person_id
         gid_to_display[old_gid] = display_name
         for tracker in business_trackers:
             try:
-                tracker.transfer_assignment(old_gid, canon_gid)
+                tracker.transfer_assignment(old_gid, canonical_gid)
             except Exception:  # noqa: BLE001 - never break the loop
                 pass
         cached = day_cache._status.get((day_str, old_gid))
@@ -422,9 +479,41 @@ def _merge_same_person_stale(
             "person_id": person_id, "person_name": display_name,
             "in_room": cached.in_room if cached else True,
             "label": cached.label if cached else LABEL_UNKNOWN,
-            "merged_into": canon_gid,
+            "merged_into": canonical_gid,
         })
-        print(f"[Reconcile] stale G{old_gid} -> G{canon_gid} {display_name}")
+        print(f"[Reconcile] G{old_gid} -> G{canonical_gid} {display_name}")
+
+
+def _remap_tracks(
+    tracks: list[Track],
+    gid_alias: dict[int, int],
+    manager,
+) -> list[Track]:
+    """Replace live duplicate Global IDs after an identity merge."""
+    remapped: list[Track] = []
+    for track in tracks:
+        gid = track.track_id
+        seen: set[int] = set()
+        while gid in gid_alias and gid not in seen:
+            seen.add(gid)
+            gid = gid_alias[gid]
+        if gid == track.track_id:
+            remapped.append(track)
+            continue
+        remapped.append(
+            Track(
+                track_id=gid,
+                bbox=track.bbox,
+                confidence=track.confidence,
+                age=track.age,
+                hits=track.hits,
+                confirmed=track.confirmed,
+                local_track_id=track.local_track_id,
+                global_person_id=gid,
+                employee_id=manager.employee_id_of(gid),
+            )
+        )
+    return remapped
 
 
 def _reconcile_unknowns(
@@ -471,6 +560,7 @@ def _reconcile_unknowns(
 def _prune_identity_maps(
     manager, gid_to_person, gid_to_display, gid_to_score,
     unknown_of_gid, reconciler, fusion, business_trackers=(),
+    face_consumer=None,
 ) -> None:
     """Drop per-ID memory for identities the manager already retired.
 
@@ -478,6 +568,8 @@ def _prune_identity_maps(
     the dashboard live list. DB history rows are kept (audit).
     """
     alive = set(manager.identities)
+    if face_consumer is not None:
+        face_consumer.forget_retired(alive)
     for store in (gid_to_person, gid_to_display, gid_to_score):
         for gid in [g for g in store if g not in alive]:
             store.pop(gid, None)
@@ -554,6 +646,10 @@ def main() -> None:
         person_class_id=config.detection.person_class_id,
         image_size=image_size,
         device=device,
+        nms_iou_threshold=config.detection.nms_iou_threshold,
+        nested_box_containment_threshold=(
+            config.detection.nested_box_containment_threshold
+        ),
     )
     effective_fps = max(1, round(config.camera.fps / config.camera.process_every_n_frames))
     tracker_a = ByteTrackTracker(
@@ -562,7 +658,7 @@ def main() -> None:
         track_high_threshold=args.new_track_conf,
         track_low_threshold=args.new_track_conf,
         new_track_threshold=args.new_track_conf,
-        match_threshold=0.9,
+        match_threshold=config.tracking.byte_match_threshold,
         min_hits=config.tracking.min_hits,
     )
     tracker_b = ByteTrackTracker(
@@ -571,15 +667,30 @@ def main() -> None:
         track_high_threshold=args.new_track_conf,
         track_low_threshold=args.new_track_conf,
         new_track_threshold=args.new_track_conf,
-        match_threshold=0.9,
+        match_threshold=config.tracking.byte_match_threshold,
         min_hits=config.tracking.min_hits,
     )
-    embedder = HistogramEmbedding()
     identity_cfg = config.identity
     if args.match_threshold is not None:
         identity_cfg = identity_cfg.model_copy(
             update={"match_threshold": args.match_threshold}
         )
+    try:
+        if identity_cfg.reid_backend == "osnet":
+            embedder = OsnetEmbedding(
+                model_name=identity_cfg.reid_model,
+                device=identity_cfg.reid_device,
+            )
+            # Validate the optional backend before opening camera streams.
+            embedder.load()
+            print(f"ReID: OSNet {identity_cfg.reid_model} ({identity_cfg.reid_device})")
+        else:
+            embedder = HistogramEmbedding()
+            print("ReID: HSV histogram fallback")
+    except Exception as error:  # optional backend must not stop camera startup
+        print(f"ReID OSNet unavailable, fallback histogram: {error}")
+        embedder = HistogramEmbedding()
+
     # Mot GlobalIdentityManager dung chung cho ca 2 channel -> Global ID
     # xuyen tracklet, xuyen mat dau dai, xuyen channel.
     manager = GlobalIdentityManager(
@@ -593,6 +704,7 @@ def main() -> None:
             match_threshold=identity_cfg.match_threshold,
             max_center_distance_ratio=identity_cfg.max_center_distance_ratio,
             min_appearance_similarity=identity_cfg.min_appearance_similarity,
+            active_duplicate_similarity=identity_cfg.active_duplicate_similarity,
             temp_lost_s=identity_cfg.temp_lost_s,
             long_lost_s=identity_cfg.long_lost_s,
             unresolved_keep_s=identity_cfg.unresolved_keep_s,
@@ -651,6 +763,8 @@ def main() -> None:
         return_stable_s=args.return_stable_s,
         prune_after_s=ws_cfg.prune_after_s,
     )
+    workstate_a = WorkstateConsumer(business_a)
+    workstate_b = WorkstateConsumer(business_b)
     count_a = StablePersonCount(rise_frames=3, fall_frames=12)
     count_b = StablePersonCount(rise_frames=3, fall_frames=12)
 
@@ -659,7 +773,7 @@ def main() -> None:
     face_cfg = config.face
     face_threshold = args.face_threshold or face_cfg.match_threshold
     use_face = bool(face_cfg.enabled and not args.no_face)
-    face_embedder = face_matcher = face_gallery = attendance = None
+    face_embedder = face_matcher = face_gallery = attendance = face_consumer = None
     gid_to_person: dict[int, str] = {}
     gid_to_display: dict[int, str] = {}
     gid_to_score: dict[int, float] = {}
@@ -684,9 +798,20 @@ def main() -> None:
                 use_face = False
             if use_face:
                 face_gallery = load_gallery(
-                    face_cfg.gallery_dir, face_embedder, face_cfg.name_map
+                    face_cfg.gallery_dir,
+                    face_embedder,
+                    face_cfg.name_map,
+                    face_cfg.employee_map,
                 )
                 face_matcher = FaceMatcher(face_gallery, threshold=face_threshold)
+                from camera_tracking.face import FaceTrackConsumer
+                face_consumer = FaceTrackConsumer(
+                    face_embedder,
+                    face_matcher,
+                    min_person_area_px=face_cfg.min_person_area_px,
+                    min_face_px=face_cfg.min_face_px,
+                    min_blur_variance=face_cfg.min_blur_variance,
+                )
                 attendance = FaceAttendanceService(
                     debounce_hits=config.attendance.debounce_hits,
                     window_s=config.attendance.window_s,
@@ -699,10 +824,9 @@ def main() -> None:
             print(f"Face disabled (thieu module: {error})")
             use_face = False
 
-    from camera_tracking.face import face_sharpness
     from camera_tracking.store.daily import DailyStateCache
     from camera_tracking.store.faces import FaceCropSaver
-    from camera_tracking.store.queue import WriteQueue
+    from camera_tracking.store.queue import WriteQueue, WriteQueueWorker
     from camera_tracking.store.supabase_client import SupabaseSettings, SupabaseStore
 
     day_cache = DailyStateCache(
@@ -718,11 +842,18 @@ def main() -> None:
     supabase = SupabaseStore(
         SupabaseSettings.from_env(config.store.supabase_enabled)
     )
+    write_worker = WriteQueueWorker(
+        write_queue,
+        lambda: _flush_queue(
+            write_queue, supabase, defer_attendance=True
+        ),
+        interval_s=1.0,
+    )
+    write_worker.start()
     if config.store.supabase_enabled:
-        if supabase.connect():
-            print("Supabase: connected.")
-        else:
-            print(f"Supabase: local-only ({supabase.last_error or 'thieu SUPABASE_URL/KEY'})")
+        print("Supabase: asynchronous writer enabled.")
+    else:
+        print("Supabase: disabled; writes remain in local queue.")
     fusion = RoomPresenceAggregator(
         leave_confirm_window_s=config.room_fusion.leave_confirm_window_s
     )
@@ -735,11 +866,45 @@ def main() -> None:
     # --- Live MJPEG stream for the dashboard (2 cameras + model overlay) ---
     stream_on = False
     streamer = None
+    jpeg_renderer = None
     if not args.no_stream and args.stream_port:
-        from camera_tracking.streaming import MjpegStreamer
+        from camera_tracking.streaming import LatestJpegRenderer, MjpegStreamer
         streamer = MjpegStreamer(host=args.stream_host, port=args.stream_port)
         stream_on = streamer.start()
+        sent_attendance_keys: set[tuple[str, str]] = set()
+        attendance_send_lock = threading.Lock()
+
+        def pending_attendance() -> list[dict]:
+            if attendance is None:
+                return []
+            return _pending_attendance_rows(
+                attendance, write_queue, sent_attendance_keys
+            )
+
+        def send_attendance() -> dict:
+            if attendance is None:
+                return {"sent": 0, "failed": 0}
+            with attendance_send_lock:
+                ok, fail = _flush_queue(
+                    write_queue, supabase, attendance_only=True
+                )
+                pending_keys = {
+                    (row["date"], row["person_id"])
+                    for row_id, kind, row, attempts in write_queue.peek(500)
+                    if kind == "attendance"
+                }
+                for record in attendance.records_for_day(
+                    datetime.now().astimezone().date().isoformat()
+                ):
+                    key = (record.day, record.person_id)
+                    if key not in pending_keys:
+                        sent_attendance_keys.add(key)
+                return {"sent": ok, "failed": fail}
+
+        streamer.set_attendance_actions(pending_attendance, send_attendance)
         if stream_on:
+            jpeg_renderer = LatestJpegRenderer(streamer)
+            jpeg_renderer.start()
             print(f"Live stream: http://{args.stream_host}:{args.stream_port} "
                   f"(dashboard Live tab, VITE_STREAM_URL)")
         else:
@@ -771,6 +936,7 @@ def main() -> None:
 
     print("Dang chay tracking Global ID. Nhan 'q' hoac ESC de thoat.")
     start = time.time()
+    metrics = StageMetrics()
     frame_idx = 0
     last_tracks_a = []
     last_tracks_b = []
@@ -778,11 +944,10 @@ def main() -> None:
     last_states_b: dict[int, str] = {}
     window_a_shown = False
     window_b_shown = False
-    last_push_a = 0.0
-    last_push_b = 0.0
     seen_gids: set[int] = set()
     ghosts_dir = Path(config.output.output_dir) / "ghosts"
     face_marks_b: list = []  # (x1,y1,x2,y2,score,known) for cam B overlay
+    frame_hub = FrameHub()
 
     try:
         while True:
@@ -805,6 +970,10 @@ def main() -> None:
                 frame_b = normalize_frame_size(
                     frame_b, config.camera.frame_width, config.camera.frame_height
                 )
+            if ret_a and frame_a is not None:
+                frame_hub.publish("A", Frame(frame_idx, now_s, frame_a))
+            if ret_b and frame_b is not None:
+                frame_hub.publish("B", Frame(frame_idx, now_s, frame_b))
 
             batch_detections: dict[str, list] = {}
             if process_frame:
@@ -817,24 +986,26 @@ def main() -> None:
                 if ret_b and frame_b is not None:
                     batch_names.append("B")
                     batch_images.append(frame_b)
-                batch_detections = dict(
-                    zip(batch_names, detector.detect_batch(batch_images), strict=True)
-                )
+                with metrics.measure("detection"):
+                    batch_detections = dict(
+                        zip(batch_names, detector.detect_batch(batch_images), strict=True)
+                    )
 
             # --- Channel A: ByteTrack (ngan han) + Global ID (toan cuc) ---
             if ret_a and frame_a is not None:
                 if process_frame:
-                    tracks_a = tracker_a.update(batch_detections["A"])
-                    tracks_a = [t for t in tracks_a
-                                if t.bbox.area >= args.min_area
-                                and _sane_box(t.bbox, config.camera.frame_width,
-                                              config.camera.frame_height)]
-                    confirmed_a = manager.update(
-                        channel="A",
-                        frame=frame_a,
-                        tracks=[t for t in tracks_a if t.confirmed],
-                        now_s=now_s,
-                    )
+                    with metrics.measure("tracking_A"):
+                        tracks_a = tracker_a.update(batch_detections["A"])
+                        tracks_a = [t for t in tracks_a
+                                    if t.bbox.area >= args.min_area
+                                    and _sane_box(t.bbox, config.camera.frame_width,
+                                                  config.camera.frame_height)]
+                        confirmed_a = manager.update(
+                            channel="A",
+                            frame=frame_a,
+                            tracks=[t for t in tracks_a if t.confirmed],
+                            now_s=now_s,
+                        )
                     last_tracks_a = confirmed_a
                     count_a.update(len(confirmed_a))
                     if use_roi:
@@ -844,9 +1015,10 @@ def main() -> None:
                         floor_a = _track_norm_centers(
                             confirmed_a, config.camera.frame_width,
                             config.camera.frame_height)
-                    states_a = business_a.update(
-                        now_s, {t.track_id for t in confirmed_a},
-                        floor_a, gid_to_person,
+                    states_a = workstate_a.consume(
+                        TrackEvent("A", Frame(frame_idx, now_s, frame_a), tuple(confirmed_a)),
+                        floor_a,
+                        gid_to_person,
                     )
                     last_states_a = {g: s.value for g, s in states_a.items()}
                 else:
@@ -855,79 +1027,80 @@ def main() -> None:
             # --- Channel B: ByteTrack + Global ID + Face diem danh ---
             if ret_b and frame_b is not None:
                 if process_frame:
-                    tracks_b = tracker_b.update(batch_detections["B"])
-                    tracks_b = [t for t in tracks_b
-                                if t.bbox.area >= args.min_area
-                                and _sane_box(t.bbox, config.camera.frame_width,
-                                              config.camera.frame_height)]
-                    confirmed_b = manager.update(
-                        channel="B",
-                        frame=frame_b,
-                        tracks=[t for t in tracks_b if t.confirmed],
-                        now_s=now_s,
-                    )
+                    with metrics.measure("tracking_B"):
+                        tracks_b = tracker_b.update(batch_detections["B"])
+                        tracks_b = [t for t in tracks_b
+                                    if t.bbox.area >= args.min_area
+                                    and _sane_box(t.bbox, config.camera.frame_width,
+                                                  config.camera.frame_height)]
+                        confirmed_b = manager.update(
+                            channel="B",
+                            frame=frame_b,
+                            tracks=[t for t in tracks_b if t.confirmed],
+                            now_s=now_s,
+                        )
                     last_tracks_b = confirmed_b
                     count_b.update(len(confirmed_b))
-                    states_b = business_b.update(
-                        now_s, {t.track_id for t in confirmed_b},
-                        None, gid_to_person,
-                    )
+                    try:
+                        states_b = workstate_b.consume(
+                            TrackEvent("B", Frame(frame_idx, now_s, frame_b), tuple(confirmed_b)),
+                            None,
+                            gid_to_person,
+                        )
+                    except (KeyError, ValueError, RuntimeError) as error:
+                        # Attendance remains usable if a workstation rule or
+                        # calibration input is malformed for one tick.
+                        print(f"Workstate B skipped for frame: {error}")
+                        states_b = {}
                     last_states_b = {g: s.value for g, s in states_b.items()}
 
                     if use_face and attendance is not None and face_matcher is not None:
-                        now_dt = datetime.now()
+                        now_dt = datetime.now().astimezone()
                         day_str = now_dt.date().isoformat()
                         wall_iso = now_dt.isoformat(timespec="seconds")
                         time_tag = now_dt.strftime("%H%M%S")
                         face_tick = (frame_idx // max(1, config.camera.process_every_n_frames)) \
                             % max(1, face_cfg.process_every_k) == 0
                         if face_tick:
-                            for track in confirmed_b:
-                                if track.bbox.area < face_cfg.min_person_area_px:
-                                    continue
-                                crop = _person_crop(frame_b, track.bbox)
-                                if crop is None:
-                                    continue
-                                # Crop origin in frame coords (same clamp as
-                                # _person_crop) to draw face boxes on vis_b.
+                            event = TrackEvent(
+                                channel="B",
+                                frame=Frame(frame_idx, now_s, frame_b),
+                                tracks=tuple(confirmed_b),
+                            )
+                            with metrics.measure("face"):
+                                observations = face_consumer.consume(event, now_s)
+                            for observation in observations:
+                                track = observation.track
+                                crop = observation.crop_bgr
+                                det = observation.detection
+                                match = observation.match
+                                sharp = observation.sharpness
                                 _bh, _bw = frame_b.shape[:2]
                                 _ox = max(0, min(_bw, round(track.bbox.x1)))
                                 _oy = max(0, min(_bh, round(track.bbox.y1)))
-                                try:
-                                    dets = face_embedder.detect_embed(crop)
-                                except RuntimeError:
-                                    dets = []
-                                if not dets:
-                                    continue
-                                det = dets[0]
-                                fw = det.bbox[2] - det.bbox[0]
-                                fh = det.bbox[3] - det.bbox[1]
-                                if min(fw, fh) < face_cfg.min_face_px:
-                                    continue
                                 fx1 = max(0, int(det.bbox[0])); fy1 = max(0, int(det.bbox[1]))
                                 fx2 = min(crop.shape[1], int(det.bbox[2]))
                                 fy2 = min(crop.shape[0], int(det.bbox[3]))
-                                face_img = crop[fy1:fy2, fx1:fx2] \
-                                    if fx2 > fx1 and fy2 > fy1 else None
-                                sharp = face_sharpness(face_img)
-                                if sharp < face_cfg.min_blur_variance:
-                                    continue
-                                match = face_matcher.match(det.embedding)
                                 # Live feedback: face box + score on cam B
                                 # (green = known, red = unknown/low score).
                                 face_marks_b.append(
                                     (_ox + fx1, _oy + fy1, _ox + fx2, _oy + fy2,
                                      match.score, match.is_known))
                                 if match.is_known and match.person is not None:
+                                    employee_id = (
+                                        match.person.employee_id
+                                        or match.person.person_id
+                                    )
+                                    manager.bind_employee(track.track_id, employee_id)
                                     gid_to_score[track.track_id] = match.score
-                                    gid_to_person[track.track_id] = match.person.person_id
+                                    gid_to_person[track.track_id] = employee_id
                                     # Show the name as soon as the face matches
                                     # (DB tick stays debounced below).
                                     gid_to_display[track.track_id] = \
                                         match.person.display_name
                                     ticked = attendance.observe(
                                         day=day_str, global_id=track.track_id,
-                                        person_id=match.person.person_id,
+                                        person_id=employee_id,
                                         display_name=match.person.display_name,
                                         score=match.score, now_s=now_s,
                                         wall_time_iso=wall_iso,
@@ -960,7 +1133,7 @@ def main() -> None:
                                             reconciler, gid_alias, gid_to_person,
                                             gid_to_display, unknown_of_gid,
                                             day_str, track.track_id,
-                                            match.person.person_id,
+                                            employee_id,
                                             match.person.display_name,
                                             match.person.embedding,
                                             (business_a, business_b),
@@ -973,12 +1146,12 @@ def main() -> None:
                                         gid_alias, gid_to_person,
                                         gid_to_display, day_str,
                                         track.track_id,
-                                        match.person.person_id,
+                                        employee_id,
                                         match.person.display_name,
                                         manager, (business_a, business_b),
                                     )
                                     local = crop_saver.save_best_crop(
-                                        day=day_str, owner=match.person.person_id,
+                                        day=day_str, owner=employee_id,
                                         known=True, global_id=track.track_id,
                                         image_bgr=crop, face_score=match.score,
                                         sharpness=sharp, time_tag=time_tag,
@@ -1012,9 +1185,30 @@ def main() -> None:
                 else:
                     confirmed_b = last_tracks_b
 
+            active_merges = manager.reconcile_active_duplicates()
+            for duplicate_gid, canonical_gid in active_merges.items():
+                gid_alias[duplicate_gid] = canonical_gid
+                # Business state is keyed by Global ID too.  Move that state
+                # before rendering, otherwise the canonical person can still
+                # appear AWAY while the duplicate is visible/WORKING.
+                for tracker in (business_a, business_b):
+                    try:
+                        tracker.transfer_assignment(duplicate_gid, canonical_gid)
+                    except Exception:  # noqa: BLE001 - merge must not stop video
+                        pass
+                print(
+                    f"[Reconcile] active G{duplicate_gid} -> "
+                    f"G{canonical_gid} (high ReID similarity)"
+                )
+
+            # Face confirmation may merge an active duplicate GID into the
+            # older canonical GID. Rewrite live tracks before fusion/render.
+            last_tracks_a = _remap_tracks(last_tracks_a, gid_alias, manager)
+            last_tracks_b = _remap_tracks(last_tracks_b, gid_alias, manager)
+
             # --- Fuse trang thai phong A+B (moi frame xu ly) ---
             if process_frame:
-                now_dt = datetime.now()
+                now_dt = datetime.now().astimezone()
                 day_str = now_dt.date().isoformat()
                 wall_iso = now_dt.isoformat(timespec="seconds")
                 present_a = {t.track_id for t in last_tracks_a}
@@ -1066,13 +1260,23 @@ def main() -> None:
                             "last_leave_at": row.last_leave_at,
                             "last_enter_at": row.last_enter_at,
                         })
+                        employee_id = gid_to_person.get(wgid)
+                        if employee_id:
+                            _store_or_queue(write_queue, supabase, "current_state", {
+                                "employee_id": employee_id,
+                                "state": st.label,
+                                "since": row.last_enter_at or wall_iso,
+                                "camera_id": "A" if gid in present_a else "B",
+                                "global_id": wgid,
+                                "updated_at": wall_iso,
+                            })
                 if now_s - last_flush_s >= config.room_fusion.flush_s:
                     last_flush_s = now_s
-                    _flush_queue(write_queue, supabase)
                     _prune_identity_maps(
                         manager, gid_to_person, gid_to_display,
                         gid_to_score, unknown_of_gid, reconciler,
                         fusion, (business_a, business_b),
+                        face_consumer,
                     )
 
             # --- Live view: annotated Global-ID frames for window/stream ---
@@ -1082,12 +1286,16 @@ def main() -> None:
                 vis_a = frame_a.copy()
                 draw_person_tracks(vis_a, last_tracks_a, display_count=count_a.value,
                                    title="Global", status=room_status_now)
-                draw_global_labels(vis_a, last_tracks_a, room_status_now, gid_to_display)
+                draw_global_labels(
+                    vis_a, last_tracks_a, room_status_now, gid_to_display, gid_to_person
+                )
             if ret_b and frame_b is not None and need_vis:
                 vis_b = frame_b.copy()
                 draw_person_tracks(vis_b, last_tracks_b, display_count=count_b.value,
                                    title="Global", status=room_status_now)
-                draw_global_labels(vis_b, last_tracks_b, room_status_now, gid_to_display)
+                draw_global_labels(
+                    vis_b, last_tracks_b, room_status_now, gid_to_display, gid_to_person
+                )
                 for x1m, y1m, x2m, y2m, fscore, fknown in face_marks_b:
                     fcolor = (40, 180, 40) if fknown else (60, 60, 220)
                     cv2.rectangle(vis_b, (int(x1m), int(y1m)),
@@ -1103,19 +1311,12 @@ def main() -> None:
                     cv2.imshow("Channel B - tracking", vis_b)
                     window_b_shown = True
             if stream_on and process_frame:
-                now_push = time.time()
-                if vis_a is not None and now_push - last_push_a >= 0.1:
-                    ok_a, buf_a = cv2.imencode(
-                        ".jpg", vis_a, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                    if ok_a:
-                        streamer.push("cam_a", buf_a.tobytes())
-                        last_push_a = now_push
-                if vis_b is not None and now_push - last_push_b >= 0.1:
-                    ok_b, buf_b = cv2.imencode(
-                        ".jpg", vis_b, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                    if ok_b:
-                        streamer.push("cam_b", buf_b.tobytes())
-                        last_push_b = now_push
+                with metrics.measure("rendering"):
+                    if jpeg_renderer is not None:
+                        if vis_a is not None:
+                            jpeg_renderer.submit("cam_a", vis_a)
+                        if vis_b is not None:
+                            jpeg_renderer.submit("cam_b", vis_b)
                 streamer.set_status({
                     "people": [
                         {"gid": gid,
@@ -1124,6 +1325,9 @@ def main() -> None:
                          "in_room": st.in_room}
                         for gid, st in sorted(room_status_now.items())
                     ],
+                    "pending_attendance": (
+                        pending_attendance() if streamer is not None else []
+                    ),
                     "count_a": count_a.value,
                     "count_b": count_b.value,
                 })
@@ -1147,9 +1351,11 @@ def main() -> None:
                 break
     finally:
         try:
-            _flush_queue(write_queue, supabase)
+            write_worker.stop()
         except Exception as error:  # noqa: BLE001
             print(f"Flush cuoi loi (da giu trong queue): {error}")
+        if jpeg_renderer is not None:
+            jpeg_renderer.stop()
         if streamer is not None:
             streamer.stop()
         stream_a.close()
@@ -1158,6 +1364,7 @@ def main() -> None:
     elapsed = time.time() - start
     gids = sorted(manager.identities)
     print(f"Xong sau {elapsed:.1f}s. Count A: {count_a.value} | Count B: {count_b.value}")
+    print(f"Stage metrics: {metrics.snapshot()}")
     print(f"Global IDs: {gids}")
     for gid in gids:
         record = manager.identities[gid]
@@ -1175,7 +1382,7 @@ def main() -> None:
               + f" — crop dau xem tai {ghosts_dir}/")
     if attendance is not None:
         try:
-            day_now = datetime.now().date().isoformat()
+            day_now = datetime.now().astimezone().date().isoformat()
             ticked = attendance.records_for_day(day_now)
             print(f"Diem danh {day_now}: {len(ticked)} nguoi")
             for rec in ticked:

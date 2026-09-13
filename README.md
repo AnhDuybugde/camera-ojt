@@ -1,13 +1,13 @@
 # Camera OJT — diem danh + trang thai phong 2 camera
 
-YOLO26s -> ByteTrack -> Global ID xuyen 2 cam IMOU (ReID histogram) +
+YOLO26s -> ByteTrack -> Global ID xuyen 2 cam IMOU (OSNet ReID, histogram fallback) +
 diem danh mat InsightFace `buffalo_s` o cam cua + dashboard Vite +
 Supabase (free tier).
 
 ## Cai dat 1 lan
 
 ```powershell
-python -m pip install -e ".[face,store]"
+python -m pip install -e ".[face,store,reid]"
 copy .env.example .env            # dien IMOU_* + SUPABASE_URL/KEY
 cd dashboard; npm install; cd ..
 ```
@@ -22,7 +22,17 @@ insert into public.roles (user_id, role) values ('<uuid-admin>', 'admin');
 Bo anh enroll vao `data/images/` (ten file = ID, vd `LeHoAnhDuy.jpg`).
 Anh mat KHONG commit len git.
 
-## Chay (2 command)
+ReID OSNet weights duoc tai lazy vao `models/reid_cache/` lan dau. Neu
+may khong co `torchreid`/weights hoac khong co network, pipeline tu fallback
+sang HSV histogram; co the chon `identity.reid_backend: histogram` de tat OSNet.
+
+Identity khong dong nhat voi Global ID: local track ID chi song trong mot
+camera, Global ID la association tam thoi, con `employee_id` tu face gallery
+moi la danh tinh ben vung. Face recognition chay theo track voi quality gate,
+best-shot va cooldown; tracking, workstate, attendance, renderer va storage
+nhan cung mot `TrackEvent` nhung khong block lan nhau.
+
+## Chay production (2 command)
 
 ```powershell
 # 1. Cam + model + stream (cua so 1)
@@ -31,6 +41,10 @@ python scripts\run_workstate.py --display
 # 2. Website: Live 2 cam + diem danh + trang thai + admin (cua so 2)
 cd dashboard; npm run dev   # http://localhost:5173
 ```
+
+`scripts/run_workstate.py` is the canonical production entry point. The
+single-camera `scripts/run_pipeline.py` remains a legacy analytics demo and
+uses the simpler IoU tracker for smoke tests only.
 
 Live tren web doc qua `VITE_STREAM_URL` (mac dinh `http://localhost:8765`,
 pipeline tu mo). Xem tu may khac: pipeline them `--stream-host 0.0.0.0`,
@@ -46,6 +60,16 @@ sua `VITE_STREAM_URL` thanh `http://<IP-may-cam>:8765`, restart `npm run dev`.
 | Mat kho khop | them anh enroll, hoac `face.match_threshold: 0.4` |
 | Nhe CPU | `--imgsz 640` (mặc định 800, CUDA) |
 | Tracking-only, tat mat | them `--no-face` |
+
+Benchmark toc do model (khong mo RTSP):
+
+```powershell
+python scripts\benchmark_inference.py --device cuda --frames 30
+python scripts\benchmark_inference.py --device cpu --frames 5
+```
+
+`camera.process_every_n_frames` dieu chinh detection FPS doc lap voi FPS
+camera; pipeline bo qua frame cu thay vi xep hang vo han.
 
 Trang thai: ngoi yen = Working, roi khoi diem neo = Away (ca khi van
 trong hinh), vang lau + thay o cam B = Out of office, quay lai =

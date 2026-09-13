@@ -17,6 +17,7 @@ class EnrolledPerson:
     display_name: str  # ten hien thi tren overlay/dashboard
     embedding: np.ndarray | None  # None neu chua tinh duoc (van hien ten khi fallback)
     source_path: str = ""
+    employee_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -59,18 +60,21 @@ def load_gallery(
     gallery_dir: str | Path,
     embedder: FaceEmbedder | None,
     name_map: dict[str, str] | None = None,
+    employee_map: dict[str, str] | None = None,
 ) -> FaceGallery:
-    """Quet gallery_dir, moi file anh = 1 nguoi. Tinh embedding 1 lan."""
+    """Load one enrolled face per image and optional Employee ID mapping."""
     root = Path(gallery_dir)
     gallery = FaceGallery()
     if not root.is_dir():
         return gallery
     name_map = name_map or {}
+    employee_map = employee_map or {}
     for path in sorted(root.iterdir()):
         if path.suffix.lower() not in _IMAGE_EXTS or not path.is_file():
             continue
         person_id = path.stem
         display_name = name_map.get(person_id, person_id)
+        employee_id = employee_map.get(person_id)
         embedding: np.ndarray | None = None
         if embedder is not None:
             img = _read_image(path)
@@ -87,6 +91,7 @@ def load_gallery(
                 display_name=display_name,
                 embedding=embedding,
                 source_path=str(path),
+                employee_id=employee_id,
             )
         )
     return gallery

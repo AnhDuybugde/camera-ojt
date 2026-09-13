@@ -7,8 +7,9 @@ import cv2
 from camera_tracking.analytics import CountingLine, FloorProjector, RoomAnalytics, Zone
 from camera_tracking.config import AppConfig
 from camera_tracking.detection import PersonDetector, YoloPersonDetector
-from camera_tracking.domain import AnalyticsSnapshot, Frame
+from camera_tracking.domain import AnalyticsSnapshot, Frame, TrackEvent
 from camera_tracking.output import ResultWriter
+from camera_tracking.runtime import StageMetrics, TrackEventBus
 from camera_tracking.tracking import IoUTracker
 from camera_tracking.visualization import OverlayRenderer
 
@@ -22,6 +23,8 @@ class CameraTrackingPipeline:
         renderer: OverlayRenderer,
         writer: ResultWriter,
         display: bool = False,
+        event_bus: TrackEventBus | None = None,
+        metrics: StageMetrics | None = None,
     ) -> None:
         self.detector = detector
         self.tracker = tracker
@@ -29,6 +32,8 @@ class CameraTrackingPipeline:
         self.renderer = renderer
         self.writer = writer
         self.display = display
+        self.event_bus = event_bus
+        self.metrics = metrics or StageMetrics()
 
     def run(
         self, frames: Iterable[Frame], max_frames: int | None = None
@@ -43,13 +48,26 @@ class CameraTrackingPipeline:
             )
         try:
             for processed_count, frame in enumerate(frames, start=1):
-                detections = self.detector.detect(frame.image)
-                tracks = self.tracker.update(detections)
-                last_snapshot = self.analytics.update(
-                    frame.index, frame.timestamp_s, tracks
-                )
-                annotated = self.renderer.render(frame.image, tracks, last_snapshot)
-                self.writer.write_frame(annotated)
+                with self.metrics.measure("detection"):
+                    detections = self.detector.detect(frame.image)
+                with self.metrics.measure("tracking"):
+                    tracks = self.tracker.update(detections)
+                if self.event_bus is not None:
+                    self.event_bus.publish(
+                        TrackEvent(
+                            channel="default",
+                            frame=frame,
+                            tracks=tuple(tracks),
+                        )
+                    )
+                with self.metrics.measure("analytics"):
+                    last_snapshot = self.analytics.update(
+                        frame.index, frame.timestamp_s, tracks
+                    )
+                with self.metrics.measure("rendering"):
+                    annotated = self.renderer.render(frame.image, tracks, last_snapshot)
+                with self.metrics.measure("storage"):
+                    self.writer.write_frame(annotated)
 
                 if self.display:
                     try:
@@ -116,6 +134,10 @@ def build_pipeline(config: AppConfig) -> CameraTrackingPipeline:
             person_class_id=config.detection.person_class_id,
             image_size=config.detection.image_size,
             device=config.detection.device,
+            nms_iou_threshold=config.detection.nms_iou_threshold,
+            nested_box_containment_threshold=(
+                config.detection.nested_box_containment_threshold
+            ),
         ),
         tracker=IoUTracker(
             iou_threshold=config.tracking.iou_threshold,

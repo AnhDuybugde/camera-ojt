@@ -27,7 +27,7 @@ class WorkstationState(str, Enum):
 
 @dataclass
 class StateStabilizer:
-    grace_s: float = 3.0
+    grace_s: float = 1.5
     dwell_s: float = 2.0
     motion_influence: float = 0.0
     state: WorkstationState = field(

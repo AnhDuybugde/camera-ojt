@@ -7,13 +7,14 @@
 """
 from camera_tracking.store.daily import DailyStateCache, RoomStatusRow, throttle_ok
 from camera_tracking.store.faces import FaceCropSaver, crop_score, save_best_crop
-from camera_tracking.store.queue import WriteQueue
+from camera_tracking.store.queue import WriteQueue, WriteQueueWorker
 
 __all__ = [
     "DailyStateCache",
     "FaceCropSaver",
     "RoomStatusRow",
     "WriteQueue",
+    "WriteQueueWorker",
     "crop_score",
     "save_best_crop",
     "throttle_ok",

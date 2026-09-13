@@ -46,6 +46,11 @@ class Track:
     age: int
     hits: int
     confirmed: bool
+    # Keep the three identity layers explicit. ``track_id`` remains the
+    # backwards-compatible display/runtime ID for existing callers.
+    local_track_id: int | None = None
+    global_person_id: int | None = None
+    employee_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +58,15 @@ class Frame:
     index: int
     timestamp_s: float
     image: np.ndarray
+
+
+@dataclass(frozen=True, slots=True)
+class TrackEvent:
+    """Immutable hand-off from local tracking to downstream consumers."""
+
+    channel: str
+    frame: Frame
+    tracks: tuple[Track, ...]
 
 
 @dataclass(slots=True)

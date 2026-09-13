@@ -7,6 +7,7 @@ Thiet ke:
   ten hien thi qua `name_map` trong config neu co.
 """
 from camera_tracking.face.attendance import AttendanceRecord, FaceAttendanceService
+from camera_tracking.face.consumer import FaceObservation, FaceTrackConsumer
 from camera_tracking.face.embeddings import (
     FaceDetection,
     FaceEmbedder,
@@ -25,6 +26,8 @@ __all__ = [
     "FaceEmbedder",
     "FaceGallery",
     "FaceMatcher",
+    "FaceObservation",
+    "FaceTrackConsumer",
     "InsightFaceEmbedder",
     "MatchResult",
     "cosine_similarity",

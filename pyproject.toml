@@ -13,6 +13,7 @@ dependencies = [
     "pydantic>=2.7.0",
     "PyYAML>=6.0.1",
     "python-dotenv>=1.0.0",
+    "typing-extensions>=4.7.0",
     "ultralytics>=8.4.0",
     "scipy>=1.10.0",
     "lap>=0.5.12",
@@ -22,6 +23,7 @@ dependencies = [
   dev = ["pytest>=8.2.0", "ruff>=0.5.0"]
   face = ["insightface>=0.7.3", "onnxruntime>=1.17.0"]
   store = ["supabase>=2.9.0"]
+  reid = ["torchreid>=0.2.5", "gdown>=6.0.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

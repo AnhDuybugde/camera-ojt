@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -20,6 +21,8 @@ class MjpegStreamer:
         self.port = port
         self._frames: dict[str, bytes] = {}
         self._status: dict = {"cameras": [], "people": []}
+        self._attendance_pending: Callable[[], list[dict]] = lambda: []
+        self._attendance_send: Callable[[], dict] = lambda: {"sent": 0}
         self._lock = threading.Lock()
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -37,6 +40,14 @@ class MjpegStreamer:
     def set_status(self, payload: dict) -> None:
         with self._lock:
             self._status = dict(payload)
+
+    def set_attendance_actions(
+        self,
+        pending: Callable[[], list[dict]],
+        send: Callable[[], dict],
+    ) -> None:
+        self._attendance_pending = pending
+        self._attendance_send = send
 
     def snapshot(self) -> tuple[dict[str, bytes], dict]:
         with self._lock:
@@ -77,6 +88,25 @@ class MjpegStreamer:
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
+                elif path == "/attendance/pending":
+                    body = json.dumps({
+                        "pending": streamer._attendance_pending(),
+                    }).encode("utf-8")
+                    self.send_response(200)
+                    self._send_cors()
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif path == "/attendance/send":
+                    result = streamer._attendance_send()
+                    body = json.dumps(result).encode("utf-8")
+                    self.send_response(200)
+                    self._send_cors()
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
                 elif path == "/":
                     body = (
                         b"<html><body><h3>Camera OJT live</h3>"
@@ -87,12 +117,11 @@ class MjpegStreamer:
                     self.send_header("Content-Type", "text/html")
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
-                    self.wfile.write(body)
                 else:
                     self.send_response(404)
                     self.end_headers()
 
-            def _serve_mjpeg(self, streamer: "MjpegStreamer", name: str) -> None:
+            def _serve_mjpeg(self, streamer: MjpegStreamer, name: str) -> None:
                 # Wait briefly for the first frame so <img> does not 404.
                 frame: bytes | None = None
                 for _ in range(100):

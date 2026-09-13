@@ -19,7 +19,7 @@ class SupabaseSettings:
     enabled: bool = False
 
     @classmethod
-    def from_env(cls, enabled_flag: bool = False) -> "SupabaseSettings":
+    def from_env(cls, enabled_flag: bool = False) -> SupabaseSettings:
         url = os.getenv("SUPABASE_URL", "").strip()
         service_key = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
         anon_key = os.getenv("SUPABASE_ANON_KEY", "").strip()
@@ -95,6 +95,19 @@ class SupabaseStore:
         try:
             self._client.table("room_status_daily").upsert(
                 row, on_conflict="date,global_id"
+            ).execute()
+            return True
+        except Exception as error:  # noqa: BLE001
+            self._error = str(error)
+            return False
+
+    def upsert_current_state(self, row: dict) -> bool:
+        """Update the durable employee-centric current state projection."""
+        if not self.connect():
+            return False
+        try:
+            self._client.table("employee_current_state").upsert(
+                row, on_conflict="employee_id"
             ).execute()
             return True
         except Exception as error:  # noqa: BLE001

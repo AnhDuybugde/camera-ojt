@@ -52,6 +52,87 @@ class GlobalIdentityTest(TestCase):
         )
         self.assertEqual(first[0].track_id, 1)
         self.assertEqual(second[0].track_id, 1)
+        self.assertEqual(first[0].local_track_id, 100)
+        self.assertEqual(first[0].global_person_id, 1)
+        self.assertIsNone(first[0].employee_id)
+
+    def test_face_binding_is_metadata_separate_from_global_id(self) -> None:
+        manager = make_manager()
+        frame = make_frame()
+        result = manager.update(
+            channel="A", frame=frame,
+            tracks=[raw_track(10, BoundingBox(20, 40, 120, 160))], now_s=0.0,
+        )
+
+        manager.bind_employee(result[0].global_person_id, "employee_123")
+        self.assertEqual(manager.employee_id_of(1), "employee_123")
+        self.assertEqual(result[0].global_person_id, 1)
+        refreshed = manager.update(
+            channel="A", frame=frame,
+            tracks=[raw_track(10, BoundingBox(20, 40, 120, 160))], now_s=1.0,
+        )
+        self.assertEqual(refreshed[0].global_person_id, 1)
+        self.assertEqual(refreshed[0].employee_id, "employee_123")
+
+    def test_merge_identity_redirects_duplicate_tracklets(self) -> None:
+        manager = make_manager()
+        frame = make_frame()
+        first = manager.update(
+            channel="A", frame=frame,
+            tracks=[raw_track(10, BoundingBox(20, 40, 120, 160))], now_s=0.0,
+        )
+        second = manager.update(
+            channel="B", frame=frame,
+            tracks=[raw_track(20, BoundingBox(260, 40, 360, 160))], now_s=0.1,
+        )
+        manager.bind_employee(first[0].global_person_id, "employee_123")
+        manager.bind_employee(second[0].global_person_id, "employee_123")
+
+        assert manager.merge_identity(
+            second[0].global_person_id, first[0].global_person_id
+        )
+        assert set(manager.identities) == {first[0].global_person_id}
+        rebound = manager.update(
+            channel="B", frame=frame,
+            tracks=[raw_track(21, BoundingBox(260, 40, 360, 160))], now_s=0.2,
+        )
+        assert rebound[0].global_person_id == first[0].global_person_id
+
+    def test_active_cross_channel_duplicates_are_reconciled(self) -> None:
+        manager = make_manager(
+            min_appearance_similarity=1.1,
+            active_duplicate_similarity=0.8,
+        )
+        frame = make_frame()
+        manager.update(
+            channel="A", frame=frame,
+            tracks=[raw_track(10, BoundingBox(20, 40, 120, 160))], now_s=0.0,
+        )
+        manager.update(
+            channel="B", frame=frame,
+            tracks=[raw_track(20, BoundingBox(20, 40, 120, 160))], now_s=0.1,
+        )
+        aliases = manager.reconcile_active_duplicates()
+        assert aliases == {2: 1}
+        assert set(manager.identities) == {1}
+
+    def test_active_same_camera_nested_duplicates_are_reconciled(self) -> None:
+        manager = make_manager(
+            min_appearance_similarity=1.1,
+            active_duplicate_similarity=0.8,
+        )
+        frame = make_frame()
+        manager.update(
+            channel="A", frame=frame,
+            tracks=[raw_track(10, BoundingBox(20, 40, 120, 160))], now_s=0.0,
+        )
+        manager.update(
+            channel="A", frame=frame,
+            tracks=[raw_track(11, BoundingBox(30, 50, 110, 150))], now_s=0.1,
+        )
+        aliases = manager.reconcile_active_duplicates()
+        assert aliases == {2: 1}
+        assert set(manager.identities) == {1}
 
     def test_long_disappearance_reconnects_same_global_id(self) -> None:
         manager = make_manager()

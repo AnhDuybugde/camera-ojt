@@ -28,6 +28,22 @@ def test_load_gallery_uses_filename_and_namemap(tmp_path) -> None:
     assert gallery.people[0].embedding is not None
 
 
+def test_load_gallery_maps_filename_to_employee_id(tmp_path) -> None:
+    pytest_cv2 = pytest_import_cv2()
+    if pytest_cv2 is None:
+        return
+    img = np.full((40, 40, 3), 128, dtype=np.uint8)
+    pytest_cv2.imwrite(str(tmp_path / "LeHoAnhDuy.jpg"), img)
+    gallery = load_gallery(
+        tmp_path,
+        _StubEmbedder(),
+        {"LeHoAnhDuy": "Le Ho Anh Duy"},
+        {"LeHoAnhDuy": "1"},
+    )
+    assert gallery.people[0].person_id == "LeHoAnhDuy"
+    assert gallery.people[0].employee_id == "1"
+
+
 def pytest_import_cv2():
     try:
         import cv2
@@ -50,7 +66,7 @@ def test_draw_global_labels_hides_raw_ids() -> None:
                     confidence=0.9, age=1, hits=1, confirmed=True)]
     status = {5: RoomPersonStatus(global_id=5, label="Working", in_room=True,
                                  display_name="An")}
-    out = draw_global_labels(frame, tracks, status, {5: "An"})
+    out = draw_global_labels(frame, tracks, status, {5: "An"}, {5: "1"})
     assert out.shape == frame.shape  # khong crash; raw ByteTrack id khong duoc ve
 
 

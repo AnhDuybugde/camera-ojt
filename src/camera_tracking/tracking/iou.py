@@ -100,5 +100,6 @@ class IoUTracker:
             age=state.age,
             hits=state.hits,
             confirmed=state.hits >= self.min_hits,
+            local_track_id=state.track_id,
         )
 
