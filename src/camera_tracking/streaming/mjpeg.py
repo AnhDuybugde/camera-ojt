@@ -21,8 +21,13 @@ class MjpegStreamer:
         self.port = port
         self._frames: dict[str, bytes] = {}
         self._status: dict = {"cameras": [], "people": []}
-        self._attendance_pending: Callable[[], list[dict]] = lambda: []
+        self._attendance_pending: Callable[[], list[dict]] = list
         self._attendance_send: Callable[[], dict] = lambda: {"sent": 0}
+        self._enrollment_register: Callable[[dict], dict] = lambda _payload: {
+            "ok": False,
+            "status": 503,
+            "message": "Enrollment is unavailable.",
+        }
         self._lock = threading.Lock()
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -49,6 +54,9 @@ class MjpegStreamer:
         self._attendance_pending = pending
         self._attendance_send = send
 
+    def set_enrollment_action(self, register: Callable[[dict], dict]) -> None:
+        self._enrollment_register = register
+
     def snapshot(self) -> tuple[dict[str, bytes], dict]:
         with self._lock:
             return dict(self._frames), dict(self._status)
@@ -68,6 +76,56 @@ class MjpegStreamer:
             def _send_cors(self) -> None:
                 self.send_header("Access-Control-Allow-Origin", "*")
 
+            def _send_json(self, payload: dict, status: int = 200) -> None:
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self._send_cors()
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_OPTIONS(self) -> None:
+                self.send_response(204)
+                self._send_cors()
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.end_headers()
+
+            def do_POST(self) -> None:
+                path = self.path.split("?", 1)[0]
+                if path != "/enrollment/register":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                try:
+                    content_length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    content_length = 0
+                if content_length <= 0 or content_length > 8 * 1024 * 1024:
+                    self._send_json({
+                        "ok": False,
+                        "message": "Dữ liệu ảnh không hợp lệ hoặc vượt quá 8 MB.",
+                    }, 413)
+                    return
+                try:
+                    payload = json.loads(self.rfile.read(content_length))
+                    if not isinstance(payload, dict):
+                        raise TypeError("payload must be an object")
+                    result = dict(streamer._enrollment_register(payload))
+                    status = int(result.pop("status", 201 if result.get("ok") else 400))
+                    self._send_json(result, status)
+                except (json.JSONDecodeError, TypeError, UnicodeDecodeError, ValueError):
+                    self._send_json({
+                        "ok": False,
+                        "message": "Dữ liệu đăng ký không hợp lệ.",
+                    }, 400)
+                except Exception:  # noqa: BLE001 - keep HTTP worker alive
+                    self._send_json({
+                        "ok": False,
+                        "message": "Không thể hoàn tất đăng ký.",
+                    }, 500)
+
             def do_GET(self) -> None:
                 path = self.path.split("?", 1)[0]
                 if path in ("/cam_a.mjpg", "/cam_b.mjpg"):
@@ -75,38 +133,20 @@ class MjpegStreamer:
                     self._serve_mjpeg(streamer, name)
                 elif path in ("/status.json", "/status"):
                     frames, status = streamer.snapshot()
-                    body = json.dumps({
+                    self._send_json({
                         **status,
                         "cameras": [
                             {"name": n, "live": n in frames}
                             for n in ("cam_a", "cam_b")
                         ],
-                    }).encode("utf-8")
-                    self.send_response(200)
-                    self._send_cors()
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
+                    })
                 elif path == "/attendance/pending":
-                    body = json.dumps({
+                    self._send_json({
                         "pending": streamer._attendance_pending(),
-                    }).encode("utf-8")
-                    self.send_response(200)
-                    self._send_cors()
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
+                    })
                 elif path == "/attendance/send":
                     result = streamer._attendance_send()
-                    body = json.dumps(result).encode("utf-8")
-                    self.send_response(200)
-                    self._send_cors()
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
+                    self._send_json(result)
                 elif path == "/":
                     body = (
                         b"<html><body><h3>Camera OJT live</h3>"

@@ -20,7 +20,11 @@ Nhan 'q' hoac ESC de thoat.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
+import json
 import os
+import re
 import sys
 import threading
 import time
@@ -440,7 +444,9 @@ def _flush_queue(
         if defer_attendance and is_attendance:
             continue
         done = False
-        if kind == "attendance":
+        if kind == "person":
+            done = supabase.upsert_person(payload)
+        elif kind == "attendance":
             done = supabase.upsert_attendance(payload)
         elif kind == "room_status":
             done = supabase.upsert_room_status(payload)
@@ -842,6 +848,8 @@ def main() -> None:
     face_threshold = args.face_threshold or face_cfg.match_threshold
     use_face = bool(face_cfg.enabled and not args.no_face)
     face_embedder = face_matcher = face_gallery = attendance = face_consumer = None
+    face_model_lock = threading.Lock()
+    enrollment_lock = threading.Lock()
     gid_to_person: dict[int, str] = {}
     gid_to_display: dict[int, str] = {}
     gid_to_score: dict[int, float] = {}
@@ -850,11 +858,13 @@ def main() -> None:
     if use_face:
         try:
             from camera_tracking.face import (
+                EnrolledPerson,
                 FaceAttendanceService,
                 FaceMatcher,
                 InsightFaceEmbedder,
                 load_gallery,
             )
+            from camera_tracking.face.gallery import load_registry
             try:
                 face_embedder = InsightFaceEmbedder(
                     model_pack=face_cfg.model_pack, det_size=face_cfg.det_size
@@ -969,7 +979,130 @@ def main() -> None:
                         sent_attendance_keys.add(key)
                 return {"sent": ok, "failed": fail}
 
+        def register_person(payload: dict) -> dict:
+            if (
+                not use_face
+                or face_embedder is None
+                or face_gallery is None
+                or face_matcher is None
+            ):
+                return {
+                    "ok": False,
+                    "status": 503,
+                    "message": "Face recognition chưa sẵn sàng.",
+                }
+            employee_id = str(payload.get("employee_id", "")).strip()
+            display_name = " ".join(str(payload.get("display_name", "")).split())
+            image_data = payload.get("image")
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", employee_id):
+                return {
+                    "ok": False,
+                    "message": "Mã nhân viên chỉ gồm chữ, số, dấu chấm, gạch ngang hoặc gạch dưới.",
+                }
+            if not 2 <= len(display_name) <= 100:
+                return {"ok": False, "message": "Tên nhân viên không hợp lệ."}
+            if payload.get("consent") is not True:
+                return {
+                    "ok": False,
+                    "message": "Cần xác nhận đồng ý xử lý dữ liệu khuôn mặt.",
+                }
+            if not isinstance(image_data, str):
+                return {"ok": False, "message": "Chưa có ảnh đăng ký."}
+            encoded = image_data.split(",", 1)[-1]
+            try:
+                raw_image = base64.b64decode(encoded, validate=True)
+            except (binascii.Error, ValueError):
+                return {"ok": False, "message": "Ảnh đăng ký không hợp lệ."}
+            if not raw_image or len(raw_image) > 5 * 1024 * 1024:
+                return {"ok": False, "message": "Ảnh phải nhỏ hơn 5 MB."}
+            image_array = np.frombuffer(raw_image, dtype=np.uint8)
+            image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+            if image is None or image.size == 0:
+                return {"ok": False, "message": "Không đọc được định dạng ảnh."}
+            height, width = image.shape[:2]
+            if max(height, width) > 1920:
+                scale = 1920 / max(height, width)
+                image = cv2.resize(
+                    image,
+                    (max(1, round(width * scale)), max(1, round(height * scale))),
+                    interpolation=cv2.INTER_AREA,
+                )
+
+            with enrollment_lock:
+                if any(
+                    person.employee_id == employee_id
+                    or person.person_id == employee_id
+                    for person in face_gallery.people
+                ):
+                    return {
+                        "ok": False,
+                        "status": 409,
+                        "message": "Mã nhân viên đã được đăng ký.",
+                    }
+                try:
+                    with face_model_lock:
+                        detections = face_embedder.detect_embed(image)
+                except RuntimeError as error:
+                    return {"ok": False, "status": 503, "message": str(error)}
+                if len(detections) == 0:
+                    return {
+                        "ok": False,
+                        "message": "Không tìm thấy khuôn mặt rõ ràng trong ảnh.",
+                    }
+                if len(detections) > 1:
+                    return {
+                        "ok": False,
+                        "message": "Ảnh có nhiều khuôn mặt; hãy dùng ảnh chỉ có một người.",
+                    }
+
+                gallery_root = Path(face_cfg.gallery_dir)
+                gallery_root.mkdir(parents=True, exist_ok=True)
+                image_path = gallery_root / f"{employee_id}.jpg"
+                ok, jpeg = cv2.imencode(
+                    ".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 92]
+                )
+                if not ok:
+                    return {"ok": False, "message": "Không thể lưu ảnh đăng ký."}
+                temp_image = gallery_root / f".{employee_id}.tmp.jpg"
+                temp_image.write_bytes(jpeg.tobytes())
+                temp_image.replace(image_path)
+
+                registry = load_registry(gallery_root)
+                registry[employee_id] = {
+                    "display_name": display_name,
+                    "employee_id": employee_id,
+                }
+                registry_path = gallery_root / "registry.json"
+                temp_registry = gallery_root / ".registry.tmp.json"
+                temp_registry.write_text(
+                    json.dumps(registry, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                temp_registry.replace(registry_path)
+
+                detection = detections[0]
+                face_gallery.people.append(EnrolledPerson(
+                    person_id=employee_id,
+                    display_name=display_name,
+                    embedding=np.asarray(detection.embedding, dtype=np.float32),
+                    source_path=str(image_path),
+                    employee_id=employee_id,
+                ))
+                _store_or_queue(write_queue, supabase, "person", {
+                    "person_id": employee_id,
+                    "display_name": display_name,
+                    "photo_url": str(image_path),
+                    "active": True,
+                })
+            return {
+                "ok": True,
+                "person_id": employee_id,
+                "display_name": display_name,
+                "message": "Đăng ký nhân viên thành công.",
+            }
+
         streamer.set_attendance_actions(pending_attendance, send_attendance)
+        streamer.set_enrollment_action(register_person)
         if stream_on:
             jpeg_renderer = LatestJpegRenderer(streamer)
             jpeg_renderer.start()
@@ -1020,6 +1153,7 @@ def main() -> None:
     window_b_shown = False
     seen_gids: set[int] = set()
     ghosts_dir = Path(config.output.output_dir) / "ghosts"
+    face_marks_a: list = []  # face feedback for the Channel A kiosk
     face_marks_b: list = []  # (x1,y1,x2,y2,score,known) for cam B overlay
     frame_hub = FrameHub()
 
@@ -1051,6 +1185,7 @@ def main() -> None:
 
             batch_detections: dict[str, list] = {}
             if process_frame:
+                face_marks_a.clear()
                 face_marks_b.clear()
                 batch_names: list[str] = []
                 batch_images: list[np.ndarray] = []
@@ -1095,6 +1230,89 @@ def main() -> None:
                         gid_to_person,
                     )
                     last_states_a = {g: s.value for g, s in states_a.items()}
+                    if use_face and attendance is not None and face_matcher is not None:
+                        face_tick = (
+                            frame_idx // max(1, config.camera.process_every_n_frames)
+                        ) % max(1, face_cfg.process_every_k) == 0
+                        if face_tick:
+                            now_dt = datetime.now().astimezone()
+                            day_str = now_dt.date().isoformat()
+                            wall_iso = now_dt.isoformat(timespec="seconds")
+                            event = TrackEvent(
+                                channel="A",
+                                frame=Frame(frame_idx, now_s, frame_a),
+                                tracks=tuple(confirmed_a),
+                            )
+                            with metrics.measure("face_A"):
+                                with face_model_lock:
+                                    observations = face_consumer.consume(event, now_s)
+                            for observation in observations:
+                                track = observation.track
+                                detection = observation.detection
+                                match = observation.match
+                                frame_height, frame_width = frame_a.shape[:2]
+                                offset_x = max(
+                                    0, min(frame_width, round(track.bbox.x1))
+                                )
+                                offset_y = max(
+                                    0, min(frame_height, round(track.bbox.y1))
+                                )
+                                fx1, fy1, fx2, fy2 = detection.bbox
+                                face_marks_a.append((
+                                    offset_x + fx1,
+                                    offset_y + fy1,
+                                    offset_x + fx2,
+                                    offset_y + fy2,
+                                    match.score,
+                                    match.is_known,
+                                ))
+                                if not match.is_known or match.person is None:
+                                    continue
+                                employee_id = (
+                                    match.person.employee_id
+                                    or match.person.person_id
+                                )
+                                manager.bind_employee(track.track_id, employee_id)
+                                gid_to_score[track.track_id] = match.score
+                                gid_to_person[track.track_id] = employee_id
+                                gid_to_display[track.track_id] = (
+                                    match.person.display_name
+                                )
+                                ticked = attendance.observe(
+                                    day=day_str,
+                                    global_id=track.track_id,
+                                    person_id=employee_id,
+                                    display_name=match.person.display_name,
+                                    score=match.score,
+                                    now_s=now_s,
+                                    wall_time_iso=wall_iso,
+                                )
+                                if ticked is not None and day_cache.attendance_should_write(
+                                    day_str, ticked.person_id
+                                ):
+                                    _store_or_queue(write_queue, supabase, "attendance", {
+                                        "date": day_str,
+                                        "person_id": ticked.person_id,
+                                        "person_name": ticked.display_name,
+                                        "global_id": ticked.global_id,
+                                        "attended": True,
+                                        "check_in_at": wall_iso,
+                                        "face_score": ticked.face_score,
+                                        "needs_review": False,
+                                    })
+                                    _store_or_queue(write_queue, supabase, "event", {
+                                        "date": day_str,
+                                        "global_id": ticked.global_id,
+                                        "person_id": ticked.person_id,
+                                        "event": "CHECK_IN",
+                                        "channel": "A",
+                                        "at": wall_iso,
+                                    })
+                                    print(
+                                        f"[Diem danh A] {ticked.display_name} "
+                                        f"(G{ticked.global_id}, "
+                                        f"score={ticked.face_score:.2f})"
+                                    )
                 else:
                     confirmed_a = last_tracks_a
 
@@ -1142,7 +1360,8 @@ def main() -> None:
                                 tracks=tuple(confirmed_b),
                             )
                             with metrics.measure("face"):
-                                observations = face_consumer.consume(event, now_s)
+                                with face_model_lock:
+                                    observations = face_consumer.consume(event, now_s)
                             for observation in observations:
                                 track = observation.track
                                 crop = observation.crop_bgr
@@ -1363,6 +1582,24 @@ def main() -> None:
                 draw_global_labels(
                     vis_a, last_tracks_a, room_status_now, gid_to_display, gid_to_person
                 )
+                for x1m, y1m, x2m, y2m, fscore, fknown in face_marks_a:
+                    fcolor = (40, 180, 40) if fknown else (60, 60, 220)
+                    cv2.rectangle(
+                        vis_a,
+                        (int(x1m), int(y1m)),
+                        (int(x2m), int(y2m)),
+                        fcolor,
+                        2,
+                    )
+                    cv2.putText(
+                        vis_a,
+                        f"{fscore:.2f}",
+                        (int(x1m), max(0, int(y1m) - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        fcolor,
+                        2,
+                    )
             if ret_b and frame_b is not None and need_vis:
                 vis_b = frame_b.copy()
                 draw_person_tracks(vis_b, last_tracks_b, display_count=count_b.value,

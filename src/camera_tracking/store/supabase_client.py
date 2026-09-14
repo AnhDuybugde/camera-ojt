@@ -76,6 +76,18 @@ class SupabaseStore:
             return False
 
     # -- upserts --
+    def upsert_person(self, row: dict) -> bool:
+        if not self.connect():
+            return False
+        try:
+            self._client.table("persons").upsert(
+                row, on_conflict="person_id"
+            ).execute()
+            return True
+        except Exception as error:  # noqa: BLE001
+            self._error = str(error)
+            return False
+
     def upsert_attendance(self, row: dict) -> bool:
         """row theo schema attendance_daily (PK date+person_id)."""
         if not self.connect():

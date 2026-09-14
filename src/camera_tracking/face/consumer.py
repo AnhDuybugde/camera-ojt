@@ -49,16 +49,18 @@ class FaceTrackConsumer:
         self.min_blur_variance = max(0.0, min_blur_variance)
         self.known_cooldown_s = max(0.0, known_cooldown_s)
         self.unknown_cooldown_s = max(0.0, unknown_cooldown_s)
-        self._gates: dict[int, _TrackGate] = {}
+        # A global identity may be visible on both cameras in the same tick.
+        # Keep quality/cooldown state per camera so one channel cannot starve
+        # face recognition on the other.
+        self._gates: dict[tuple[str, int], _TrackGate] = {}
 
     def consume(self, event: TrackEvent, now_s: float) -> list[FaceObservation]:
-        if event.channel != "B":
-            return []
         observations: list[FaceObservation] = []
         for track in event.tracks:
             if track.bbox.area < self.min_person_area_px:
                 continue
-            gate = self._gates.setdefault(_global_id(track), _TrackGate())
+            gate_key = (event.channel, _global_id(track))
+            gate = self._gates.setdefault(gate_key, _TrackGate())
             cooldown = (
                 self.known_cooldown_s if gate.employee_id else self.unknown_cooldown_s
             )
@@ -109,8 +111,11 @@ class FaceTrackConsumer:
         return observations
 
     def forget_retired(self, alive_global_ids: set[int]) -> None:
-        for global_id in [gid for gid in self._gates if gid not in alive_global_ids]:
-            self._gates.pop(global_id, None)
+        retired = [
+            key for key in self._gates if key[1] not in alive_global_ids
+        ]
+        for key in retired:
+            self._gates.pop(key, None)
 
 
 def _global_id(track: Track) -> int:

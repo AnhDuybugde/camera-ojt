@@ -37,3 +37,25 @@ def test_face_consumer_applies_track_cooldown() -> None:
     assert len(first) == 1
     assert second == []
     assert len(third) == 1
+
+
+def test_face_consumer_processes_channel_a_independently_from_b() -> None:
+    image = np.zeros((200, 200, 3), dtype=np.uint8)
+    checker = np.indices((100, 60)).sum(axis=0) % 2 * 255
+    image[40:140, 60:120] = checker[:, :, None]
+    track = Track(7, BoundingBox(40, 20, 160, 180), 0.9, 3, 3, True,
+                  local_track_id=12, global_person_id=7)
+    consumer = FaceTrackConsumer(
+        FakeEmbedder(), FakeMatcher(), min_person_area_px=1,
+        min_face_px=20, min_blur_variance=1,
+    )
+
+    result_b = consumer.consume(
+        TrackEvent("B", Frame(1, 0.0, image), (track,)), now_s=0.0
+    )
+    result_a = consumer.consume(
+        TrackEvent("A", Frame(1, 0.0, image), (track,)), now_s=0.0
+    )
+
+    assert len(result_b) == 1
+    assert len(result_a) == 1

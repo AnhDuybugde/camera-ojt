@@ -1,6 +1,7 @@
 """Enroll gallery tu thu muc `data/images/`."""
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import numpy as np
 from camera_tracking.face.embeddings import FaceEmbedder, cosine_similarity
 
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+_REGISTRY_FILE = "registry.json"
 
 
 @dataclass(slots=True)
@@ -56,6 +58,31 @@ def _read_image(path: Path) -> np.ndarray | None:
     return img
 
 
+def load_registry(gallery_dir: str | Path) -> dict[str, dict[str, str]]:
+    """Load locally enrolled display metadata without making YAML mutable."""
+    path = Path(gallery_dir) / _REGISTRY_FILE
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    registry: dict[str, dict[str, str]] = {}
+    for person_id, value in payload.items():
+        if not isinstance(person_id, str) or not isinstance(value, dict):
+            continue
+        display_name = value.get("display_name")
+        employee_id = value.get("employee_id")
+        if isinstance(display_name, str) and isinstance(employee_id, str):
+            registry[person_id] = {
+                "display_name": display_name,
+                "employee_id": employee_id,
+            }
+    return registry
+
+
 def load_gallery(
     gallery_dir: str | Path,
     embedder: FaceEmbedder | None,
@@ -67,8 +94,15 @@ def load_gallery(
     gallery = FaceGallery()
     if not root.is_dir():
         return gallery
-    name_map = name_map or {}
-    employee_map = employee_map or {}
+    registry = load_registry(root)
+    registry_names = {
+        person_id: value["display_name"] for person_id, value in registry.items()
+    }
+    registry_employees = {
+        person_id: value["employee_id"] for person_id, value in registry.items()
+    }
+    name_map = {**registry_names, **(name_map or {})}
+    employee_map = {**registry_employees, **(employee_map or {})}
     for path in sorted(root.iterdir()):
         if path.suffix.lower() not in _IMAGE_EXTS or not path.is_file():
             continue

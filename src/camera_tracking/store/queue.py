@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS pending_writes (
 """
 
 _COALESCED_KEYS = {
+    "person": ("person_id",),
     "room_status": ("date", "global_id"),
     "current_state": ("employee_id",),
 }
