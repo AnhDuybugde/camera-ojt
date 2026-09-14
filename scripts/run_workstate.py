@@ -202,6 +202,74 @@ class ResilientCapture:
         self.capture.release()
 
 
+class LatestFrameCapture:
+    """Continuously drain an RTSP source and expose only its newest frame."""
+
+    def __init__(self, stream: ResilientCapture) -> None:
+        self.stream = stream
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._frame: np.ndarray | None = None
+        self._generation = 0
+        self._delivered_generation = 0
+
+    @property
+    def exhausted(self) -> bool:
+        return self.stream.exhausted
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._drain,
+            name=f"latest-frame-{self.stream.name}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _drain(self) -> None:
+        while not self._stop.is_set():
+            ok, frame = self.stream.read()
+            if ok and frame is not None:
+                with self._lock:
+                    self._frame = frame
+                    self._generation += 1
+                continue
+            if self.stream.exhausted:
+                break
+            time.sleep(0.005)
+
+    def read(self) -> tuple[bool, np.ndarray | None]:
+        with self._lock:
+            if (
+                self._frame is None
+                or self._generation == self._delivered_generation
+            ):
+                return False, None
+            self._delivered_generation = self._generation
+            return True, self._frame
+
+    def close(self) -> None:
+        self._stop.set()
+        self.stream.close()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+
+def low_latency_capture(
+    stream: ResilientCapture,
+) -> ResilientCapture | LatestFrameCapture:
+    """Use a latest-frame reader for RTSP without accelerating local files."""
+    source = normalize_source(stream.source)
+    if not (isinstance(source, str) and source.lower().startswith("rtsp://")):
+        return stream
+    latest = LatestFrameCapture(stream)
+    latest.start()
+    return latest
+
+
 def imou_url(channel: int, subtype: int = 1) -> str | None:
     ip = os.getenv("IMOU_IP", "")
     user = os.getenv("IMOU_USER", "")
@@ -912,27 +980,33 @@ def main() -> None:
                   f"running without live stream.")
 
     cap_a = open_capture(source_a, attempts=args.open_attempts, camera_name="A")
-    cap_b = open_capture(source_b, attempts=args.open_attempts, camera_name="B")
-    if not cap_a.isOpened():
+    opened_a = cap_a.isOpened()
+    if not opened_a:
         print(f"Không mở được camera A: {source_label(source_a)}")
-    if not cap_b.isOpened():
-        print(f"Không mở được camera B: {source_label(source_b)}")
-    if not cap_a.isOpened() and not cap_b.isOpened():
-        raise SystemExit(1)
-    stream_a = ResilientCapture(
+    stream_a = low_latency_capture(ResilientCapture(
         source_a,
         "A",
         cap_a,
         args.open_attempts,
         max_reconnects=max(0, args.max_reconnects),
-    )
-    stream_b = ResilientCapture(
+    ))
+
+    # Drain A while B is opening; otherwise A can accumulate the entire B
+    # connection time in FFmpeg's internal RTSP buffer.
+    cap_b = open_capture(source_b, attempts=args.open_attempts, camera_name="B")
+    opened_b = cap_b.isOpened()
+    if not opened_b:
+        print(f"Không mở được camera B: {source_label(source_b)}")
+    if not opened_a and not opened_b:
+        stream_a.close()
+        raise SystemExit(1)
+    stream_b = low_latency_capture(ResilientCapture(
         source_b,
         "B",
         cap_b,
         args.open_attempts,
         max_reconnects=max(0, args.max_reconnects),
-    )
+    ))
 
     print("Dang chay tracking Global ID. Nhan 'q' hoac ESC de thoat.")
     start = time.time()
@@ -1310,27 +1384,48 @@ def main() -> None:
                 if vis_b is not None:
                     cv2.imshow("Channel B - tracking", vis_b)
                     window_b_shown = True
-            if stream_on and process_frame:
+            if stream_on:
                 with metrics.measure("rendering"):
                     if jpeg_renderer is not None:
                         if vis_a is not None:
                             jpeg_renderer.submit("cam_a", vis_a)
                         if vis_b is not None:
                             jpeg_renderer.submit("cam_b", vis_b)
-                streamer.set_status({
-                    "people": [
-                        {"gid": gid,
-                         "name": st.display_name,
-                         "label": st.label,
-                         "in_room": st.in_room}
-                        for gid, st in sorted(room_status_now.items())
-                    ],
-                    "pending_attendance": (
-                        pending_attendance() if streamer is not None else []
-                    ),
-                    "count_a": count_a.value,
-                    "count_b": count_b.value,
-                })
+                if process_frame:
+                    live_people = []
+                    for gid, st in sorted(room_status_now.items()):
+                        identity = manager.identities.get(gid)
+                        live_people.append({
+                            "gid": gid,
+                            "person_id": gid_to_person.get(gid),
+                            "name": st.display_name,
+                            "label": st.label,
+                            "in_room": st.in_room,
+                            "face_score": gid_to_score.get(gid),
+                            "camera": identity.channel if identity else None,
+                            "tracking_state": (
+                                identity.state.value if identity else None
+                            ),
+                        })
+                    attendance_today = [] if attendance is None else [
+                        {
+                            "date": record.day,
+                            "person_id": record.person_id,
+                            "person_name": record.display_name,
+                            "global_id": record.global_id,
+                            "attended": True,
+                            "check_in_at": record.wall_time,
+                            "face_score": record.face_score,
+                        }
+                        for record in attendance.records_for_day(day_str)
+                    ]
+                    streamer.set_status({
+                        "people": live_people,
+                        "attendance_today": attendance_today,
+                        "pending_attendance": pending_attendance(),
+                        "count_a": count_a.value,
+                        "count_b": count_b.value,
+                    })
 
             if args.display:
                 key = cv2.waitKey(1) & 0xFF

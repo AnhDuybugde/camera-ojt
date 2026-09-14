@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 
 from scripts.run_workstate import (
+    LatestFrameCapture,
     ResilientCapture,
     _substream_fallback,
     normalize_frame_size,
@@ -14,6 +15,31 @@ from scripts.run_workstate import (
 
 
 class OpenCaptureTest(TestCase):
+    def test_latest_frame_capture_drops_stale_rtsp_frames(self) -> None:
+        first = np.zeros((2, 2, 3), dtype=np.uint8)
+        newest = np.ones((2, 2, 3), dtype=np.uint8)
+        capture = MagicMock()
+        capture.isOpened.return_value = True
+        capture.read.side_effect = [(True, first), (True, newest), (False, None)]
+        stream = ResilientCapture(
+            "rtsp://camera/live",
+            "A",
+            capture,
+            open_attempts=1,
+            max_reconnects=0,
+            failure_threshold=1,
+        )
+        latest = LatestFrameCapture(stream)
+
+        latest.start()
+        assert latest._thread is not None
+        latest._thread.join(timeout=1.0)
+        ok, frame = latest.read()
+        latest.close()
+
+        self.assertTrue(ok)
+        np.testing.assert_array_equal(frame, newest)
+
     def test_main_stream_has_substream_fallback(self) -> None:
         source = "rtsp://user:secret@camera/live?channel=1&subtype=0"
 

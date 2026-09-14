@@ -138,6 +138,9 @@ class MjpegStreamer:
                 self.send_header("Content-Type",
                                  "multipart/x-mixed-replace; boundary=frame")
                 self.send_header("Cache-Control", "no-cache")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Expires", "0")
+                self.send_header("X-Accel-Buffering", "no")
                 self.end_headers()
                 try:
                     while True:
@@ -149,7 +152,7 @@ class MjpegStreamer:
                                 + f"Content-Length: {len(frame)}\r\n\r\n".encode()
                                 + frame + b"\r\n"
                             )
-                        time.sleep(0.07)  # ~14 fps cap per viewer
+                        time.sleep(0.04)  # ~25 fps cap; snapshot is always latest.
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                     pass
 

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
+import KioskCheckIn from './KioskCheckIn'
 import PipelineControl from './PipelineControl'
-import { supabase } from './lib/supabase'
+import { supabase, supabaseConfigured } from './lib/supabase'
 import {
   deleteAllForDate,
   deleteAttendance,
@@ -43,9 +44,13 @@ type RoomEventRow = {
 
 type LivePerson = {
   gid: number
+  person_id?: string | null
   name: string | null
   label: string
   in_room: boolean
+  face_score?: number | null
+  camera?: string | null
+  tracking_state?: string | null
 }
 
 type PendingAttendance = {
@@ -57,7 +62,13 @@ type PendingAttendance = {
   face_score: number
 }
 
-const STREAM_URL = (import.meta.env.VITE_STREAM_URL as string | undefined)?.replace(/\/$/, '') ?? ''
+const STREAM_URL = (import.meta.env.VITE_STREAM_URL as string | undefined)?.replace(/\/$/, '')
+  ?? 'http://localhost:8765'
+const KIOSK_CHANNEL = (
+  (import.meta.env.VITE_KIOSK_CHANNEL as string | undefined)?.toUpperCase() === 'B'
+    ? 'B'
+    : 'A'
+) as 'A' | 'B'
 
 // Old rows in the DB may still carry Vietnamese labels; normalize to EN.
 const LABEL_MAP: Record<string, string> = {
@@ -87,6 +98,7 @@ function todayISO(): string {
 }
 
 export default function App() {
+  const [screen, setScreen] = useState<'kiosk' | 'admin'>('kiosk')
   const [day, setDay] = useState(todayISO())
   const [attendance, setAttendance] = useState<AttendanceRow[]>([])
   const [room, setRoom] = useState<RoomRow[]>([])
@@ -108,6 +120,7 @@ export default function App() {
   const [liveOk, setLiveOk] = useState(false)
 
   useEffect(() => {
+    if (!supabaseConfigured) return
     supabase.auth.getSession().then(({ data }) => {
       setUser(data.session?.user?.email ?? null)
     })
@@ -123,6 +136,10 @@ export default function App() {
   }
 
   async function load(showLoading = true) {
+    if (!supabaseConfigured) {
+      if (showLoading) note('Supabase is not configured.')
+      return
+    }
     if (showLoading) note('Loading...')
     const [a, r, e] = await Promise.all([
       supabase.from('attendance_daily').select('*').eq('date', day).order('check_in_at'),
@@ -167,6 +184,9 @@ export default function App() {
         if (!alive) return
         setLivePeople((data.people ?? []) as LivePerson[])
         setPendingAttendance((data.pending_attendance ?? []) as PendingAttendance[])
+        if (Array.isArray(data.attendance_today)) {
+          setAttendance(data.attendance_today as AttendanceRow[])
+        }
         setLiveOk(true)
       } catch {
         if (alive) setLiveOk(false)
@@ -255,11 +275,30 @@ export default function App() {
     }
   }
 
+  if (screen === 'kiosk') {
+    return (
+      <KioskCheckIn
+        streamUrl={STREAM_URL}
+        cameraChannel={KIOSK_CHANNEL}
+        liveOk={liveOk}
+        people={livePeople}
+        attendance={attendance}
+        pendingAttendance={pendingAttendance}
+        onOpenAdmin={() => setScreen('admin')}
+      />
+    )
+  }
+
   return (
     <div className="app">
       <header className="app-header">
-        <h1>Attendance &amp; Room Status</h1>
-        <p>Face check-in once per person per day, live room presence per Global ID.</p>
+        <div>
+          <h1>Attendance &amp; Room Status</h1>
+          <p>Face check-in once per person per day, live room presence per Global ID.</p>
+        </div>
+        <button type="button" className="header-action" onClick={() => setScreen('kiosk')}>
+          Màn hình điểm danh
+        </button>
       </header>
 
       <div className="toolbar">
