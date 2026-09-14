@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import KioskCheckIn from './KioskCheckIn'
+import KioskCheckIn, { type KioskEvent } from './KioskCheckIn'
 import PipelineControl from './PipelineControl'
 import { supabase, supabaseConfigured } from './lib/supabase'
 import {
@@ -93,6 +93,19 @@ function labelClass(label: string): string {
   return 'badge badge-unknown'
 }
 
+const EVENT_VI: Record<string, string> = {
+  CHECK_IN: 'Điểm danh',
+  LEAVE_OFFICE: 'Rời văn phòng',
+  RETURN: 'Quay lại',
+}
+
+function eventClass(event: string): string {
+  if (event === 'CHECK_IN') return 'badge badge-working'
+  if (event === 'LEAVE_OFFICE') return 'badge badge-out'
+  if (event === 'RETURN') return 'badge badge-returning'
+  return 'badge badge-unknown'
+}
+
 function todayISO(): string {
   return new Date().toISOString().slice(0, 10)
 }
@@ -116,6 +129,7 @@ export default function App() {
   const [isError, setIsError] = useState(false)
   const [livePeople, setLivePeople] = useState<LivePerson[]>([])
   const [pendingAttendance, setPendingAttendance] = useState<PendingAttendance[]>([])
+  const [liveEvents, setLiveEvents] = useState<KioskEvent[]>([])
   const [sendingAttendance, setSendingAttendance] = useState(false)
   const [liveOk, setLiveOk] = useState(false)
 
@@ -184,6 +198,9 @@ export default function App() {
         if (!alive) return
         setLivePeople((data.people ?? []) as LivePerson[])
         setPendingAttendance((data.pending_attendance ?? []) as PendingAttendance[])
+        if (Array.isArray(data.recent_events)) {
+          setLiveEvents(data.recent_events as KioskEvent[])
+        }
         if (Array.isArray(data.attendance_today)) {
           setAttendance(data.attendance_today as AttendanceRow[])
         }
@@ -284,6 +301,7 @@ export default function App() {
         people={livePeople}
         attendance={attendance}
         pendingAttendance={pendingAttendance}
+        events={liveEvents}
         onOpenAdmin={() => setScreen('admin')}
       />
     )
@@ -353,6 +371,25 @@ export default function App() {
               ))}
             </div>
           </>
+        )}
+      </section>
+
+      <section className="card">
+        <h2>Sự kiện trực tiếp {liveOk && <span className="badge badge-working">LIVE</span>}</h2>
+        {!liveOk ? (
+          <p className="footnote">Pipeline offline — sự kiện mới sẽ hiện tại đây khi camera chạy lại.</p>
+        ) : liveEvents.length === 0 ? (
+          <p className="footnote">Chưa có sự kiện nào trong phiên chạy này.</p>
+        ) : (
+          <ul className="live-events">
+            {liveEvents.slice().reverse().map((e, i) => (
+              <li key={`${e.at ?? ''}-${e.global_id ?? ''}-${e.event}-${i}`}>
+                <span className={eventClass(e.event)}>{EVENT_VI[e.event] ?? e.event}</span>
+                <strong>{e.person_name ?? `G${e.global_id ?? '?'}`}</strong>
+                <span className="footnote">Cam {e.channel ?? '?'} · {e.at ?? '—'}</span>
+              </li>
+            ))}
+          </ul>
         )}
       </section>
 

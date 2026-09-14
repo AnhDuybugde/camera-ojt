@@ -8,8 +8,10 @@ camera:
 
 detection:
   # auto = cuda neu co GPU, khong thi mps, khong thi cpu.
-  # YOLO26s @ 800px was benchmarked on RTX 3050 6 GB for this two-camera view.
-  model_path: yolo26s.pt
+  # TensorRT FP16 dynamic batch (build tu yolo26s.pt, TRT 10.9, sm_89).
+  # ~185 frame/s vs ~50 cua .pt. Rebuild khi doi GPU/model:
+  # yolo export model=yolo26s.pt format=engine half=True imgsz=640 device=0 dynamic=True batch=16
+  model_path: yolo26s.engine
   # Recall-first (chong nhap nhay khi che): giu box yeu de ByteTrack +
   # GlobalID noi lai. Danh doi: ghost ID tang, can loc bang min-area.
   confidence_threshold: 0.25
@@ -47,6 +49,9 @@ identity:
   long_lost_s: 120.0
   unresolved_keep_s: 600.0
   min_gallery_confidence: 0.25
+  # Perf: track on dinh chi refresh gallery moi 5 buoc (pending van
+  # extract moi frame de matching). Giam ~80% OSNet calls khi dong nguoi.
+  gallery_refresh_steps: 5
   reid_backend: osnet
   reid_model: osnet_x1_0
   reid_device: auto
@@ -89,9 +94,13 @@ output:
   video_filename: annotated.mp4
   report_filename: report.json
 
-# Face attendance (channel B = cua ra vao). InsightFace buffalo_s.
+# Face attendance + nhan dien (InsightFace buffalo_s).
+# channels: camera nao diem danh — ["A", "B"] = ca 2 nhu nhau.
 face:
   enabled: true
+  channels: [A, B]
+  # auto = cuda neu co onnxruntime-gpu + CUDA Toolkit, khong thi cpu.
+  face_device: auto
   gallery_dir: data/images
   model_pack: buffalo_s
   match_threshold: 0.45
@@ -102,8 +111,14 @@ face:
   det_size: 640
   name_map:
     LeHoAnhDuy: Le Ho Anh Duy
+    LeVanDai: Le Van Dai
+    QuocNgoc: Quoc Ngoc
+    TranBaLeHoang: Tran Ba Le Hoang
   employee_map:
     LeHoAnhDuy: "1"
+    LeVanDai: "2"
+    QuocNgoc: "3"
+    TranBaLeHoang: "4"
 
 attendance:
   debounce_hits: 1

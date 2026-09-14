@@ -41,6 +41,7 @@ class FaceTrackConsumer:
         min_blur_variance: float = 60.0,
         known_cooldown_s: float = 30.0,
         unknown_cooldown_s: float = 1.0,
+        channels: tuple[str, ...] = ("A", "B"),
     ) -> None:
         self.embedder = embedder
         self.matcher = matcher
@@ -49,10 +50,11 @@ class FaceTrackConsumer:
         self.min_blur_variance = max(0.0, min_blur_variance)
         self.known_cooldown_s = max(0.0, known_cooldown_s)
         self.unknown_cooldown_s = max(0.0, unknown_cooldown_s)
+        self.channels = tuple(channels) or ("A", "B")
         self._gates: dict[int, _TrackGate] = {}
 
     def consume(self, event: TrackEvent, now_s: float) -> list[FaceObservation]:
-        if event.channel != "B":
+        if event.channel not in self.channels:
             return []
         observations: list[FaceObservation] = []
         for track in event.tracks:

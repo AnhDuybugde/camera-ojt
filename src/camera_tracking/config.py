@@ -59,6 +59,7 @@ class GlobalIdentityConfig(StrictModel):
     long_lost_s: float = Field(default=60.0, ge=0)
     unresolved_keep_s: float = Field(default=300.0, ge=0)
     min_gallery_confidence: float = Field(default=0.25, ge=0, le=1)
+    gallery_refresh_steps: int = Field(default=1, ge=1)
     reid_backend: Literal["osnet", "histogram"] = "osnet"
     reid_model: str = "osnet_x1_0"
     reid_device: Literal["auto", "cpu", "cuda"] = "auto"
@@ -113,9 +114,15 @@ class OutputConfig(StrictModel):
 
 
 class FaceConfig(StrictModel):
-    """Nhan dien khuon mat channel B (diem danh). InsightFace buffalo_s."""
+    """Nhan dien khuon mat (diem danh). Chay tren cac channel chi dinh."""
 
     enabled: bool = True
+    # Channel chay face recognition/diem danh, vi du ["B"] (cua) hoac
+    # ["A", "B"] (ca 2 camera nhu nhau).
+    channels: list[str] = Field(default_factory=lambda: ["A", "B"])
+    # Thiet bi InsightFace: auto = cuda neu co CUDAExecutionProvider (can
+    # onnxruntime-gpu + CUDA Toolkit), khong thi cpu.
+    face_device: Literal["auto", "cpu", "cuda"] = "auto"
     gallery_dir: Path = Path("data/images")
     model_pack: str = "buffalo_s"
     match_threshold: float = Field(default=0.3, ge=0, le=1)

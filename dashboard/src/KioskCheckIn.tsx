@@ -20,6 +20,15 @@ export type KioskAttendance = {
   face_score: number | null
 }
 
+export type KioskEvent = {
+  event: 'CHECK_IN' | 'LEAVE_OFFICE' | 'RETURN' | string
+  global_id: number | null
+  channel: string | null
+  at: string | null
+  person_id?: string | null
+  person_name?: string | null
+}
+
 type RecognitionState =
   | 'idle'
   | 'recognizing'
@@ -36,6 +45,7 @@ type Props = {
   people: KioskPerson[]
   attendance: KioskAttendance[]
   pendingAttendance: KioskAttendance[]
+  events: KioskEvent[]
   onOpenAdmin: () => void
 }
 
@@ -70,6 +80,16 @@ const STATE_COPY: Record<RecognitionState, { title: string; detail: string }> = 
   },
 }
 
+const EVENT_COPY: Record<string, { label: string; className: string }> = {
+  CHECK_IN: { label: 'Điểm danh', className: 'event-checkin' },
+  LEAVE_OFFICE: { label: 'Rời văn phòng', className: 'event-leave' },
+  RETURN: { label: 'Quay lại', className: 'event-return' },
+}
+
+function eventCopy(event: string): { label: string; className: string } {
+  return EVENT_COPY[event] ?? { label: event, className: 'event-other' }
+}
+
 function initials(name: string | null | undefined): string {
   if (!name) return 'ID'
   return name
@@ -94,6 +114,7 @@ export default function KioskCheckIn({
   people,
   attendance,
   pendingAttendance,
+  events,
   onOpenAdmin,
 }: Props) {
   const [now, setNow] = useState(new Date())
@@ -265,6 +286,7 @@ export default function KioskCheckIn({
         </aside>
       </div>
 
+      <div className="kiosk-bottom">
       <section className="recent-checkins" aria-label="Lượt điểm danh gần đây">
         <div className="recent-heading">
           <strong>Lượt điểm danh gần đây</strong>
@@ -283,6 +305,32 @@ export default function KioskCheckIn({
           ))}
         </div>
       </section>
+
+      <section className="activity-feed" aria-label="Hoạt động gần đây">
+        <div className="recent-heading">
+          <strong>Hoạt động</strong>
+          <span>{liveOk ? 'Trực tiếp từ pipeline' : 'Ngoại tuyến'}</span>
+        </div>
+        <ul className="activity-list">
+          {events.length === 0 && (
+            <li className="recent-empty">Chưa có hoạt động nào</li>
+          )}
+          {events.slice(-8).reverse().map((item, index) => {
+            const copy = eventCopy(item.event)
+            return (
+              <li key={`${item.at ?? ''}-${item.global_id ?? ''}-${item.event}-${index}`} className="activity-item">
+                <span className={`activity-dot ${copy.className}`} aria-hidden="true" />
+                <span className="activity-body">
+                  <strong>{item.person_name ?? `G${item.global_id ?? '?'}`}</strong>
+                  <small>{copy.label}{item.channel ? ` · Cam ${item.channel}` : ''}</small>
+                </span>
+                <time>{formatTime(item.at, now)}</time>
+              </li>
+            )
+          })}
+        </ul>
+      </section>
+      </div>
     </main>
   )
 }

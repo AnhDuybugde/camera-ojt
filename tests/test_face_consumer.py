@@ -37,3 +37,31 @@ def test_face_consumer_applies_track_cooldown() -> None:
     assert len(first) == 1
     assert second == []
     assert len(third) == 1
+
+
+def _event(channel: str) -> TrackEvent:
+    image = np.zeros((200, 200, 3), dtype=np.uint8)
+    checker = np.indices((100, 60)).sum(axis=0) % 2 * 255
+    image[40:140, 60:120] = checker[:, :, None]
+    track = Track(7, BoundingBox(40, 20, 160, 180), 0.9, 3, 3, True,
+                  local_track_id=12, global_person_id=7)
+    return TrackEvent(channel, Frame(1, 0.0, image), (track,))
+
+
+def test_face_consumer_runs_on_both_channels_by_default() -> None:
+    consumer = FaceTrackConsumer(
+        FakeEmbedder(), FakeMatcher(), min_person_area_px=1,
+        min_face_px=20, min_blur_variance=1,
+    )
+    assert len(consumer.consume(_event("A"), now_s=0.0)) == 1
+    # Per-gid cooldown shared: same gid on B within cooldown is skipped.
+    assert consumer.consume(_event("B"), now_s=1.0) == []
+
+
+def test_face_consumer_channel_allowlist() -> None:
+    consumer = FaceTrackConsumer(
+        FakeEmbedder(), FakeMatcher(), min_person_area_px=1,
+        min_face_px=20, min_blur_variance=1, channels=("B",),
+    )
+    assert consumer.consume(_event("A"), now_s=0.0) == []
+    assert len(consumer.consume(_event("B"), now_s=0.0)) == 1

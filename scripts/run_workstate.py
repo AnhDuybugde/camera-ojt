@@ -24,6 +24,7 @@ import os
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -46,6 +47,11 @@ import numpy as np
 from camera_tracking.camera import FrameHub
 from camera_tracking.config import load_config
 from camera_tracking.detection import YoloPersonDetector, resolve_device
+try:  # CUDA/cuDNN tu pip wheels (khong can CUDA Toolkit he thong).
+    from camera_tracking.face.embeddings import ensure_cuda_dlls
+    ensure_cuda_dlls()
+except Exception:  # noqa: BLE001 - CPU fallback van chay
+    pass
 from camera_tracking.domain import Frame, Track, TrackEvent
 from camera_tracking.runtime import StageMetrics
 from camera_tracking.tracking import (
@@ -350,9 +356,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default=None,
                         help="cuda / mps / cpu / auto (mac dinh lay theo config).")
     parser.add_argument("--no-face", action="store_true",
-                        help="Tat nhan dien khuon mat channel B (chi tracking).")
+                        help="Tat nhan dien khuon mat ca 2 kenh (chi tracking).")
     parser.add_argument("--face-threshold", type=float, default=None,
                         help="Override face.match_threshold trong config.")
+    parser.add_argument("--face-channels", default=None,
+                        help="Override face.channels trong config "
+                        "(vi du 'B' chi diem danh 1 cam, 'AB' ca 2).")
+    parser.add_argument("--metrics-log-s", type=float, default=60.0,
+                        help="In StageMetrics moi N giay de soi bottleneck "
+                        "(0 = tat, chi in khi thoat).")
     return parser.parse_args()
 
 
@@ -778,6 +790,7 @@ def main() -> None:
             long_lost_s=identity_cfg.long_lost_s,
             unresolved_keep_s=identity_cfg.unresolved_keep_s,
             min_gallery_confidence=identity_cfg.min_gallery_confidence,
+            gallery_refresh_steps=identity_cfg.gallery_refresh_steps,
         ),
     )
     # Business theo channel: position (workstation ROI) + presence,
@@ -830,7 +843,16 @@ def main() -> None:
         away_grace_s=args.away_grace_s,
         out_after_s=args.out_after_s,
         return_stable_s=args.return_stable_s,
+        workstations=ws_zones if use_roi else [],
+        grace_s=ws_cfg.grace_s,
+        dwell_s=ws_cfg.dwell_s,
+        assign_dwell_s=ws_cfg.assign_dwell_s,
+        hysteresis_m=ws_cfg.hysteresis_m,
+        motion_influence=ws_cfg.motion_influence,
+        person_map=dict(ws_cfg.person_map),
         prune_after_s=ws_cfg.prune_after_s,
+        move_ratio=move_ratio,
+        settle_ratio=ws_cfg.settle_ratio,
     )
     workstate_a = WorkstateConsumer(business_a)
     workstate_b = WorkstateConsumer(business_b)
@@ -841,7 +863,11 @@ def main() -> None:
     # Tat ca optional: thieu model/lib/.env van chay tracking nhu cu.
     face_cfg = config.face
     face_threshold = args.face_threshold or face_cfg.match_threshold
-    use_face = bool(face_cfg.enabled and not args.no_face)
+    if args.face_channels is not None:
+        face_cfg = face_cfg.model_copy(
+            update={"channels": [c for c in args.face_channels.upper() if c in ("A", "B")] or ["B"]}
+        )
+    use_face = bool(face_cfg.enabled and not args.no_face and face_cfg.channels)
     face_embedder = face_matcher = face_gallery = attendance = face_consumer = None
     gid_to_person: dict[int, str] = {}
     gid_to_display: dict[int, str] = {}
@@ -858,7 +884,8 @@ def main() -> None:
             )
             try:
                 face_embedder = InsightFaceEmbedder(
-                    model_pack=face_cfg.model_pack, det_size=face_cfg.det_size
+                    model_pack=face_cfg.model_pack, det_size=face_cfg.det_size,
+                    device=face_cfg.face_device,
                 )
                 # Khong load model nang o day; load lazy o frame dau co nguoi.
             except Exception as error:  # noqa: BLE001
@@ -880,6 +907,7 @@ def main() -> None:
                     min_person_area_px=face_cfg.min_person_area_px,
                     min_face_px=face_cfg.min_face_px,
                     min_blur_variance=face_cfg.min_blur_variance,
+                    channels=tuple(face_cfg.channels),
                 )
                 attendance = FaceAttendanceService(
                     debounce_hits=config.attendance.debounce_hits,
@@ -888,7 +916,7 @@ def main() -> None:
                     active_hour_end=config.attendance.active_hour_end,
                 )
                 print(f"Face gallery: {len(face_gallery)} nguoi tu {face_cfg.gallery_dir} "
-                      f"| threshold={face_threshold}")
+                      f"| threshold={face_threshold} | channels={list(face_cfg.channels)}")
         except ImportError as error:
             print(f"Face disabled (thieu module: {error})")
             use_face = False
@@ -928,6 +956,7 @@ def main() -> None:
     )
     room_status_now: dict = {}
     last_flush_s = 0.0
+    last_metrics_log_s = 0.0
     # Unknown GID -> canonical (identified) GID after face reconcile.
     gid_alias: dict[int, int] = {}
     reconciler = IdentityReconciler(threshold=face_threshold)
@@ -1021,8 +1050,165 @@ def main() -> None:
     window_b_shown = False
     seen_gids: set[int] = set()
     ghosts_dir = Path(config.output.output_dir) / "ghosts"
+    face_marks_a: list = []  # (x1,y1,x2,y2,score,known) for cam A overlay
     face_marks_b: list = []  # (x1,y1,x2,y2,score,known) for cam B overlay
     frame_hub = FrameHub()
+    # Live event feed cho dashboard (kiosk + admin): 20 su kien moi nhat,
+    # song song voi WriteQueue -> Supabase (kiosk thay ngay ca khi offline).
+    recent_events: deque = deque(maxlen=20)
+
+    def _note_event(*, event: str, global_id: int, channel: str,
+                    at_iso: str, person_id=None, person_name=None) -> None:
+        recent_events.append({
+            "event": event,
+            "global_id": global_id,
+            "channel": channel,
+            "at": at_iso,
+            "person_id": person_id,
+            "person_name": person_name,
+        })
+
+    def _process_face_channel(*, channel: str, frame, confirmed_tracks,
+                              face_marks: list, day_str: str,
+                              wall_iso: str, time_tag: str,
+                              now_s: float) -> None:
+        """Face recognition + diem danh cho 1 channel (A/B nhu nhau).
+
+        Bind employee, tick attendance (1 lan/nguoi/ngay, dung chung cho
+        ca 2 kenh), reconcile ID, luu best-shot. Ghi face box vao face_marks
+        cua kenh do de ve overlay.
+        """
+        nonlocal unknown_counter
+        if not (use_face and attendance is not None
+                and face_matcher is not None and face_consumer is not None):
+            return
+        if channel not in face_consumer.channels:
+            return
+        event = TrackEvent(
+            channel=channel,
+            frame=Frame(frame_idx, now_s, frame),
+            tracks=tuple(confirmed_tracks),
+        )
+        with metrics.measure("face"):
+            observations = face_consumer.consume(event, now_s)
+        for observation in observations:
+            track = observation.track
+            crop = observation.crop_bgr
+            det = observation.detection
+            match = observation.match
+            sharp = observation.sharpness
+            _bh, _bw = frame.shape[:2]
+            _ox = max(0, min(_bw, round(track.bbox.x1)))
+            _oy = max(0, min(_bh, round(track.bbox.y1)))
+            fx1 = max(0, int(det.bbox[0])); fy1 = max(0, int(det.bbox[1]))
+            fx2 = min(crop.shape[1], int(det.bbox[2]))
+            fy2 = min(crop.shape[0], int(det.bbox[3]))
+            # Live feedback: face box + score (green = known, red = unknown).
+            face_marks.append(
+                (_ox + fx1, _oy + fy1, _ox + fx2, _oy + fy2,
+                 match.score, match.is_known))
+            if match.is_known and match.person is not None:
+                employee_id = (
+                    match.person.employee_id
+                    or match.person.person_id
+                )
+                manager.bind_employee(track.track_id, employee_id)
+                gid_to_score[track.track_id] = match.score
+                gid_to_person[track.track_id] = employee_id
+                # Show the name as soon as the face matches
+                # (DB tick stays debounced below).
+                gid_to_display[track.track_id] = \
+                    match.person.display_name
+                ticked = attendance.observe(
+                    day=day_str, global_id=track.track_id,
+                    person_id=employee_id,
+                    display_name=match.person.display_name,
+                    score=match.score, now_s=now_s,
+                    wall_time_iso=wall_iso,
+                )
+                if ticked is not None:
+                    if day_cache.attendance_should_write(
+                            day_str, ticked.person_id):
+                        _store_or_queue(write_queue, supabase, "attendance", {
+                            "date": day_str, "person_id": ticked.person_id,
+                            "person_name": ticked.display_name,
+                            "global_id": ticked.global_id,
+                            "attended": True, "check_in_at": wall_iso,
+                            "face_score": ticked.face_score,
+                            "needs_review": False,
+                        })
+                        _store_or_queue(write_queue, supabase, "event", {
+                            "date": day_str, "global_id": ticked.global_id,
+                            "person_id": ticked.person_id,
+                            "event": "CHECK_IN", "channel": channel,
+                            "at": wall_iso,
+                        })
+                        _note_event(
+                            event="CHECK_IN", global_id=ticked.global_id,
+                            channel=channel, at_iso=wall_iso,
+                            person_id=ticked.person_id,
+                            person_name=ticked.display_name,
+                        )
+                        print(f"[Diem danh][{channel}] {ticked.display_name} "
+                              f"(G{ticked.global_id}, "
+                              f"score={ticked.face_score:.2f})")
+                # Reconcile: stale unknown GIDs that match
+                # this person merge into the current gid.
+                if match.person.embedding is not None:
+                    _reconcile_unknowns(
+                        day_cache, write_queue, supabase,
+                        reconciler, gid_alias, gid_to_person,
+                        gid_to_display, unknown_of_gid,
+                        day_str, track.track_id,
+                        employee_id,
+                        match.person.display_name,
+                        match.person.embedding,
+                        (business_a, business_b),
+                    )
+                # Same face on a stale duplicate gid:
+                # fold it into the live one (fixes the
+                # G1-OUT + G2-Working split-brain).
+                _merge_same_person_stale(
+                    day_cache, write_queue, supabase,
+                    gid_alias, gid_to_person,
+                    gid_to_display, day_str,
+                    track.track_id,
+                    employee_id,
+                    match.person.display_name,
+                    manager, (business_a, business_b),
+                )
+                local = crop_saver.save_best_crop(
+                    day=day_str, owner=employee_id,
+                    known=True, global_id=track.track_id,
+                    image_bgr=crop, face_score=match.score,
+                    sharpness=sharp, time_tag=time_tag,
+                )
+                if local:
+                    _store_or_queue(write_queue, supabase, "face_crop", {
+                        "local_path": local,
+                        "storage_path": f"{day_str}/known/{Path(local).name}",
+                    })
+            else:
+                if track.track_id not in unknown_of_gid:
+                    unknown_counter += 1
+                    unknown_of_gid[track.track_id] = (
+                        f"U-{day_str.replace('-', '')}-{unknown_counter:03d}"
+                    )
+                uid = unknown_of_gid[track.track_id]
+                reconciler.note_unknown(
+                    uid, det.embedding, match.score)
+                local = crop_saver.save_best_crop(
+                    day=day_str, owner=uid, known=False,
+                    global_id=track.track_id, image_bgr=crop,
+                    face_score=match.score, sharpness=sharp,
+                    time_tag=time_tag,
+                )
+                if local:
+                    _store_or_queue(write_queue, supabase, "face_crop", {
+                        "local_path": local,
+                        "storage_path":
+                            f"{day_str}/unknown/{Path(local).name}",
+                    })
 
     try:
         while True:
@@ -1052,7 +1238,17 @@ def main() -> None:
 
             batch_detections: dict[str, list] = {}
             if process_frame:
+                face_marks_a.clear()
                 face_marks_b.clear()
+                # Face cadence xen ke A/B de dan deu tai InsightFace CPU:
+                # slot chan -> kenh dau, slot le -> kenh sau. 1 kenh thi
+                # chay moi slot (hanh vi cu).
+                face_slot = (frame_idx // max(1, config.camera.process_every_n_frames)) \
+                    // max(1, face_cfg.process_every_k)
+                face_order = [c for c in ("A", "B") if c in face_cfg.channels]
+                face_pick = face_order[face_slot % len(face_order)] if face_order else None
+                face_tick_a = bool(use_face and face_pick == "A")
+                face_tick_b = bool(use_face and face_pick == "B")
                 batch_names: list[str] = []
                 batch_images: list[np.ndarray] = []
                 if ret_a and frame_a is not None:
@@ -1096,6 +1292,17 @@ def main() -> None:
                         gid_to_person,
                     )
                     last_states_a = {g: s.value for g, s in states_a.items()}
+                    if face_tick_a:
+                        now_dt_a = datetime.now().astimezone()
+                        _process_face_channel(
+                            channel="A", frame=frame_a,
+                            confirmed_tracks=confirmed_a,
+                            face_marks=face_marks_a,
+                            day_str=now_dt_a.date().isoformat(),
+                            wall_iso=now_dt_a.isoformat(timespec="seconds"),
+                            time_tag=now_dt_a.strftime("%H%M%S"),
+                            now_s=now_s,
+                        )
                 else:
                     confirmed_a = last_tracks_a
 
@@ -1116,10 +1323,17 @@ def main() -> None:
                         )
                     last_tracks_b = confirmed_b
                     count_b.update(len(confirmed_b))
+                    if use_roi:
+                        floor_b = _track_floor_points(confirmed_b, projector)
+                    else:
+                        # Interim: normalized centers, displacement mode (nhu A).
+                        floor_b = _track_norm_centers(
+                            confirmed_b, config.camera.frame_width,
+                            config.camera.frame_height)
                     try:
                         states_b = workstate_b.consume(
                             TrackEvent("B", Frame(frame_idx, now_s, frame_b), tuple(confirmed_b)),
-                            None,
+                            floor_b,
                             gid_to_person,
                         )
                     except (KeyError, ValueError, RuntimeError) as error:
@@ -1129,134 +1343,17 @@ def main() -> None:
                         states_b = {}
                     last_states_b = {g: s.value for g, s in states_b.items()}
 
-                    if use_face and attendance is not None and face_matcher is not None:
+                    if face_tick_b:
                         now_dt = datetime.now().astimezone()
-                        day_str = now_dt.date().isoformat()
-                        wall_iso = now_dt.isoformat(timespec="seconds")
-                        time_tag = now_dt.strftime("%H%M%S")
-                        face_tick = (frame_idx // max(1, config.camera.process_every_n_frames)) \
-                            % max(1, face_cfg.process_every_k) == 0
-                        if face_tick:
-                            event = TrackEvent(
-                                channel="B",
-                                frame=Frame(frame_idx, now_s, frame_b),
-                                tracks=tuple(confirmed_b),
-                            )
-                            with metrics.measure("face"):
-                                observations = face_consumer.consume(event, now_s)
-                            for observation in observations:
-                                track = observation.track
-                                crop = observation.crop_bgr
-                                det = observation.detection
-                                match = observation.match
-                                sharp = observation.sharpness
-                                _bh, _bw = frame_b.shape[:2]
-                                _ox = max(0, min(_bw, round(track.bbox.x1)))
-                                _oy = max(0, min(_bh, round(track.bbox.y1)))
-                                fx1 = max(0, int(det.bbox[0])); fy1 = max(0, int(det.bbox[1]))
-                                fx2 = min(crop.shape[1], int(det.bbox[2]))
-                                fy2 = min(crop.shape[0], int(det.bbox[3]))
-                                # Live feedback: face box + score on cam B
-                                # (green = known, red = unknown/low score).
-                                face_marks_b.append(
-                                    (_ox + fx1, _oy + fy1, _ox + fx2, _oy + fy2,
-                                     match.score, match.is_known))
-                                if match.is_known and match.person is not None:
-                                    employee_id = (
-                                        match.person.employee_id
-                                        or match.person.person_id
-                                    )
-                                    manager.bind_employee(track.track_id, employee_id)
-                                    gid_to_score[track.track_id] = match.score
-                                    gid_to_person[track.track_id] = employee_id
-                                    # Show the name as soon as the face matches
-                                    # (DB tick stays debounced below).
-                                    gid_to_display[track.track_id] = \
-                                        match.person.display_name
-                                    ticked = attendance.observe(
-                                        day=day_str, global_id=track.track_id,
-                                        person_id=employee_id,
-                                        display_name=match.person.display_name,
-                                        score=match.score, now_s=now_s,
-                                        wall_time_iso=wall_iso,
-                                    )
-                                    if ticked is not None:
-                                        if day_cache.attendance_should_write(
-                                                day_str, ticked.person_id):
-                                            _store_or_queue(write_queue, supabase, "attendance", {
-                                                "date": day_str, "person_id": ticked.person_id,
-                                                "person_name": ticked.display_name,
-                                                "global_id": ticked.global_id,
-                                                "attended": True, "check_in_at": wall_iso,
-                                                "face_score": ticked.face_score,
-                                                "needs_review": False,
-                                            })
-                                            _store_or_queue(write_queue, supabase, "event", {
-                                                "date": day_str, "global_id": ticked.global_id,
-                                                "person_id": ticked.person_id,
-                                                "event": "CHECK_IN", "channel": "B",
-                                                "at": wall_iso,
-                                            })
-                                            print(f"[Diem danh] {ticked.display_name} "
-                                                  f"(G{ticked.global_id}, "
-                                                  f"score={ticked.face_score:.2f})")
-                                    # Reconcile: stale unknown GIDs that match
-                                    # this person merge into the current gid.
-                                    if match.person.embedding is not None:
-                                        _reconcile_unknowns(
-                                            day_cache, write_queue, supabase,
-                                            reconciler, gid_alias, gid_to_person,
-                                            gid_to_display, unknown_of_gid,
-                                            day_str, track.track_id,
-                                            employee_id,
-                                            match.person.display_name,
-                                            match.person.embedding,
-                                            (business_a, business_b),
-                                        )
-                                    # Same face on a stale duplicate gid:
-                                    # fold it into the live one (fixes the
-                                    # G1-OUT + G2-Working split-brain).
-                                    _merge_same_person_stale(
-                                        day_cache, write_queue, supabase,
-                                        gid_alias, gid_to_person,
-                                        gid_to_display, day_str,
-                                        track.track_id,
-                                        employee_id,
-                                        match.person.display_name,
-                                        manager, (business_a, business_b),
-                                    )
-                                    local = crop_saver.save_best_crop(
-                                        day=day_str, owner=employee_id,
-                                        known=True, global_id=track.track_id,
-                                        image_bgr=crop, face_score=match.score,
-                                        sharpness=sharp, time_tag=time_tag,
-                                    )
-                                    if local:
-                                        _store_or_queue(write_queue, supabase, "face_crop", {
-                                            "local_path": local,
-                                            "storage_path": f"{day_str}/known/{Path(local).name}",
-                                        })
-                                else:
-                                    if track.track_id not in unknown_of_gid:
-                                        unknown_counter += 1
-                                        unknown_of_gid[track.track_id] = (
-                                            f"U-{day_str.replace('-', '')}-{unknown_counter:03d}"
-                                        )
-                                    uid = unknown_of_gid[track.track_id]
-                                    reconciler.note_unknown(
-                                        uid, det.embedding, match.score)
-                                    local = crop_saver.save_best_crop(
-                                        day=day_str, owner=uid, known=False,
-                                        global_id=track.track_id, image_bgr=crop,
-                                        face_score=match.score, sharpness=sharp,
-                                        time_tag=time_tag,
-                                    )
-                                    if local:
-                                        _store_or_queue(write_queue, supabase, "face_crop", {
-                                            "local_path": local,
-                                            "storage_path":
-                                                f"{day_str}/unknown/{Path(local).name}",
-                                        })
+                        _process_face_channel(
+                            channel="B", frame=frame_b,
+                            confirmed_tracks=confirmed_b,
+                            face_marks=face_marks_b,
+                            day_str=now_dt.date().isoformat(),
+                            wall_iso=now_dt.isoformat(timespec="seconds"),
+                            time_tag=now_dt.strftime("%H%M%S"),
+                            now_s=now_s,
+                        )
                 else:
                     confirmed_b = last_tracks_b
 
@@ -1325,6 +1422,14 @@ def main() -> None:
                             "channel": "B" if st.just_left_office else "A",
                             "at": wall_iso,
                         })
+                        _note_event(
+                            event="LEAVE_OFFICE" if st.just_left_office else "RETURN",
+                            global_id=wgid,
+                            channel="B" if st.just_left_office else "A",
+                            at_iso=wall_iso,
+                            person_id=gid_to_person.get(wgid),
+                            person_name=gid_to_display.get(wgid),
+                        )
                     if write_row and established:
                         row = day_cache._status[(day_str, wgid)]
                         _store_or_queue(write_queue, supabase, "room_status", {
@@ -1364,6 +1469,13 @@ def main() -> None:
                 draw_global_labels(
                     vis_a, last_tracks_a, room_status_now, gid_to_display, gid_to_person
                 )
+                for x1m, y1m, x2m, y2m, fscore, fknown in face_marks_a:
+                    fcolor = (40, 180, 40) if fknown else (60, 60, 220)
+                    cv2.rectangle(vis_a, (int(x1m), int(y1m)),
+                                  (int(x2m), int(y2m)), fcolor, 2)
+                    cv2.putText(vis_a, f"{fscore:.2f}",
+                                (int(x1m), max(0, int(y1m) - 6)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, fcolor, 2)
             if ret_b and frame_b is not None and need_vis:
                 vis_b = frame_b.copy()
                 draw_person_tracks(vis_b, last_tracks_b, display_count=count_b.value,
@@ -1423,6 +1535,7 @@ def main() -> None:
                     streamer.set_status({
                         "people": live_people,
                         "attendance_today": attendance_today,
+                        "recent_events": list(recent_events),
                         "pending_attendance": pending_attendance(),
                         "count_a": count_a.value,
                         "count_b": count_b.value,
@@ -1442,6 +1555,9 @@ def main() -> None:
                 if window_a_closed or window_b_closed:
                     print("Cửa sổ đã đóng. Đang giải phóng camera...")
                     break
+            if args.metrics_log_s > 0 and now_s - last_metrics_log_s >= args.metrics_log_s:
+                last_metrics_log_s = now_s
+                print(f"[Metrics] {metrics.snapshot()}")
             frame_idx += 1
             if args.max_frames is not None and frame_idx >= args.max_frames:
                 break

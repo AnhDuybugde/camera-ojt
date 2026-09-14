@@ -94,6 +94,11 @@ class GlobalIdentityConfig:
     # Only embeddings from confident, reasonably sized crops join the gallery.
     min_gallery_confidence: float = 0.25
     min_gallery_crop_pixels: int = 8
+    # Perf: stable tracklets (fast path) refresh the gallery only every N
+    # manager steps instead of every frame. New/lost tracklets (pending
+    # path) always extract -- matching needs fresh appearance. 1 = old
+    # behavior (extract for every track every frame).
+    gallery_refresh_steps: int = 1
     # Soft channel-transition evidence: (from_channel, to_channel) -> bonus.
     # Small by design; appearance + spatio-temporal terms always dominate.
     channel_transition_bonus: dict[tuple[str, str], float] = field(
@@ -172,10 +177,14 @@ class GlobalIdentityManager:
         self._retire_identities(now_s)
         self._refresh_states(now_s)
 
-        embeddings = {
-            track.track_id: self.embedding_extractor.extract(_crop(frame, track.bbox))
-            for track in tracks
-        }
+        # Lazy embeddings: stable tracklets on the fast path usually need
+        # no fresh appearance, so extraction is cached per call and skipped
+        # unless the gallery is due for a refresh. Pending (new/lost)
+        # tracklets always extract -- global matching depends on it.
+        embeddings: dict[int, np.ndarray | None] = {}
+        refresh_gallery = (
+            self._step % max(1, self.config.gallery_refresh_steps) == 0
+        )
         frame_shape = frame.shape
         claimed_gids: set[int] = set()
         assignments: dict[int, int] = {}  # raw track_id -> global id
@@ -194,7 +203,11 @@ class GlobalIdentityManager:
             ):
                 assignments[track.track_id] = gid
                 claimed_gids.add(gid)
-                self._observe(record, channel, track, embeddings[track.track_id], now_s,
+                embedding = (
+                    self._cached_embedding(frame, track, embeddings)
+                    if refresh_gallery else None
+                )
+                self._observe(record, channel, track, embedding, now_s,
                               score=1.0)
             else:
                 if key in self._tracklet_to_gid:
@@ -205,6 +218,9 @@ class GlobalIdentityManager:
 
         # 2. Global association for the rest: cost matrix + Hungarian.
         if pending:
+            # Pending tracklets always need fresh appearance for matching.
+            for track in pending:
+                self._cached_embedding(frame, track, embeddings)
             candidates = [
                 record
                 for record in self._identities.values()
@@ -430,6 +446,19 @@ class GlobalIdentityManager:
         )
 
     # ------------------------------------------------------------ lifecycle
+    def _cached_embedding(
+        self,
+        frame: np.ndarray,
+        track: Track,
+        cache: dict[int, np.ndarray | None],
+    ) -> np.ndarray | None:
+        """Extract once per update() call; fast path usually skips this."""
+        if track.track_id not in cache:
+            cache[track.track_id] = self.embedding_extractor.extract(
+                _crop(frame, track.bbox)
+            )
+        return cache[track.track_id]
+
     def _observe(
         self,
         record: IdentityRecord,
