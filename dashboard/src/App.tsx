@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import KioskCheckIn, { type KioskEvent } from './KioskCheckIn'
+import PersonRegistration from './PersonRegistration'
 import PipelineControl from './PipelineControl'
 import { supabase, supabaseConfigured } from './lib/supabase'
 import {
@@ -111,7 +112,7 @@ function todayISO(): string {
 }
 
 export default function App() {
-  const [screen, setScreen] = useState<'kiosk' | 'admin'>('kiosk')
+  const [screen, setScreen] = useState<'kiosk' | 'admin' | 'registration'>('kiosk')
   const [day, setDay] = useState(todayISO())
   const [attendance, setAttendance] = useState<AttendanceRow[]>([])
   const [room, setRoom] = useState<RoomRow[]>([])
@@ -292,6 +293,10 @@ export default function App() {
     }
   }
 
+  if (screen === 'registration') {
+    return <PersonRegistration streamUrl={STREAM_URL} onBack={() => setScreen('admin')} />
+  }
+
   if (screen === 'kiosk') {
     return (
       <KioskCheckIn
@@ -314,9 +319,16 @@ export default function App() {
           <h1>Attendance &amp; Room Status</h1>
           <p>Face check-in once per person per day, live room presence per Global ID.</p>
         </div>
-        <button type="button" className="header-action" onClick={() => setScreen('kiosk')}>
-          Màn hình điểm danh
-        </button>
+        <div className="app-header-actions">
+          {(user || !supabaseConfigured) && (
+            <button type="button" className="header-action" onClick={() => setScreen('registration')}>
+              Đăng ký nhân viên
+            </button>
+          )}
+          <button type="button" className="header-action" onClick={() => setScreen('kiosk')}>
+            Màn hình điểm danh
+          </button>
+        </div>
       </header>
 
       <div className="toolbar">

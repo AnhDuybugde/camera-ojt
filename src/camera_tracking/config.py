@@ -60,9 +60,13 @@ class GlobalIdentityConfig(StrictModel):
     unresolved_keep_s: float = Field(default=300.0, ge=0)
     min_gallery_confidence: float = Field(default=0.25, ge=0, le=1)
     gallery_refresh_steps: int = Field(default=1, ge=1)
-    reid_backend: Literal["osnet", "histogram"] = "osnet"
+    # Backend appearance cho Global ID: "face" (khuyen nghi: nhan dang
+    # bang mat, quay lung thi khong ep match), "osnet" (body), "histogram".
+    reid_backend: Literal["face", "osnet", "histogram"] = "face"
     reid_model: str = "osnet_x1_0"
     reid_device: Literal["auto", "cpu", "cuda"] = "auto"
+    # Mat nho hon nguong nay thi ReID coi nhu "khong thay mat".
+    face_min_px: int = Field(default=40, ge=8)
 
 
 class CalibrationConfig(StrictModel):

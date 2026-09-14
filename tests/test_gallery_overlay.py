@@ -1,4 +1,6 @@
 """Test gallery load tu data/images + overlay chi hien Global ID."""
+import json
+
 import numpy as np
 
 from camera_tracking.face.gallery import load_gallery
@@ -42,6 +44,23 @@ def test_load_gallery_maps_filename_to_employee_id(tmp_path) -> None:
     )
     assert gallery.people[0].person_id == "LeHoAnhDuy"
     assert gallery.people[0].employee_id == "1"
+
+
+def test_load_gallery_reads_registration_metadata(tmp_path) -> None:
+    image_path = tmp_path / "NV001.jpg"
+    image_path.write_bytes(b"fake")
+    (tmp_path / "registry.json").write_text(json.dumps({
+        "NV001": {
+            "display_name": "Nguyen Van A",
+            "employee_id": "NV001",
+        }
+    }), encoding="utf-8")
+
+    gallery = load_gallery(tmp_path, _StubEmbedder())
+
+    assert len(gallery) == 1
+    assert gallery.people[0].display_name == "Nguyen Van A"
+    assert gallery.people[0].employee_id == "NV001"
 
 
 def pytest_import_cv2():

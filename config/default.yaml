@@ -40,19 +40,23 @@ identity:
   spatial_weight: 0.15
   time_weight: 0.15
   channel_weight: 0.10
-  match_threshold: 0.35
+  # Nghiem (chong nhan nham): tong diem phai >= 0.55, cosine mat >= 0.5.
+  match_threshold: 0.55
   max_center_distance_ratio: 0.35
-  min_appearance_similarity: 0.35
-  named_appearance_floor: 0.45
-  active_duplicate_similarity: 0.60
+  min_appearance_similarity: 0.50
+  named_appearance_floor: 0.60
+  active_duplicate_similarity: 0.70
   temp_lost_s: 10.0
   long_lost_s: 120.0
   unresolved_keep_s: 600.0
   min_gallery_confidence: 0.25
   # Perf: track on dinh chi refresh gallery moi 5 buoc (pending van
-  # extract moi frame de matching). Giam ~80% OSNet calls khi dong nguoi.
+  # extract moi frame de matching). Giam ~80% ReID calls khi dong nguoi.
   gallery_refresh_steps: 5
-  reid_backend: osnet
+  # Nhan dang bang MAT (quay lung = khong ep match). Fallback body khi
+  # InsightFace khong tai duoc.
+  reid_backend: face
+  face_min_px: 40
   reid_model: osnet_x1_0
   reid_device: auto
 
@@ -94,8 +98,8 @@ output:
   video_filename: annotated.mp4
   report_filename: report.json
 
-# Face attendance + nhan dien (InsightFace buffalo_s).
-# channels: camera nao diem danh — ["A", "B"] = ca 2 nhu nhau.
+# Face attendance + nhan dien (InsightFace buffalo_s, GPU neu co).
+# match_threshold >= 0.5: mat mo/nghieng khong bind bua.
 face:
   enabled: true
   channels: [A, B]
@@ -103,7 +107,7 @@ face:
   face_device: auto
   gallery_dir: data/images
   model_pack: buffalo_s
-  match_threshold: 0.45
+  match_threshold: 0.55
   min_face_px: 40
   min_blur_variance: 40.0
   min_person_area_px: 2000.0

@@ -1,97 +1,261 @@
-# Camera OJT — diem danh + trang thai phong 2 camera
+# Camera OJT
 
-YOLO26s -> ByteTrack -> Global ID xuyen 2 cam IMOU (OSNet ReID, histogram fallback) +
-diem danh mat InsightFace `buffalo_s` o cam cua + dashboard Vite +
-Supabase (free tier).
+Hệ thống điểm danh và theo dõi trạng thái nhân viên bằng hai camera:
 
-## Cai dat 1 lan
+- YOLO phát hiện người (person detection).
+- ByteTrack và Global Identity theo dõi người trong và giữa hai camera.
+- InsightFace `buffalo_s` đăng ký và nhận diện khuôn mặt trên Channel A/B.
+- React + Vite cung cấp màn hình check-in, camera trực tiếp và trang quản trị.
+- Supabase lưu nhân viên, điểm danh và trạng thái phòng (tùy chọn).
+
+## 1. Yêu cầu máy
+
+- Windows 10/11 và PowerShell.
+- Git.
+- Python 3.10 trở lên. Dự án hiện đã kiểm thử với Python 3.12.
+- Node.js 20 trở lên và npm.
+- Camera RTSP hoặc webcam/video để thử nghiệm.
+- NVIDIA GPU được khuyến nghị. Hệ thống vẫn chạy CPU nhưng chậm hơn.
+
+## 2. Clone branch Ngoc
 
 ```powershell
-python -m pip install -e ".[face,store,reid]"
-copy .env.example .env            # dien IMOU_* + SUPABASE_URL/KEY
-cd dashboard; npm install; cd ..
+git clone -b Ngoc https://github.com/AnhDuybugde/camera-ojt.git
+cd camera-ojt
 ```
 
-Supabase (1 lan, SQL Editor): chay `supabase/schema.sql`, tao 2 bucket
-`face-crops` + `enrolled-faces`, tao user admin roi chay:
+Nếu repository đã có sẵn trên máy:
+
+```powershell
+git fetch origin
+git switch Ngoc
+git pull --ff-only origin Ngoc
+```
+
+## 3. Cài backend Python
+
+Tạo virtual environment riêng cho dự án:
+
+```powershell
+py -3.12 -m venv yolovenv
+.\yolovenv\Scripts\Activate.ps1
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -e ".[face,store,dev]"
+```
+
+Nếu PowerShell chặn script kích hoạt, chạy một lần trong terminal hiện tại:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\yolovenv\Scripts\Activate.ps1
+```
+
+`reid` là dependency tùy chọn. Có thể cài bằng lệnh sau; nếu không cài được,
+pipeline tự dùng HSV histogram:
+
+```powershell
+python -m pip install -e ".[reid]"
+```
+
+Để dùng CUDA, cài bản PyTorch tương thích với GPU/driver trước khi chạy. Kiểm tra:
+
+```powershell
+python -c "import torch; print('CUDA:', torch.cuda.is_available())"
+```
+
+## 4. Cấu hình camera và Supabase
+
+Tạo `.env` từ file mẫu:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Mở `.env` và thay bằng thông tin thật:
+
+```dotenv
+IMOU_IP=192.168.1.100
+IMOU_USER=admin
+IMOU_PASSWORD=your_camera_password
+
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_KEY=your_service_role_key
+SUPABASE_ANON_KEY=your_anon_key
+```
+
+Camera A và B mặc định dùng channel `1` và `2` trên cùng thiết bị IMOU. Có thể
+ghi đè nguồn khi chạy bằng `--source-a` và `--source-b`.
+
+Supabase là tùy chọn. Nếu sử dụng:
+
+1. Chạy [supabase/schema.sql](supabase/schema.sql) trong Supabase SQL Editor.
+2. Tạo hai Storage bucket `face-crops` và `enrolled-faces`.
+3. Tạo tài khoản quản trị và thêm role:
 
 ```sql
-insert into public.roles (user_id, role) values ('<uuid-admin>', 'admin');
+insert into public.roles (user_id, role)
+values ('<uuid-admin>', 'admin');
 ```
 
-Bo anh enroll vao `data/images/` (ten file = ID, vd `LeHoAnhDuy.jpg`).
-Anh mat KHONG commit len git.
+Không đưa `SUPABASE_SERVICE_KEY` vào frontend. Key này chỉ được lưu trong `.env`
+ở máy chạy pipeline.
 
-ReID OSNet weights duoc tai lazy vao `models/reid_cache/` lan dau. Neu
-may khong co `torchreid`/weights hoac khong co network, pipeline tu fallback
-sang HSV histogram; co the chon `identity.reid_backend: histogram` de tat OSNet.
-
-Identity khong dong nhat voi Global ID: local track ID chi song trong mot
-camera, Global ID la association tam thoi, con `employee_id` tu face gallery
-moi la danh tinh ben vung. Face recognition chay theo track voi quality gate,
-best-shot va cooldown; tracking, workstate, attendance, renderer va storage
-nhan cung mot `TrackEvent` nhung khong block lan nhau.
-
-## Chay production (2 command)
+## 5. Cài frontend
 
 ```powershell
-# 1. Cam + model + stream (cua so 1)
+Copy-Item dashboard\.env.example dashboard\.env
+Set-Location dashboard
+npm install
+Set-Location ..
+```
+
+Các biến frontend chính trong `dashboard/.env`:
+
+```dotenv
+VITE_STREAM_URL=http://localhost:8765
+VITE_KIOSK_CHANNEL=A
+VITE_CONTROL_URL=http://localhost:8766
+VITE_SUPABASE_URL=https://your-project.supabase.co
+VITE_SUPABASE_ANON_KEY=your_anon_key
+```
+
+Có thể bỏ trống cấu hình Supabase khi chỉ thử camera và đăng ký nhân viên cục bộ.
+
+## 6. Chạy hệ thống
+
+Mở terminal thứ nhất tại thư mục gốc:
+
+```powershell
+.\yolovenv\Scripts\Activate.ps1
 python scripts\run_workstate.py --display
-
-# 2. Website: Live 2 cam + diem danh + trang thai + admin (cua so 2)
-cd dashboard; npm run dev   # http://localhost:5173
 ```
 
-`scripts/run_workstate.py` is the canonical production entry point. The
-single-camera `scripts/run_pipeline.py` remains a legacy analytics demo and
-uses the simpler IoU tracker for smoke tests only.
-
-Live tren web doc qua `VITE_STREAM_URL` (mac dinh `http://localhost:8765`,
-pipeline tu mo). Xem tu may khac: pipeline them `--stream-host 0.0.0.0`,
-sua `VITE_STREAM_URL` thanh `http://<IP-may-cam>:8765`, restart `npm run dev`.
-
-## Tinh chinh nhanh
-
-| Nhu cau | Lam gi |
-|---|---|
-| Bot bao ao (ghost ID) | `--new-track-conf 0.5`, `--min-area 5000` |
-| Nguoi that hien G cham | `--new-track-conf 0.3` |
-| Roi cho bao Away nhanh/cham | `--move-ratio 0.10` / `0.20` (`0` = tat) |
-| Mat kho khop | them anh enroll, hoac `face.match_threshold: 0.4` |
-| Nhe CPU | `--imgsz 640` (mặc định 800, CUDA) |
-| Tracking-only, tat mat | them `--no-face` |
-
-Benchmark toc do model (khong mo RTSP):
+Mở terminal thứ hai:
 
 ```powershell
+Set-Location dashboard
+npm run dev
+```
+
+Truy cập địa chỉ Vite in trên terminal, thông thường là:
+
+```text
+http://localhost:5173
+```
+
+Backend camera và API chạy mặc định tại:
+
+```text
+http://localhost:8765
+```
+
+Lần chạy đầu, Ultralytics và InsightFace có thể tải model `yolo26s.pt` và
+`buffalo_s`. Cần giữ kết nối mạng cho đến khi tải xong.
+
+## 7. Đăng ký nhân viên
+
+1. Mở dashboard và vào `Đăng ký nhân viên`.
+2. Nhập mã nhân viên duy nhất và họ tên.
+3. Chụp/tải ảnh chỉ có một khuôn mặt, rõ, đủ sáng và nhìn gần chính diện.
+4. Xác nhận đồng ý xử lý dữ liệu khuôn mặt rồi nhấn đăng ký.
+5. Đứng trước Channel A khoảng 1-2 giây để kiểm tra nhận diện/check-in.
+
+Thông tin đăng ký cục bộ nằm trong `data/images/registry.json`; ảnh nằm trong
+`data/images/`. Cả hai đều bị `.gitignore` loại khỏi Git vì là dữ liệu cá nhân.
+Khi chuyển sang máy khác, phải đăng ký lại hoặc chuyển dữ liệu qua kênh bảo mật
+có sự đồng ý của nhân viên.
+
+Không đăng ký cùng một khuôn mặt dưới nhiều mã nhân viên. Việc này làm danh tính
+không xác định khi hai embedding gần như giống nhau.
+
+## 8. Chạy từ máy khác trong mạng LAN
+
+Trên máy gắn camera:
+
+```powershell
+python scripts\run_workstate.py --stream-host 0.0.0.0
+```
+
+Trên máy chạy dashboard, sửa:
+
+```dotenv
+VITE_STREAM_URL=http://<IP_MAY_CAMERA>:8765
+```
+
+Khởi động lại `npm run dev` sau khi thay biến môi trường. Cho phép cổng `8765`
+qua Windows Firewall nếu máy khác không truy cập được.
+
+## 9. Lệnh hữu ích
+
+```powershell
+# Chạy tracking nhưng tắt nhận diện khuôn mặt
+python scripts\run_workstate.py --no-face --display
+
+# Dùng webcam 0 và 1 thay cho RTSP
+python scripts\run_workstate.py --source-a 0 --source-b 1 --display
+
+# Giảm tải GPU/CPU
+python scripts\run_workstate.py --imgsz 640
+
+# Benchmark model, không mở RTSP
 python scripts\benchmark_inference.py --device cuda --frames 30
-python scripts\benchmark_inference.py --device cpu --frames 5
-```
 
-`camera.process_every_n_frames` dieu chinh detection FPS doc lap voi FPS
-camera; pipeline bo qua frame cu thay vi xep hang vo han.
-
-Trang thai: ngoi yen = Working, roi khoi diem neo = Away (ca khi van
-trong hinh), vang lau + thay o cam B = Out of office, quay lai =
-Returning. Overlay/box mau theo trang thai: xanh la Working, vang
-Away/Near seat, xanh duong Returning, do Out/Unknown. Ten hien ngay khi
-khop mat (tick DB van debounce 2 hits/8s, cong don xuyen ID vo vun). Mat la cap `U-...`, tu gop
-vao nguoi quen khi khop mat sau (log `[Reconcile]`). G non (< 5 hits)
-khong ghi DB.
-
-Ve san/workstation (khi co dinh camera): click tool thay vi do tay:
-
-```powershell
-python scripts\calibrate_room.py --out config\locations\roomA.yaml --tile 0.6 --auto-tiles
-python scripts\run_workstate.py --config config\locations\roomA.yaml --display
-```
-
-Admin tren dashboard (can login): tick diem danh, dao in-room, chon
-dong / xoa all lich su trong ngay (2 lop confirm), nut Start/Stop
-pipeline (can chay `python scripts\pipeline_supervisor.py`).
-
-## Test
-
-```powershell
+# Chạy kiểm thử backend
 python -m pytest -q
+
+# Kiểm tra frontend production build
+Set-Location dashboard
+npm run build
 ```
+
+## 10. Xử lý lỗi thường gặp
+
+### Không mở được camera A/B
+
+- Kiểm tra `IMOU_IP`, user/password và channel trong `.env`.
+- Xác nhận máy và camera cùng mạng, RTSP đã được bật.
+- Thử truyền URL/video/webcam bằng `--source-a` và `--source-b`.
+- Không đặt chuỗi chữ `RTSP stream` vào `.env`; đây chỉ là nhãn log đã ẩn mật khẩu.
+
+### Đăng ký xong vẫn hiện Unknown
+
+- Kiểm tra log có dòng `Face gallery: N nguoi`, với `N > 0`.
+- Đảm bảo không chạy `--no-face`.
+- Đứng đủ gần, nhìn gần chính diện và tránh ngược sáng.
+- Channel A và B đều hỗ trợ face matching; Channel A là kênh kiosk mặc định.
+- Không dùng cùng một ảnh/khuôn mặt cho hai mã nhân viên.
+
+### Dashboard không có hình
+
+- Mở `http://localhost:8765/status.json` để kiểm tra backend.
+- Kiểm tra `VITE_STREAM_URL` và khởi động lại Vite sau khi sửa.
+- Nếu cổng đang bận, dừng tiến trình cũ hoặc chọn `--stream-port` khác.
+
+## Kiến trúc rút gọn
+
+```mermaid
+flowchart LR
+    A[Camera A/B] --> B[YOLO person detection]
+    B --> C[ByteTrack]
+    C --> D[Global Identity]
+    C --> E[InsightFace]
+    E --> F[Employee matching]
+    D --> G[Workstate and room presence]
+    F --> H[Attendance]
+    G --> I[Supabase/local queue]
+    H --> I
+    D --> J[MJPEG API]
+    F --> J
+    J --> K[React dashboard]
+```
+
+Entry point production chính là `scripts/run_workstate.py`.
+`scripts/run_pipeline.py` chỉ là demo analytics một camera dùng cho smoke test.
+
+## Bảo mật dữ liệu
+
+- Không commit `.env`, service key, mật khẩu RTSP hoặc ảnh khuôn mặt.
+- Chỉ thu thập ảnh khi nhân viên đã đồng ý.
+- Giới hạn quyền truy cập Supabase và định kỳ xóa ảnh không còn cần thiết.
+- Global ID chỉ là ID theo dõi tạm thời; `employee_id` sau face matching mới là
+  danh tính nhân viên dùng cho chấm công.

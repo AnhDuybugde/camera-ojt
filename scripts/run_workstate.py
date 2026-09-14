@@ -20,7 +20,11 @@ Nhan 'q' hoac ESC de thoat.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
+import json
 import os
+import re
 import sys
 import threading
 import time
@@ -452,7 +456,9 @@ def _flush_queue(
         if defer_attendance and is_attendance:
             continue
         done = False
-        if kind == "attendance":
+        if kind == "person":
+            done = supabase.upsert_person(payload)
+        elif kind == "attendance":
             done = supabase.upsert_attendance(payload)
         elif kind == "room_status":
             done = supabase.upsert_room_status(payload)
@@ -755,8 +761,42 @@ def main() -> None:
         identity_cfg = identity_cfg.model_copy(
             update={"match_threshold": args.match_threshold}
         )
+    # Shared InsightFace (dung chung cho ReID mat + diem danh, load 1 lan).
+    # Can truoc manager vi reid_backend=face lay embedding mat lam appearance.
+    from camera_tracking.face import InsightFaceEmbedder as _IFEmbedder
+    face_cfg_early = config.face
+    if args.face_channels is not None:
+        face_cfg_early = face_cfg_early.model_copy(
+            update={"channels": [c for c in args.face_channels.upper() if c in ("A", "B")] or ["B"]}
+        )
+    _need_iface = bool(
+        (face_cfg_early.enabled and not args.no_face and face_cfg_early.channels)
+        or identity_cfg.reid_backend == "face"
+    )
+    shared_face_embedder = None
+    if _need_iface:
+        try:
+            shared_face_embedder = _IFEmbedder(
+                model_pack=face_cfg_early.model_pack,
+                det_size=face_cfg_early.det_size,
+                device=face_cfg_early.face_device,
+            )
+            # Validate truoc khi mo camera (tai model nang lan dau o day).
+            shared_face_embedder._load()
+            print(f"InsightFace {face_cfg_early.model_pack} "
+                  f"({shared_face_embedder.resolved_device})")
+        except Exception as error:  # noqa: BLE001 - fallback body, van chay
+            print(f"InsightFace unavailable, ReID/face fallback body: {error}")
+            shared_face_embedder = None
     try:
-        if identity_cfg.reid_backend == "osnet":
+        if identity_cfg.reid_backend == "face" and shared_face_embedder is not None:
+            from camera_tracking.face import FaceReIDEmbedding
+            embedder = FaceReIDEmbedding(
+                shared_face_embedder,
+                min_face_px=identity_cfg.face_min_px,
+            )
+            print("ReID: FACE (InsightFace, quay lung = khong ep match)")
+        elif identity_cfg.reid_backend == "osnet":
             embedder = OsnetEmbedding(
                 model_name=identity_cfg.reid_model,
                 device=identity_cfg.reid_device,
@@ -765,10 +805,14 @@ def main() -> None:
             embedder.load()
             print(f"ReID: OSNet {identity_cfg.reid_model} ({identity_cfg.reid_device})")
         else:
+            if identity_cfg.reid_backend == "face":
+                print("ReID face requested nhung thieu InsightFace "
+                      "-> HSV histogram fallback")
+            else:
+                print("ReID: HSV histogram fallback")
             embedder = HistogramEmbedding()
-            print("ReID: HSV histogram fallback")
     except Exception as error:  # optional backend must not stop camera startup
-        print(f"ReID OSNet unavailable, fallback histogram: {error}")
+        print(f"ReID backend unavailable, fallback histogram: {error}")
         embedder = HistogramEmbedding()
 
     # Mot GlobalIdentityManager dung chung cho ca 2 channel -> Global ID
@@ -859,64 +903,57 @@ def main() -> None:
     count_a = StablePersonCount(rise_frames=3, fall_frames=12)
     count_b = StablePersonCount(rise_frames=3, fall_frames=12)
 
-    # --- Face diem danh (channel B) + daily store + room fusion ---
+    # --- Face diem danh + daily store + room fusion ---
     # Tat ca optional: thieu model/lib/.env van chay tracking nhu cu.
-    face_cfg = config.face
+    # Dung lai shared_face_embedder da load o tren (ReID mat) neu co.
+    face_cfg = face_cfg_early
     face_threshold = args.face_threshold or face_cfg.match_threshold
-    if args.face_channels is not None:
-        face_cfg = face_cfg.model_copy(
-            update={"channels": [c for c in args.face_channels.upper() if c in ("A", "B")] or ["B"]}
-        )
     use_face = bool(face_cfg.enabled and not args.no_face and face_cfg.channels)
-    face_embedder = face_matcher = face_gallery = attendance = face_consumer = None
+    face_embedder = shared_face_embedder
+    face_matcher = face_gallery = attendance = face_consumer = None
+    face_model_lock = threading.Lock()
+    enrollment_lock = threading.Lock()
     gid_to_person: dict[int, str] = {}
     gid_to_display: dict[int, str] = {}
     gid_to_score: dict[int, float] = {}
     unknown_of_gid: dict[int, str] = {}
     unknown_counter = 0
+    if use_face and face_embedder is None:
+        print("Face disabled (thieu InsightFace embedder).")
+        use_face = False
     if use_face:
         try:
             from camera_tracking.face import (
+                EnrolledPerson,
                 FaceAttendanceService,
                 FaceMatcher,
-                InsightFaceEmbedder,
                 load_gallery,
             )
-            try:
-                face_embedder = InsightFaceEmbedder(
-                    model_pack=face_cfg.model_pack, det_size=face_cfg.det_size,
-                    device=face_cfg.face_device,
-                )
-                # Khong load model nang o day; load lazy o frame dau co nguoi.
-            except Exception as error:  # noqa: BLE001
-                print(f"Face disabled (khoi tao embedder loi: {error})")
-                face_embedder = None
-                use_face = False
-            if use_face:
-                face_gallery = load_gallery(
-                    face_cfg.gallery_dir,
-                    face_embedder,
-                    face_cfg.name_map,
-                    face_cfg.employee_map,
-                )
-                face_matcher = FaceMatcher(face_gallery, threshold=face_threshold)
-                from camera_tracking.face import FaceTrackConsumer
-                face_consumer = FaceTrackConsumer(
-                    face_embedder,
-                    face_matcher,
-                    min_person_area_px=face_cfg.min_person_area_px,
-                    min_face_px=face_cfg.min_face_px,
-                    min_blur_variance=face_cfg.min_blur_variance,
-                    channels=tuple(face_cfg.channels),
-                )
-                attendance = FaceAttendanceService(
-                    debounce_hits=config.attendance.debounce_hits,
-                    window_s=config.attendance.window_s,
-                    active_hour_start=config.attendance.active_hour_start,
-                    active_hour_end=config.attendance.active_hour_end,
-                )
-                print(f"Face gallery: {len(face_gallery)} nguoi tu {face_cfg.gallery_dir} "
-                      f"| threshold={face_threshold} | channels={list(face_cfg.channels)}")
+            from camera_tracking.face.gallery import load_registry
+            face_gallery = load_gallery(
+                face_cfg.gallery_dir,
+                face_embedder,
+                face_cfg.name_map,
+                face_cfg.employee_map,
+            )
+            face_matcher = FaceMatcher(face_gallery, threshold=face_threshold)
+            from camera_tracking.face import FaceTrackConsumer
+            face_consumer = FaceTrackConsumer(
+                face_embedder,
+                face_matcher,
+                min_person_area_px=face_cfg.min_person_area_px,
+                min_face_px=face_cfg.min_face_px,
+                min_blur_variance=face_cfg.min_blur_variance,
+                channels=tuple(face_cfg.channels),
+            )
+            attendance = FaceAttendanceService(
+                debounce_hits=config.attendance.debounce_hits,
+                window_s=config.attendance.window_s,
+                active_hour_start=config.attendance.active_hour_start,
+                active_hour_end=config.attendance.active_hour_end,
+            )
+            print(f"Face gallery: {len(face_gallery)} nguoi tu {face_cfg.gallery_dir} "
+                  f"| threshold={face_threshold} | channels={list(face_cfg.channels)}")
         except ImportError as error:
             print(f"Face disabled (thieu module: {error})")
             use_face = False
@@ -999,7 +1036,130 @@ def main() -> None:
                         sent_attendance_keys.add(key)
                 return {"sent": ok, "failed": fail}
 
+        def register_person(payload: dict) -> dict:
+            if (
+                not use_face
+                or face_embedder is None
+                or face_gallery is None
+                or face_matcher is None
+            ):
+                return {
+                    "ok": False,
+                    "status": 503,
+                    "message": "Face recognition chưa sẵn sàng.",
+                }
+            employee_id = str(payload.get("employee_id", "")).strip()
+            display_name = " ".join(str(payload.get("display_name", "")).split())
+            image_data = payload.get("image")
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", employee_id):
+                return {
+                    "ok": False,
+                    "message": "Mã nhân viên chỉ gồm chữ, số, dấu chấm, gạch ngang hoặc gạch dưới.",
+                }
+            if not 2 <= len(display_name) <= 100:
+                return {"ok": False, "message": "Tên nhân viên không hợp lệ."}
+            if payload.get("consent") is not True:
+                return {
+                    "ok": False,
+                    "message": "Cần xác nhận đồng ý xử lý dữ liệu khuôn mặt.",
+                }
+            if not isinstance(image_data, str):
+                return {"ok": False, "message": "Chưa có ảnh đăng ký."}
+            encoded = image_data.split(",", 1)[-1]
+            try:
+                raw_image = base64.b64decode(encoded, validate=True)
+            except (binascii.Error, ValueError):
+                return {"ok": False, "message": "Ảnh đăng ký không hợp lệ."}
+            if not raw_image or len(raw_image) > 5 * 1024 * 1024:
+                return {"ok": False, "message": "Ảnh phải nhỏ hơn 5 MB."}
+            image_array = np.frombuffer(raw_image, dtype=np.uint8)
+            image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+            if image is None or image.size == 0:
+                return {"ok": False, "message": "Không đọc được định dạng ảnh."}
+            height, width = image.shape[:2]
+            if max(height, width) > 1920:
+                scale = 1920 / max(height, width)
+                image = cv2.resize(
+                    image,
+                    (max(1, round(width * scale)), max(1, round(height * scale))),
+                    interpolation=cv2.INTER_AREA,
+                )
+
+            with enrollment_lock:
+                if any(
+                    person.employee_id == employee_id
+                    or person.person_id == employee_id
+                    for person in face_gallery.people
+                ):
+                    return {
+                        "ok": False,
+                        "status": 409,
+                        "message": "Mã nhân viên đã được đăng ký.",
+                    }
+                try:
+                    with face_model_lock:
+                        detections = face_embedder.detect_embed(image)
+                except RuntimeError as error:
+                    return {"ok": False, "status": 503, "message": str(error)}
+                if len(detections) == 0:
+                    return {
+                        "ok": False,
+                        "message": "Không tìm thấy khuôn mặt rõ ràng trong ảnh.",
+                    }
+                if len(detections) > 1:
+                    return {
+                        "ok": False,
+                        "message": "Ảnh có nhiều khuôn mặt; hãy dùng ảnh chỉ có một người.",
+                    }
+
+                gallery_root = Path(face_cfg.gallery_dir)
+                gallery_root.mkdir(parents=True, exist_ok=True)
+                image_path = gallery_root / f"{employee_id}.jpg"
+                ok, jpeg = cv2.imencode(
+                    ".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 92]
+                )
+                if not ok:
+                    return {"ok": False, "message": "Không thể lưu ảnh đăng ký."}
+                temp_image = gallery_root / f".{employee_id}.tmp.jpg"
+                temp_image.write_bytes(jpeg.tobytes())
+                temp_image.replace(image_path)
+
+                registry = load_registry(gallery_root)
+                registry[employee_id] = {
+                    "display_name": display_name,
+                    "employee_id": employee_id,
+                }
+                registry_path = gallery_root / "registry.json"
+                temp_registry = gallery_root / ".registry.tmp.json"
+                temp_registry.write_text(
+                    json.dumps(registry, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                temp_registry.replace(registry_path)
+
+                detection = detections[0]
+                face_gallery.people.append(EnrolledPerson(
+                    person_id=employee_id,
+                    display_name=display_name,
+                    embedding=np.asarray(detection.embedding, dtype=np.float32),
+                    source_path=str(image_path),
+                    employee_id=employee_id,
+                ))
+                _store_or_queue(write_queue, supabase, "person", {
+                    "person_id": employee_id,
+                    "display_name": display_name,
+                    "photo_url": str(image_path),
+                    "active": True,
+                })
+            return {
+                "ok": True,
+                "person_id": employee_id,
+                "display_name": display_name,
+                "message": "Đăng ký nhân viên thành công.",
+            }
+
         streamer.set_attendance_actions(pending_attendance, send_attendance)
+        streamer.set_enrollment_action(register_person)
         if stream_on:
             jpeg_renderer = LatestJpegRenderer(streamer)
             jpeg_renderer.start()
@@ -1090,7 +1250,8 @@ def main() -> None:
             tracks=tuple(confirmed_tracks),
         )
         with metrics.measure("face"):
-            observations = face_consumer.consume(event, now_s)
+            with face_model_lock:
+                observations = face_consumer.consume(event, now_s)
         for observation in observations:
             track = observation.track
             crop = observation.crop_bgr

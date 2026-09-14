@@ -17,6 +17,7 @@ from camera_tracking.face.embeddings import (
 )
 from camera_tracking.face.gallery import EnrolledPerson, FaceGallery, load_gallery
 from camera_tracking.face.matcher import FaceMatcher, MatchResult
+from camera_tracking.face.reid import FaceReIDEmbedding
 
 __all__ = [
     "AttendanceRecord",
@@ -27,6 +28,7 @@ __all__ = [
     "FaceGallery",
     "FaceMatcher",
     "FaceObservation",
+    "FaceReIDEmbedding",
     "FaceTrackConsumer",
     "InsightFaceEmbedder",
     "MatchResult",
