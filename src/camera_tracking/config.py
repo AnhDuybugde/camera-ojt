@@ -36,6 +36,7 @@ class TrackingConfig(StrictModel):
     min_hits: int = Field(default=3, ge=1)
     iou_threshold: float = Field(default=0.3, ge=0, le=1)
     byte_match_threshold: float = Field(default=0.50, ge=0, le=1)
+    track_buffer: int = Field(default=30, ge=1)
 
 
 class GlobalIdentityConfig(StrictModel):
@@ -49,6 +50,10 @@ class GlobalIdentityConfig(StrictModel):
     match_threshold: float = Field(default=0.40, ge=0, le=1)
     max_center_distance_ratio: float = Field(default=0.35, gt=0)
     min_appearance_similarity: float = Field(default=0.30, ge=0, le=1)
+    # Gate rieng cho ID da co ten (employee_id): muon tai su dung GID nay,
+    # appearance phai >= nguong nay ke ca khi spatial/time cao. Chong vu
+    # G1-LeHoAnhDuy an di roi gán sang nguoi khac dung gan.
+    named_appearance_floor: float = Field(default=0.45, ge=0, le=1)
     active_duplicate_similarity: float = Field(default=0.60, ge=0, le=1)
     temp_lost_s: float = Field(default=5.0, ge=0)
     long_lost_s: float = Field(default=60.0, ge=0)

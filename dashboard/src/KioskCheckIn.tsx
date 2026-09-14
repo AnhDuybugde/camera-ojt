@@ -118,6 +118,15 @@ export default function KioskCheckIn({
       : active
   }, [cameraChannel, people])
 
+  const countA = useMemo(
+    () => people.filter((p) => p.camera === 'A' && (!p.tracking_state || p.tracking_state === 'ACTIVE')).length,
+    [people],
+  )
+  const countB = useMemo(
+    () => people.filter((p) => p.camera === 'B' && (!p.tracking_state || p.tracking_state === 'ACTIVE')).length,
+    [people],
+  )
+
   const subject = useMemo(
     () => cameraPeople.find((person) => person.name) ?? cameraPeople[0] ?? null,
     [cameraPeople],
@@ -184,26 +193,34 @@ export default function KioskCheckIn({
       </header>
 
       <div className="kiosk-content">
-        <section className="camera-panel" aria-label="Camera nhận diện khuôn mặt">
+        <section className="camera-panel" aria-label="Camera trực tiếp">
           <div className="camera-bar">
             <div>
-              <strong>Camera nhận diện</strong>
-              <span>Channel {cameraChannel} · Camera chấm công</span>
+              <strong>Camera trực tiếp</strong>
+              <span>A · Phòng ({countA}) — B · Cửa ({countB}) · Điểm danh theo Channel {cameraChannel}</span>
             </div>
             <span className="camera-mode">LIVE</span>
           </div>
-          <div className="camera-viewport">
-            <img
-              src={`${streamUrl}/cam_${cameraChannel.toLowerCase()}.mjpg`}
-              alt={`Camera check-in Channel ${cameraChannel}`}
-            />
-            {!liveOk && (
-              <div className="camera-offline">
-                <strong>Không có tín hiệu</strong>
-                <span>Pipeline sẽ tự kết nối lại</span>
+          <div className="camera-duo">
+            <figure className="camera-cell">
+              <div className="camera-viewport">
+                <img src={`${streamUrl}/cam_a.mjpg`} alt="Camera A — phòng" />
               </div>
-            )}
+              <figcaption>Camera A — phòng</figcaption>
+            </figure>
+            <figure className="camera-cell">
+              <div className="camera-viewport">
+                <img src={`${streamUrl}/cam_b.mjpg`} alt="Camera B — cửa" />
+              </div>
+              <figcaption>Camera B — cửa</figcaption>
+            </figure>
           </div>
+          {!liveOk && (
+            <div className="camera-offline">
+              <strong>Không có tín hiệu</strong>
+              <span>Pipeline sẽ tự kết nối lại</span>
+            </div>
+          )}
         </section>
 
         <aside className="recognition-panel" aria-live="polite">

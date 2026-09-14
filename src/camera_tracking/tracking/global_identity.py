@@ -79,6 +79,9 @@ class GlobalIdentityConfig:
     # Gating: pairs less similar than this in appearance are implausible
     # (only when both sides actually have an embedding).
     min_appearance_similarity: float = 0.30
+    # Stricter appearance floor for reusing a named (employee-bound) identity.
+    # Ngăn GID đã gắn tên bị body khác mặc đồ khác chiếm chỉ vì đứng gần.
+    named_appearance_floor: float = 0.45
     # Strong evidence for merging two simultaneously active cross-camera IDs.
     active_duplicate_similarity: float = 0.60
     # Lifecycle windows (seconds when timestamps are given, else steps).
@@ -394,6 +397,16 @@ class GlobalIdentityManager:
             and appearance < cfg.min_appearance_similarity
         ):
             return None  # Gating: looks like a different person.
+        # Named-ID guard: GID da gan employee_id khong duoc tai su dung
+        # boi body khac chi vi dung gan / mat dau ngan. Can appearance
+        # that su khop, ke ca khi embedding 2 ben deu co.
+        if (
+            record.employee_id
+            and embedding is not None
+            and len(record.gallery) > 0
+            and appearance < cfg.named_appearance_floor
+        ):
+            return None
 
         same_channel = channel == record.channel
         distance = _normalized_distance(bbox, record, frame_shape)

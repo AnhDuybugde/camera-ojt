@@ -480,6 +480,29 @@ tbody tr:hover { background: #f8fafc; }
   box-shadow: 0 3px 12px rgba(24, 32, 43, 0.08);
 }
 
+.camera-panel {
+  position: relative;
+}
+
+.camera-duo {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+  padding: 12px;
+}
+
+.camera-cell {
+  margin: 0;
+  min-width: 0;
+}
+
+.camera-cell figcaption {
+  padding-top: 6px;
+  color: #667085;
+  font-size: 12px;
+  text-align: center;
+}
+
 .camera-bar {
   min-height: 62px;
   justify-content: space-between;
@@ -779,6 +802,10 @@ tbody tr:hover { background: #f8fafc; }
 @media (max-width: 1024px) {
   .kiosk-content {
     grid-template-columns: minmax(0, 1.35fr) minmax(310px, 0.8fr);
+  }
+
+  .camera-duo {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .recent-list {

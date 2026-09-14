@@ -125,9 +125,9 @@ def open_capture(
     cap = cv2.VideoCapture()
     open_params = [
         cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,
-        5000,
+        20000,
         cv2.CAP_PROP_READ_TIMEOUT_MSEC,
-        5000,
+        15000,
     ]
     for candidate_index, candidate in enumerate(candidates):
         if candidate_index == 1:
@@ -335,7 +335,7 @@ def parse_args() -> argparse.Namespace:
                         help="Business: absent over N sec -> POSSIBLY_OUT.")
     parser.add_argument("--return-stable-s", type=float, default=2.0,
                         help="Business: stable presence N sec -> WORKING.")
-    parser.add_argument("--new-track-conf", type=float, default=0.4,
+    parser.add_argument("--new-track-conf", type=float, default=0.25,
                         help="Min YOLO score that may spawn a NEW tracklet "
                         "(ghosts below this never become Global IDs).")
     parser.add_argument("--move-ratio", type=float, default=None,
@@ -707,9 +707,9 @@ def main() -> None:
 
     detector = YoloPersonDetector(
         model_path=model_path,
-        # Precision-first: feed exactly the configured confidence (0.4).
-        # No low-conf recovery: brief occlusions may fragment IDs instead
-        # of risking misassignment. Reconcile + prune clean up afterwards.
+        # Recall-first: feed exactly the configured confidence (0.25).
+        # Giu box yeu khi che de ByteTrack + GlobalID noi lai; loc ghost
+        # bang --min-area + --new-track-conf + prune ve sau.
         confidence=config.detection.confidence_threshold,
         person_class_id=config.detection.person_class_id,
         image_size=image_size,
@@ -722,7 +722,7 @@ def main() -> None:
     effective_fps = max(1, round(config.camera.fps / config.camera.process_every_n_frames))
     tracker_a = ByteTrackTracker(
         frame_rate=effective_fps,
-        track_buffer=30,
+        track_buffer=config.tracking.track_buffer,
         track_high_threshold=args.new_track_conf,
         track_low_threshold=args.new_track_conf,
         new_track_threshold=args.new_track_conf,
@@ -731,7 +731,7 @@ def main() -> None:
     )
     tracker_b = ByteTrackTracker(
         frame_rate=effective_fps,
-        track_buffer=30,
+        track_buffer=config.tracking.track_buffer,
         track_high_threshold=args.new_track_conf,
         track_low_threshold=args.new_track_conf,
         new_track_threshold=args.new_track_conf,
@@ -772,6 +772,7 @@ def main() -> None:
             match_threshold=identity_cfg.match_threshold,
             max_center_distance_ratio=identity_cfg.max_center_distance_ratio,
             min_appearance_similarity=identity_cfg.min_appearance_similarity,
+            named_appearance_floor=identity_cfg.named_appearance_floor,
             active_duplicate_similarity=identity_cfg.active_duplicate_similarity,
             temp_lost_s=identity_cfg.temp_lost_s,
             long_lost_s=identity_cfg.long_lost_s,
