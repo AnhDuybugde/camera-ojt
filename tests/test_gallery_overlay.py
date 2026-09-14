@@ -119,3 +119,13 @@ def test_draw_tracks_accepts_status_colors() -> None:
     # Yellow (Away) box border must be present somewhere.
     yellow = (out[:, :, 0] == 0) & (out[:, :, 1] == 200) & (out[:, :, 2] == 255)
     assert bool(yellow.any())
+
+
+def test_draw_face_mark_has_high_contrast_border() -> None:
+    from camera_tracking.visualization import draw_face_mark
+
+    frame = np.zeros((120, 180, 3), dtype=np.uint8)
+    out = draw_face_mark(frame, (30, 30, 100, 105), 0.82, True)
+
+    green = (out[:, :, 0] == 40) & (out[:, :, 1] == 180) & (out[:, :, 2] == 40)
+    assert bool(green.any())

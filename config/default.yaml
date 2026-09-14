@@ -39,6 +39,9 @@ identity:
   max_center_distance_ratio: 0.35
   min_appearance_similarity: 0.30
   active_duplicate_similarity: 0.60
+  # Do not reuse a Global ID across A/B in the same instant. Active IDs only
+  # merge across cameras after both faces resolve to the same employee.
+  cross_channel_min_transition_s: 1.0
   temp_lost_s: 5.0
   long_lost_s: 60.0
   unresolved_keep_s: 300.0
@@ -90,19 +93,25 @@ face:
   enabled: true
   gallery_dir: data/images
   model_pack: buffalo_s
-  match_threshold: 0.3
-  min_face_px: 32
-  min_blur_variance: 20.0
+  # Precision-first attendance: prefer Unknown over assigning a wrong person.
+  match_threshold: 0.52
+  ambiguity_margin: 0.08
+  min_face_px: 48
+  min_blur_variance: 30.0
   min_person_area_px: 2000.0
   process_every_k: 3
   det_size: 640
+  # Three confirmations still complete in roughly 4-6 seconds.
+  known_cooldown_s: 2.0
+  unknown_cooldown_s: 1.0
   name_map:
     LeHoAnhDuy: Le Ho Anh Duy
   employee_map:
     LeHoAnhDuy: "1"
 
 attendance:
-  debounce_hits: 1
+  # Require repeated independent observations before writing attendance.
+  debounce_hits: 3
   window_s: 8.0
   active_hour_start: null
   active_hour_end: null

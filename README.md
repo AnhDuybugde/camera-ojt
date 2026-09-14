@@ -1,4 +1,4 @@
-# Camera OJT
+# Hệ thống chấm công AI Mind JSC
 
 Hệ thống điểm danh và theo dõi trạng thái nhân viên bằng hai camera:
 
@@ -159,6 +159,10 @@ Lần chạy đầu, Ultralytics và InsightFace có thể tải model `yolo26s.
 3. Chụp/tải ảnh chỉ có một khuôn mặt, rõ, đủ sáng và nhìn gần chính diện.
 4. Xác nhận đồng ý xử lý dữ liệu khuôn mặt rồi nhấn đăng ký.
 5. Đứng trước Channel A khoảng 1-2 giây để kiểm tra nhận diện/check-in.
+
+Trang `Quản lý nhân viên` cho phép xem gallery, thay ảnh nhưng giữ nguyên mã,
+hoặc gỡ một người khỏi nhận diện. Khi gỡ, giao diện yêu cầu nhập lại đúng mã
+nhân viên để tránh thao tác nhầm; lịch sử chấm công vẫn được giữ lại.
 
 Thông tin đăng ký cục bộ nằm trong `data/images/registry.json`; ảnh nằm trong
 `data/images/`. Cả hai đều bị `.gitignore` loại khỏi Git vì là dữ liệu cá nhân.

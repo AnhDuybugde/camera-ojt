@@ -30,21 +30,35 @@ class FaceGallery:
         return len(self.people)
 
     def best_match(
-        self, query: np.ndarray | None, threshold: float
+        self,
+        query: np.ndarray | None,
+        threshold: float,
+        min_margin: float = 0.0,
     ) -> tuple[EnrolledPerson | None, float]:
-        """Tra (person | None, score). Khong dat nguong -> None."""
+        """Return a match only when it is strong and unambiguous."""
         if query is None or not self.people:
             return None, 0.0
         best: EnrolledPerson | None = None
         best_score = -1.0
+        second_score = -1.0
         for person in self.people:
             if person.embedding is None:
                 continue
             score = cosine_similarity(query, person.embedding)
             if score > best_score:
+                second_score = best_score
                 best_score = score
                 best = person
-        if best is None or best_score < threshold:
+            elif score > second_score:
+                second_score = score
+        if (
+            best is None
+            or best_score < threshold
+            or (
+                second_score >= 0.0
+                and best_score - second_score < min_margin
+            )
+        ):
             return None, max(best_score, 0.0)
         return best, float(best_score)
 

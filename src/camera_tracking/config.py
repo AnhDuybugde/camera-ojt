@@ -50,6 +50,7 @@ class GlobalIdentityConfig(StrictModel):
     max_center_distance_ratio: float = Field(default=0.35, gt=0)
     min_appearance_similarity: float = Field(default=0.30, ge=0, le=1)
     active_duplicate_similarity: float = Field(default=0.60, ge=0, le=1)
+    cross_channel_min_transition_s: float = Field(default=1.0, ge=0)
     temp_lost_s: float = Field(default=5.0, ge=0)
     long_lost_s: float = Field(default=60.0, ge=0)
     unresolved_keep_s: float = Field(default=300.0, ge=0)
@@ -113,12 +114,15 @@ class FaceConfig(StrictModel):
     enabled: bool = True
     gallery_dir: Path = Path("data/images")
     model_pack: str = "buffalo_s"
-    match_threshold: float = Field(default=0.3, ge=0, le=1)
+    match_threshold: float = Field(default=0.52, ge=0, le=1)
+    ambiguity_margin: float = Field(default=0.08, ge=0, le=1)
     min_face_px: int = Field(default=32, ge=8)
     min_blur_variance: float = Field(default=20.0, ge=0)
     min_person_area_px: float = Field(default=2000.0, ge=0)
     process_every_k: int = Field(default=3, ge=1)
     det_size: int = Field(default=640, ge=160)
+    known_cooldown_s: float = Field(default=2.0, ge=0)
+    unknown_cooldown_s: float = Field(default=1.0, ge=0)
     # Ten hien thi: {"LeHoAnhDuy": "Le Ho Anh Duy"}; mac dinh dung stem file.
     name_map: dict[str, str] = Field(default_factory=dict)
     # Employee ID trong database: {"LeHoAnhDuy": "1"}.

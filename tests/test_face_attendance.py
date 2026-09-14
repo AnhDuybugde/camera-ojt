@@ -71,3 +71,23 @@ def test_matcher_threshold() -> None:
     assert matched.is_known and matched.person is not None and matched.person.person_id == "An"
     strict = FaceMatcher(gallery, threshold=1.01)
     assert strict.match(query).is_known is False
+
+
+def test_matcher_rejects_ambiguous_top_two_candidates() -> None:
+    query = np.array([1.0, 0.0], dtype=np.float32)
+    gallery = FaceGallery(people=[
+        EnrolledPerson(
+            person_id="An", display_name="An",
+            embedding=np.array([0.90, 0.436], dtype=np.float32),
+        ),
+        EnrolledPerson(
+            person_id="Bo", display_name="Bo",
+            embedding=np.array([0.88, 0.475], dtype=np.float32),
+        ),
+    ])
+
+    result = FaceMatcher(gallery, threshold=0.5, min_margin=0.08).match(query)
+
+    assert result.is_known is False
+    assert result.person is None
+    assert result.score > 0.8

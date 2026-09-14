@@ -58,7 +58,11 @@ from camera_tracking.tracking import (
     GlobalIdentityManager,
     StablePersonCount,
 )
-from camera_tracking.visualization import draw_global_labels, draw_person_tracks
+from camera_tracking.visualization import (
+    draw_face_mark,
+    draw_global_labels,
+    draw_person_tracks,
+)
 from camera_tracking.workstate import (
     LABEL_UNKNOWN,
     ChannelBusinessTracker,
@@ -162,10 +166,11 @@ class ResilientCapture:
     name: str
     capture: cv2.VideoCapture
     open_attempts: int
-    max_reconnects: int = 3
+    max_reconnects: int = 0
     failure_threshold: int = 5
     failure_count: int = 0
     reconnect_count: int = 0
+    next_reconnect_s: float = 0.0
     exhausted: bool = False
 
     def read(self) -> tuple[bool, np.ndarray | None]:
@@ -177,28 +182,44 @@ class ResilientCapture:
                 ok, frame = False, None
         if ok and frame is not None:
             self.failure_count = 0
+            self.reconnect_count = 0
+            self.next_reconnect_s = 0.0
             return True, frame
 
         self.failure_count += 1
         if self.failure_count < max(1, self.failure_threshold):
             return False, None
-        if self.reconnect_count >= max(0, self.max_reconnects):
+        finite_retries = self.max_reconnects > 0
+        if finite_retries and self.reconnect_count >= self.max_reconnects:
             self.exhausted = True
+            return False, None
+        now_s = time.monotonic()
+        if now_s < self.next_reconnect_s:
             return False, None
 
         self.reconnect_count += 1
         self.failure_count = 0
         self.capture.release()
+        reconnect_limit = (
+            str(self.max_reconnects) if self.max_reconnects > 0 else "unlimited"
+        )
         print(
             f"Camera {self.name}: mat stream, dang ket noi lai "
-            f"({self.reconnect_count}/{self.max_reconnects})..."
+            f"({self.reconnect_count}/{reconnect_limit})..."
         )
         self.capture = open_capture(
             self.source,
             attempts=self.open_attempts,
             camera_name=self.name,
         )
-        if not self.capture.isOpened() and self.reconnect_count >= self.max_reconnects:
+        if not self.capture.isOpened():
+            backoff_s = min(30.0, 2.0 ** min(self.reconnect_count - 1, 4))
+            self.next_reconnect_s = time.monotonic() + backoff_s
+        if (
+            not self.capture.isOpened()
+            and finite_retries
+            and self.reconnect_count >= self.max_reconnects
+        ):
             self.exhausted = True
         return False, None
 
@@ -326,8 +347,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-reconnects",
         type=int,
-        default=3,
-        help="So lan ket noi lai neu stream bi mat khi dang chay.",
+        default=0,
+        help="So lan ket noi lai khi mat stream; 0 = thu lai vo han co backoff.",
     )
     parser.add_argument("--min-area", type=float, default=2000.0,
                         help="Bo box nguoi nho hon nguong (px^2) de giam nhieu.")
@@ -779,6 +800,9 @@ def main() -> None:
             max_center_distance_ratio=identity_cfg.max_center_distance_ratio,
             min_appearance_similarity=identity_cfg.min_appearance_similarity,
             active_duplicate_similarity=identity_cfg.active_duplicate_similarity,
+            cross_channel_min_transition_s=(
+                identity_cfg.cross_channel_min_transition_s
+            ),
             temp_lost_s=identity_cfg.temp_lost_s,
             long_lost_s=identity_cfg.long_lost_s,
             unresolved_keep_s=identity_cfg.unresolved_keep_s,
@@ -864,6 +888,7 @@ def main() -> None:
                 InsightFaceEmbedder,
                 load_gallery,
             )
+            from camera_tracking.face.embeddings import cosine_similarity
             from camera_tracking.face.gallery import load_registry
             try:
                 face_embedder = InsightFaceEmbedder(
@@ -881,7 +906,11 @@ def main() -> None:
                     face_cfg.name_map,
                     face_cfg.employee_map,
                 )
-                face_matcher = FaceMatcher(face_gallery, threshold=face_threshold)
+                face_matcher = FaceMatcher(
+                    face_gallery,
+                    threshold=face_threshold,
+                    min_margin=face_cfg.ambiguity_margin,
+                )
                 from camera_tracking.face import FaceTrackConsumer
                 face_consumer = FaceTrackConsumer(
                     face_embedder,
@@ -889,6 +918,8 @@ def main() -> None:
                     min_person_area_px=face_cfg.min_person_area_px,
                     min_face_px=face_cfg.min_face_px,
                     min_blur_variance=face_cfg.min_blur_variance,
+                    known_cooldown_s=face_cfg.known_cooldown_s,
+                    unknown_cooldown_s=face_cfg.unknown_cooldown_s,
                 )
                 attendance = FaceAttendanceService(
                     debounce_hits=config.attendance.debounce_hits,
@@ -994,6 +1025,7 @@ def main() -> None:
             employee_id = str(payload.get("employee_id", "")).strip()
             display_name = " ".join(str(payload.get("display_name", "")).split())
             image_data = payload.get("image")
+            replace_existing = payload.get("replace") is True
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", employee_id):
                 return {
                     "ok": False,
@@ -1029,15 +1061,23 @@ def main() -> None:
                 )
 
             with enrollment_lock:
-                if any(
-                    person.employee_id == employee_id
+                existing_people = [
+                    person for person in face_gallery.people
+                    if person.employee_id == employee_id
                     or person.person_id == employee_id
-                    for person in face_gallery.people
-                ):
+                ]
+                existing_object_ids = {id(person) for person in existing_people}
+                if existing_people and not replace_existing:
                     return {
                         "ok": False,
                         "status": 409,
                         "message": "Mã nhân viên đã được đăng ký.",
+                    }
+                if replace_existing and not existing_people:
+                    return {
+                        "ok": False,
+                        "status": 404,
+                        "message": "Không tìm thấy nhân viên cần thay ảnh.",
                     }
                 try:
                     with face_model_lock:
@@ -1053,6 +1093,27 @@ def main() -> None:
                     return {
                         "ok": False,
                         "message": "Ảnh có nhiều khuôn mặt; hãy dùng ảnh chỉ có một người.",
+                    }
+
+                detection = detections[0]
+                duplicate = None
+                duplicate_score = 0.0
+                for person in face_gallery.people:
+                    if id(person) in existing_object_ids or person.embedding is None:
+                        continue
+                    score = cosine_similarity(detection.embedding, person.embedding)
+                    if score > duplicate_score:
+                        duplicate = person
+                        duplicate_score = score
+                if duplicate is not None and duplicate_score >= 0.75:
+                    duplicate_id = duplicate.employee_id or duplicate.person_id
+                    return {
+                        "ok": False,
+                        "status": 409,
+                        "message": (
+                            "Khuôn mặt này có vẻ đã đăng ký cho "
+                            f"{duplicate.display_name} ({duplicate_id})."
+                        ),
                     }
 
                 gallery_root = Path(face_cfg.gallery_dir)
@@ -1080,14 +1141,19 @@ def main() -> None:
                 )
                 temp_registry.replace(registry_path)
 
-                detection = detections[0]
-                face_gallery.people.append(EnrolledPerson(
-                    person_id=employee_id,
-                    display_name=display_name,
-                    embedding=np.asarray(detection.embedding, dtype=np.float32),
-                    source_path=str(image_path),
-                    employee_id=employee_id,
-                ))
+                with face_model_lock:
+                    if existing_people:
+                        face_gallery.people[:] = [
+                            person for person in face_gallery.people
+                            if id(person) not in existing_object_ids
+                        ]
+                    face_gallery.people.append(EnrolledPerson(
+                        person_id=employee_id,
+                        display_name=display_name,
+                        embedding=np.asarray(detection.embedding, dtype=np.float32),
+                        source_path=str(image_path),
+                        employee_id=employee_id,
+                    ))
                 _store_or_queue(write_queue, supabase, "person", {
                     "person_id": employee_id,
                     "display_name": display_name,
@@ -1098,11 +1164,121 @@ def main() -> None:
                 "ok": True,
                 "person_id": employee_id,
                 "display_name": display_name,
-                "message": "Đăng ký nhân viên thành công.",
+                "message": (
+                    "Thay ảnh nhận diện thành công."
+                    if replace_existing
+                    else "Đăng ký nhân viên thành công."
+                ),
+            }
+
+        def list_enrolled_people() -> list[dict]:
+            if face_gallery is None:
+                return []
+            with enrollment_lock:
+                people_by_id: dict[str, dict] = {}
+                for person in face_gallery.people:
+                    employee_id = person.employee_id or person.person_id
+                    people_by_id[employee_id] = {
+                        "person_id": employee_id,
+                        "display_name": person.display_name,
+                        "has_image": bool(
+                            person.source_path and Path(person.source_path).is_file()
+                        ),
+                    }
+                return sorted(
+                    people_by_id.values(),
+                    key=lambda item: (item["display_name"].casefold(), item["person_id"]),
+                )
+
+        def delete_enrolled_person(employee_id: str) -> dict:
+            if face_gallery is None:
+                return {
+                    "ok": False,
+                    "status": 503,
+                    "message": "Face recognition chưa sẵn sàng.",
+                }
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", employee_id):
+                return {"ok": False, "message": "Mã nhân viên không hợp lệ."}
+            with enrollment_lock:
+                existing_people = [
+                    person for person in face_gallery.people
+                    if person.employee_id == employee_id
+                    or person.person_id == employee_id
+                ]
+                if not existing_people:
+                    return {
+                        "ok": False,
+                        "status": 404,
+                        "message": "Không tìm thấy nhân viên trong gallery.",
+                    }
+                existing_object_ids = {id(person) for person in existing_people}
+                gallery_root = Path(face_cfg.gallery_dir).resolve()
+                image_paths: list[Path] = []
+                for person in existing_people:
+                    if not person.source_path:
+                        continue
+                    image_path = Path(person.source_path).resolve()
+                    if image_path.parent == gallery_root and image_path.is_file():
+                        image_paths.append(image_path)
+                try:
+                    for image_path in image_paths:
+                        image_path.unlink()
+                    registry = load_registry(gallery_root)
+                    keys_to_remove = {
+                        key for key, value in registry.items()
+                        if key == employee_id or value.get("employee_id") == employee_id
+                    }
+                    for key in keys_to_remove:
+                        registry.pop(key, None)
+                    registry_path = gallery_root / "registry.json"
+                    temp_registry = gallery_root / ".registry.tmp.json"
+                    temp_registry.write_text(
+                        json.dumps(registry, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    temp_registry.replace(registry_path)
+                except OSError as error:
+                    return {
+                        "ok": False,
+                        "status": 500,
+                        "message": f"Không thể xóa ảnh nhận diện: {error}",
+                    }
+
+                with face_model_lock:
+                    face_gallery.people[:] = [
+                        person for person in face_gallery.people
+                        if id(person) not in existing_object_ids
+                    ]
+                stale_gids = [
+                    gid for gid, person_id in gid_to_person.items()
+                    if person_id == employee_id
+                ]
+                for gid in stale_gids:
+                    gid_to_person.pop(gid, None)
+                    gid_to_display.pop(gid, None)
+                    gid_to_score.pop(gid, None)
+                manager.unbind_employee(employee_id)
+                _store_or_queue(write_queue, supabase, "person", {
+                    "person_id": employee_id,
+                    "display_name": existing_people[0].display_name,
+                    "photo_url": None,
+                    "active": False,
+                })
+            return {
+                "ok": True,
+                "person_id": employee_id,
+                "message": (
+                    "Đã gỡ nhân viên khỏi nhận diện; "
+                    "lịch sử chấm công được giữ lại."
+                ),
             }
 
         streamer.set_attendance_actions(pending_attendance, send_attendance)
-        streamer.set_enrollment_action(register_person)
+        streamer.set_enrollment_actions(
+            register_person,
+            list_enrolled_people,
+            delete_enrolled_person,
+        )
         if stream_on:
             jpeg_renderer = LatestJpegRenderer(streamer)
             jpeg_renderer.start()
@@ -1130,9 +1306,6 @@ def main() -> None:
     opened_b = cap_b.isOpened()
     if not opened_b:
         print(f"Không mở được camera B: {source_label(source_b)}")
-    if not opened_a and not opened_b:
-        stream_a.close()
-        raise SystemExit(1)
     stream_b = low_latency_capture(ResilientCapture(
         source_b,
         "B",
@@ -1578,42 +1751,27 @@ def main() -> None:
             if ret_a and frame_a is not None and need_vis:
                 vis_a = frame_a.copy()
                 draw_person_tracks(vis_a, last_tracks_a, display_count=count_a.value,
-                                   title="Global", status=room_status_now)
+                                   title="Global", status=room_status_now,
+                                   show_track_label=False)
                 draw_global_labels(
                     vis_a, last_tracks_a, room_status_now, gid_to_display, gid_to_person
                 )
                 for x1m, y1m, x2m, y2m, fscore, fknown in face_marks_a:
-                    fcolor = (40, 180, 40) if fknown else (60, 60, 220)
-                    cv2.rectangle(
-                        vis_a,
-                        (int(x1m), int(y1m)),
-                        (int(x2m), int(y2m)),
-                        fcolor,
-                        2,
-                    )
-                    cv2.putText(
-                        vis_a,
-                        f"{fscore:.2f}",
-                        (int(x1m), max(0, int(y1m) - 6)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.55,
-                        fcolor,
-                        2,
+                    draw_face_mark(
+                        vis_a, (x1m, y1m, x2m, y2m), fscore, fknown
                     )
             if ret_b and frame_b is not None and need_vis:
                 vis_b = frame_b.copy()
                 draw_person_tracks(vis_b, last_tracks_b, display_count=count_b.value,
-                                   title="Global", status=room_status_now)
+                                   title="Global", status=room_status_now,
+                                   show_track_label=False)
                 draw_global_labels(
                     vis_b, last_tracks_b, room_status_now, gid_to_display, gid_to_person
                 )
                 for x1m, y1m, x2m, y2m, fscore, fknown in face_marks_b:
-                    fcolor = (40, 180, 40) if fknown else (60, 60, 220)
-                    cv2.rectangle(vis_b, (int(x1m), int(y1m)),
-                                  (int(x2m), int(y2m)), fcolor, 2)
-                    cv2.putText(vis_b, f"{fscore:.2f}",
-                                (int(x1m), max(0, int(y1m) - 6)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, fcolor, 2)
+                    draw_face_mark(
+                        vis_b, (x1m, y1m, x2m, y2m), fscore, fknown
+                    )
             if args.display:
                 if vis_a is not None:
                     cv2.imshow("Channel A - tracking", vis_a)

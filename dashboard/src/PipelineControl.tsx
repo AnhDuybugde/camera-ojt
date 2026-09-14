@@ -55,9 +55,9 @@ export default function PipelineControl() {
         reason?: string
         pid?: number
       }
-      setMsg(r.started ? `Pipeline started (pid ${r.pid}). Live feed in ~10s.` : `Not started: ${r.reason ?? 'unknown'}`)
+      setMsg(r.started ? `Pipeline đã khởi động (PID ${r.pid}). Camera sẽ hiển thị sau khoảng 10 giây.` : `Không thể khởi động: ${r.reason ?? 'không rõ nguyên nhân'}`)
     } catch (e) {
-      setMsg(`Start failed: ${(e as Error).message}`)
+      setMsg(`Khởi động thất bại: ${(e as Error).message}`)
     } finally {
       setBusy(false)
       refresh()
@@ -65,13 +65,13 @@ export default function PipelineControl() {
   }
 
   async function stop() {
-    if (!window.confirm('Stop the camera pipeline? Live feed will go offline.')) return
+    if (!window.confirm('Dừng pipeline camera? Hình ảnh trực tiếp sẽ bị ngắt.')) return
     setBusy(true)
     try {
       await api('/api/stop', {})
-      setMsg('Pipeline stopped.')
+      setMsg('Pipeline đã dừng.')
     } catch (e) {
-      setMsg(`Stop failed: ${(e as Error).message}`)
+      setMsg(`Dừng pipeline thất bại: ${(e as Error).message}`)
     } finally {
       setBusy(false)
       refresh()
@@ -81,42 +81,42 @@ export default function PipelineControl() {
   return (
     <section className="card">
       <h2>
-        Pipeline{' '}
+        Pipeline camera{' '}
         {online && status && (
           status.running
-            ? <span className="badge badge-working">RUNNING{status.pid ? ` · pid ${status.pid}` : ''}</span>
-            : <span className="badge badge-unknown">STOPPED</span>
+            ? <span className="badge badge-working">ĐANG CHẠY{status.pid ? ` · PID ${status.pid}` : ''}</span>
+            : <span className="badge badge-unknown">ĐÃ DỪNG</span>
         )}
       </h2>
       {!online ? (
         <p className="footnote">
-          Supervisor offline — run <code>python scripts\pipeline_supervisor.py</code> on the camera PC
-          (or double-click <code>start-all.bat</code>), then cameras can be started from here.
+          Supervisor đang ngoại tuyến. Chạy <code>python scripts\pipeline_supervisor.py</code> trên máy camera
+          (hoặc mở <code>start-all.bat</code>) để điều khiển camera tại đây.
         </p>
       ) : (
         <>
           <div className="control-row">
             <label>
-              Model size:{' '}
+              Kích thước xử lý:{' '}
               <select value={imgsz} onChange={(e) => setImgsz(e.target.value)} disabled={status?.running || busy}>
-                <option value="640">640 — faster</option>
-                <option value="800">800 — default</option>
-                <option value="960">960 — sharper</option>
+                <option value="640">640 — nhanh hơn</option>
+                <option value="800">800 — mặc định</option>
+                <option value="960">960 — rõ hơn</option>
               </select>
             </label>
             <label className="scope-check">
               <input type="checkbox" checked={noFace} onChange={(e) => setNoFace(e.target.checked)}
-                disabled={status?.running || busy} /> tracking only (no face)
+                disabled={status?.running || busy} /> chỉ theo dõi, không nhận diện khuôn mặt
             </label>
             {status?.running ? (
-              <button className="danger-btn" disabled={busy} onClick={stop}>Stop cameras</button>
+              <button className="danger-btn" disabled={busy} onClick={stop}>Dừng camera</button>
             ) : (
-              <button disabled={busy} onClick={start}>{busy ? 'Starting...' : 'Start cameras'}</button>
+              <button disabled={busy} onClick={start}>{busy ? 'Đang khởi động...' : 'Khởi động camera'}</button>
             )}
-            <button className="ghost" onClick={refresh}>Refresh</button>
+            <button className="ghost" onClick={refresh}>Làm mới</button>
           </div>
           {status?.running && status.uptime_s > 0 && (
-            <p className="footnote">Uptime: {Math.round(status.uptime_s)}s · args: <code>{status.args.join(' ')}</code></p>
+            <p className="footnote">Thời gian hoạt động: {Math.round(status.uptime_s)} giây · tham số: <code>{status.args.join(' ')}</code></p>
           )}
           {msg && <p className="footnote">{msg}</p>}
           {status && status.log_tail.length > 0 && (

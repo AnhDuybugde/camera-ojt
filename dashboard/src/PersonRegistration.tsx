@@ -1,8 +1,16 @@
 import { useRef, useState } from 'react'
+import Brand from './Brand'
 
 type Props = {
   streamUrl: string
   onBack: () => void
+  initialPerson?: EnrolledPerson | null
+}
+
+export type EnrolledPerson = {
+  person_id: string
+  display_name: string
+  has_image: boolean
 }
 
 type RegistrationResponse = {
@@ -12,10 +20,11 @@ type RegistrationResponse = {
   message?: string
 }
 
-export default function PersonRegistration({ streamUrl, onBack }: Props) {
+export default function PersonRegistration({ streamUrl, onBack, initialPerson }: Props) {
   const inputRef = useRef<HTMLInputElement>(null)
-  const [employeeId, setEmployeeId] = useState('')
-  const [displayName, setDisplayName] = useState('')
+  const replacing = Boolean(initialPerson)
+  const [employeeId, setEmployeeId] = useState(initialPerson?.person_id ?? '')
+  const [displayName, setDisplayName] = useState(initialPerson?.display_name ?? '')
   const [imageData, setImageData] = useState('')
   const [fileName, setFileName] = useState('')
   const [consent, setConsent] = useState(false)
@@ -55,13 +64,16 @@ export default function PersonRegistration({ streamUrl, onBack }: Props) {
           display_name: displayName.trim(),
           image: imageData,
           consent,
+          replace: replacing,
         }),
       })
       const payload = await response.json() as RegistrationResponse
       setResult(payload)
       if (response.ok && payload.ok) {
-        setEmployeeId('')
-        setDisplayName('')
+        if (!replacing) {
+          setEmployeeId('')
+          setDisplayName('')
+        }
         setImageData('')
         setFileName('')
         setConsent(false)
@@ -82,15 +94,9 @@ export default function PersonRegistration({ streamUrl, onBack }: Props) {
   return (
     <main className="registration-page">
       <header className="registration-header">
-        <div className="kiosk-brand">
-          <span className="brand-mark">FPT</span>
-          <div>
-            <strong>Đăng ký nhân viên</strong>
-            <span>Face enrollment</span>
-          </div>
-        </div>
+        <Brand section={replacing ? 'Thay ảnh nhận diện' : 'Đăng ký nhân viên'} />
         <button type="button" className="registration-back" onClick={onBack}>
-          Quay lại điểm danh
+          Quay lại quản lý
         </button>
       </header>
 
@@ -113,6 +119,7 @@ export default function PersonRegistration({ streamUrl, onBack }: Props) {
             placeholder="Ví dụ: NV001"
             maxLength={64}
             autoComplete="off"
+            readOnly={replacing}
             required
           />
 
@@ -141,13 +148,15 @@ export default function PersonRegistration({ streamUrl, onBack }: Props) {
 
           {result && (
             <div className={`registration-result ${result.ok ? 'success' : 'error'}`} role="status">
-              <strong>{result.ok ? 'Đăng ký thành công' : 'Chưa thể đăng ký'}</strong>
+              <strong>{result.ok ? (replacing ? 'Thay ảnh thành công' : 'Đăng ký thành công') : 'Chưa thể lưu'}</strong>
               <span>{result.message}</span>
             </div>
           )}
 
           <button type="submit" className="register-submit" disabled={!ready || submitting}>
-            {submitting ? 'Đang kiểm tra khuôn mặt...' : 'Đăng ký nhân viên'}
+            {submitting
+              ? 'Đang kiểm tra khuôn mặt...'
+              : replacing ? 'Lưu ảnh nhận diện mới' : 'Đăng ký nhân viên'}
           </button>
         </section>
 

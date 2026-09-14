@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
+import Brand from './Brand'
+import EmployeeManagement from './EmployeeManagement'
 import KioskCheckIn from './KioskCheckIn'
-import PersonRegistration from './PersonRegistration'
+import PersonRegistration, { type EnrolledPerson } from './PersonRegistration'
 import PipelineControl from './PipelineControl'
 import { supabase, supabaseConfigured } from './lib/supabase'
 import {
@@ -80,8 +82,9 @@ const LABEL_MAP: Record<string, string> = {
   'Chưa xác định': 'Unknown',
 }
 
-function displayLabel(label: string): string {
-  return LABEL_MAP[label] ?? label
+function displayLabel(label: string, identified = false): string {
+  const normalized = LABEL_MAP[label] ?? label
+  return identified && normalized === 'Unknown' ? 'Chưa xác định trạng thái' : normalized
 }
 
 function labelClass(label: string): string {
@@ -94,12 +97,41 @@ function labelClass(label: string): string {
   return 'badge badge-unknown'
 }
 
+function labelText(label: string, identified = false): string {
+  const normalized = displayLabel(label, identified)
+  const translations: Record<string, string> = {
+    Working: 'Đang làm việc',
+    Away: 'Rời vị trí',
+    'Out of office': 'Ngoài văn phòng',
+    Returning: 'Đang quay lại',
+    Unknown: 'Chưa xác định',
+  }
+  return translations[normalized] ?? normalized
+}
+
 function todayISO(): string {
   return new Date().toISOString().slice(0, 10)
 }
 
+function formatDateTime(value: string | null): string {
+  if (!value) return '—'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return new Intl.DateTimeFormat('vi-VN', {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).format(date)
+}
+
+type AdminTab = 'attendance' | 'room' | 'events' | 'maintenance'
+
 export default function App() {
-  const [screen, setScreen] = useState<'kiosk' | 'admin' | 'registration'>('kiosk')
+  const [screen, setScreen] = useState<'kiosk' | 'admin' | 'registration' | 'employees'>('kiosk')
+  const [registrationPerson, setRegistrationPerson] = useState<EnrolledPerson | null>(null)
   const [day, setDay] = useState(todayISO())
   const [attendance, setAttendance] = useState<AttendanceRow[]>([])
   const [room, setRoom] = useState<RoomRow[]>([])
@@ -119,6 +151,7 @@ export default function App() {
   const [pendingAttendance, setPendingAttendance] = useState<PendingAttendance[]>([])
   const [sendingAttendance, setSendingAttendance] = useState(false)
   const [liveOk, setLiveOk] = useState(false)
+  const [adminTab, setAdminTab] = useState<AdminTab>('attendance')
 
   useEffect(() => {
     if (!supabaseConfigured) return
@@ -138,7 +171,7 @@ export default function App() {
 
   async function load(showLoading = true) {
     if (!supabaseConfigured) {
-      if (showLoading) note('Supabase is not configured.')
+      if (showLoading) note('')
       return
     }
     if (showLoading) note('Loading...')
@@ -188,7 +221,11 @@ export default function App() {
         if (Array.isArray(data.attendance_today)) {
           setAttendance(data.attendance_today as AttendanceRow[])
         }
-        setLiveOk(true)
+        const kioskCameraName = KIOSK_CHANNEL === 'A' ? 'cam_a' : 'cam_b'
+        const kioskCamera = Array.isArray(data.cameras)
+          ? data.cameras.find((camera: { name?: string }) => camera.name === kioskCameraName)
+          : null
+        setLiveOk(Boolean(kioskCamera?.live))
       } catch {
         if (alive) setLiveOk(false)
       }
@@ -277,7 +314,30 @@ export default function App() {
   }
 
   if (screen === 'registration') {
-    return <PersonRegistration streamUrl={STREAM_URL} onBack={() => setScreen('admin')} />
+    return (
+      <PersonRegistration
+        streamUrl={STREAM_URL}
+        initialPerson={registrationPerson}
+        onBack={() => setScreen('employees')}
+      />
+    )
+  }
+
+  if (screen === 'employees') {
+    return (
+      <EmployeeManagement
+        streamUrl={STREAM_URL}
+        onBack={() => setScreen('admin')}
+        onRegister={() => {
+          setRegistrationPerson(null)
+          setScreen('registration')
+        }}
+        onReplace={(person) => {
+          setRegistrationPerson(person)
+          setScreen('registration')
+        }}
+      />
+    )
   }
 
   if (screen === 'kiosk') {
@@ -294,73 +354,85 @@ export default function App() {
     )
   }
 
+  const canManage = Boolean(user || !supabaseConfigured)
+  const inRoomCount = room.filter((item) => item.in_room).length
+
   return (
-    <div className="app">
-      <header className="app-header">
-        <div>
-          <h1>Attendance &amp; Room Status</h1>
-          <p>Face check-in once per person per day, live room presence per Global ID.</p>
-        </div>
+    <div className="app admin-app">
+      <header className="app-header admin-header">
+        <Brand section="Bảng điều hành chấm công theo thời gian thực" />
         <div className="app-header-actions">
-          {(user || !supabaseConfigured) && (
-            <button type="button" className="header-action" onClick={() => setScreen('registration')}>
-              Đăng ký nhân viên
+          {canManage && (
+            <button type="button" className="header-action" onClick={() => setScreen('employees')}>
+              Nhân viên
             </button>
           )}
-          <button type="button" className="header-action" onClick={() => setScreen('kiosk')}>
+          <button type="button" className="header-action header-action-primary" onClick={() => setScreen('kiosk')}>
             Màn hình điểm danh
           </button>
         </div>
       </header>
 
-      <div className="toolbar">
-        <label>
-          Date:{' '}
-          <input type="date" value={day} onChange={(e) => setDay(e.target.value)} />
-        </label>
-        <button onClick={() => load()}>Reload</button>
-        <span className="spacer">
-          {user ? (
+      <section className="admin-controls" aria-label="Bộ lọc và tài khoản">
+        <div className="date-control">
+          <label htmlFor="dashboard-date">Ngày làm việc</label>
+          <input id="dashboard-date" type="date" value={day} onChange={(e) => setDay(e.target.value)} />
+          <button type="button" onClick={() => load()} aria-label="Làm mới dữ liệu">Làm mới</button>
+        </div>
+        <div className="admin-session">
+          {!supabaseConfigured ? (
+            <span className="mode-indicator"><i /> Chế độ dữ liệu cục bộ</span>
+          ) : user ? (
             <span className="user-chip">
-              {user} <button className="ghost" onClick={() => supabase.auth.signOut()}>Sign out</button>
+              {user} <button className="ghost" onClick={() => supabase.auth.signOut()}>Đăng xuất</button>
             </span>
           ) : (
             <form onSubmit={login} className="login-form">
-              <input type="email" placeholder="admin email" value={email} onChange={(e) => setEmail(e.target.value)} />
-              <input type="password" placeholder="password" value={password} onChange={(e) => setPassword(e.target.value)} />
-              <button type="submit">Login</button>
+              <input type="email" aria-label="Email quản trị" placeholder="Email quản trị" value={email} onChange={(e) => setEmail(e.target.value)} />
+              <input type="password" aria-label="Mật khẩu" placeholder="Mật khẩu" value={password} onChange={(e) => setPassword(e.target.value)} />
+              <button type="submit">Đăng nhập</button>
             </form>
           )}
-        </span>
-      </div>
-      <p className={`status-msg${isError ? ' error' : ''}`}>{msg}</p>
+        </div>
+      </section>
+      {msg && <p className={`status-msg${isError ? ' error' : ''}`}>{msg}</p>}
 
-      <section className="card">
-        <h2>Live cameras {liveOk && <span className="badge badge-working">LIVE</span>}</h2>
+      <section className="overview-strip" aria-label="Tổng quan hệ thống">
+        <div><span>Kết nối camera</span><strong className={liveOk ? 'metric-ok' : 'metric-error'}>{liveOk ? 'Trực tuyến' : 'Ngoại tuyến'}</strong></div>
+        <div><span>Đang theo dõi</span><strong>{livePeople.length}</strong></div>
+        <div><span>Đã điểm danh</span><strong>{attendance.filter((item) => item.attended).length}</strong></div>
+        <div><span>Trong phòng</span><strong>{inRoomCount}</strong></div>
+        <div><span>Chờ đồng bộ</span><strong className={pendingAttendance.length ? 'metric-warning' : ''}>{pendingAttendance.length}</strong></div>
+      </section>
+
+      <section className="camera-workspace">
+        <div className="section-heading">
+          <div><h2>Camera trực tiếp</h2><p>Quan sát nhận diện và Global ID trên hai khu vực</p></div>
+          <span className={`camera-state ${liveOk ? 'online' : 'offline'}`}><i />{liveOk ? 'LIVE' : 'OFFLINE'}</span>
+        </div>
         {!STREAM_URL || !liveOk ? (
-          <p className="footnote">
-            Stream offline — start the pipeline on the camera PC
-            (<code>python scripts\run_workstate.py</code>, default port 8765)
-            and set <code>VITE_STREAM_URL</code> if the dashboard runs elsewhere.
-          </p>
+          <div className="stream-empty">
+            <strong>Chưa nhận được tín hiệu camera</strong>
+            <span>Pipeline sẽ tự kết nối lại. Kiểm tra cổng 8765 nếu trạng thái này kéo dài.</span>
+          </div>
         ) : (
           <>
             <div className="live-grid">
               <figure>
-                <img src={`${STREAM_URL}/cam_a.mjpg`} alt="Channel A live" />
-                <figcaption>Channel A — room (YOLO + Global ID overlay)</figcaption>
+                <img src={`${STREAM_URL}/cam_a.mjpg`} alt="Camera A trực tiếp" />
+                <figcaption><strong>Camera A</strong><span>Phòng làm việc · YOLO + Global ID</span></figcaption>
               </figure>
               <figure>
-                <img src={`${STREAM_URL}/cam_b.mjpg`} alt="Channel B live" />
-                <figcaption>Channel B — door + face check-in</figcaption>
+                <img src={`${STREAM_URL}/cam_b.mjpg`} alt="Camera B trực tiếp" />
+                <figcaption><strong>Camera B</strong><span>Cửa ra vào · Xác thực khuôn mặt</span></figcaption>
               </figure>
             </div>
-            <div className="live-chips">
-              {livePeople.length === 0 && <span className="footnote">No one tracked right now.</span>}
-              {livePeople.map((p) => (
-                <span key={p.gid} className="live-chip">
-                  G{p.gid}{p.name ? ` · ${p.name}` : ''}{' '}
-                  <span className={labelClass(p.label)}>{displayLabel(p.label)}</span>
+            <div className="live-chips" aria-label="Người đang được theo dõi">
+              {livePeople.length === 0 && <span className="footnote">Chưa phát hiện người trong khung hình.</span>}
+              {livePeople.map((person) => (
+                <span key={person.gid} className="live-chip">
+                  <strong>G{person.gid}</strong>{person.name ? ` · ${person.name}` : ''}
+                  <span className={labelClass(person.label)}>{labelText(person.label, Boolean(person.person_id || person.name))}</span>
                 </span>
               ))}
             </div>
@@ -368,167 +440,94 @@ export default function App() {
         )}
       </section>
 
-      <section className="card">
-        <h2>Attendance ({attendance.length})</h2>
-        {pendingAttendance.length > 0 && (
-          <div className="pending-attendance">
-            <p>
-              Pending local attendance: {pendingAttendance.length}
-              {' '}
-              <button onClick={sendPendingAttendance} disabled={sendingAttendance}>
-                {sendingAttendance ? 'Sending...' : 'Send to Supabase'}
-              </button>
-            </p>
-            <ul>
-              {pendingAttendance.map((r) => (
-                <li key={r.date + '-' + r.person_id}>
-                  G{r.global_id} — {r.person_name} — score {r.face_score.toFixed(2)}
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
-        <table>
-          <thead>
-            <tr>
-              <th><input type="checkbox" aria-label="Select all attendance"
-                checked={attendance.length > 0 && selAttend.length === attendance.length}
-                onChange={(e) => setSelAttend(e.target.checked ? attendance.map((r) => r.person_id) : [])} /></th>
-              <th>Person</th><th>GID</th><th>Check-in</th><th>Score</th><th>Present</th><th>Admin</th>
-            </tr>
-          </thead>
-          <tbody>
-            {attendance.length === 0 && (
-              <tr className="empty-row"><td colSpan={7}>No records for this date.</td></tr>
-            )}
-            {attendance.map((r) => (
-              <tr key={r.person_id}>
-                <td><input type="checkbox" aria-label={`Select ${r.person_id}`}
-                  checked={selAttend.includes(r.person_id)}
-                  onChange={() => toggleSel(selAttend, setSelAttend, r.person_id)} /></td>
-                <td>{r.person_name}</td>
-                <td>{r.global_id ?? '—'}</td>
-                <td>{r.check_in_at ?? '—'}</td>
-                <td>{r.face_score?.toFixed(2) ?? '—'}</td>
-                <td className={r.attended ? 'pill-yes' : 'pill-no'}>{r.attended ? 'Yes' : 'No'}</td>
-                <td><button onClick={() => toggleAttend(r)}>Toggle</button></td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </section>
+      <nav className="admin-tabs" aria-label="Dữ liệu quản trị">
+        {([
+          ['attendance', 'Điểm danh', attendance.length],
+          ['room', 'Trạng thái phòng', room.length],
+          ['events', 'Nhật ký di chuyển', events.length],
+          ['maintenance', 'Vận hành', null],
+        ] as [AdminTab, string, number | null][]).map(([tab, label, count]) => (
+          <button key={tab} type="button" className={adminTab === tab ? 'active' : ''} onClick={() => setAdminTab(tab)}>
+            {label}{count !== null && <span>{count}</span>}
+          </button>
+        ))}
+      </nav>
 
-      <section className="card">
-        <h2>Room status ({room.length})</h2>
-        <table>
-          <thead>
-            <tr>
-              <th><input type="checkbox" aria-label="Select all room rows"
-                checked={room.length > 0 && selRoom.length === room.length}
-                onChange={(e) => setSelRoom(e.target.checked ? room.map((r) => r.global_id) : [])} /></th>
-              <th>GID</th><th>Name</th><th>Status</th><th>In room</th><th>Left at</th><th>Entered at</th><th>Admin</th>
-            </tr>
-          </thead>
-          <tbody>
-            {room.length === 0 && (
-              <tr className="empty-row"><td colSpan={8}>No records for this date.</td></tr>
-            )}
-            {room.map((r) => (
-              <tr key={r.global_id}>
-                <td><input type="checkbox" aria-label={`Select G${r.global_id}`}
-                  checked={selRoom.includes(r.global_id)}
-                  onChange={() => toggleSel(selRoom, setSelRoom, r.global_id)} /></td>
-                <td>G{r.global_id}</td>
-                <td>{r.person_name ?? '—'}</td>
-                <td><span className={labelClass(r.label)}>{displayLabel(r.label)}</span></td>
-                <td className={r.in_room ? 'pill-yes' : 'pill-no'}>{r.in_room ? 'Yes' : 'No'}</td>
-                <td>{r.last_leave_at ?? '—'}</td>
-                <td>{r.last_enter_at ?? '—'}</td>
-                <td><button onClick={() => toggleInRoom(r)}>Toggle</button></td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        <p className="footnote">
-          Pipeline ticks attendance once per person per day and flips in-room at most once per hour.
-          Manual admin edits go through RLS (role = admin in the roles table).
-        </p>
-      </section>
-
-      <section className="card">
-        <h2>Room events ({events.length}, latest 100)</h2>
-        <table>
-          <thead>
-            <tr>
-              <th><input type="checkbox" aria-label="Select all events"
-                checked={events.length > 0 && selEvents.length === events.length}
-                onChange={(e) => setSelEvents(e.target.checked ? events.map((r) => r.id) : [])} /></th>
-              <th>At</th><th>GID</th><th>Person</th><th>Event</th><th>Ch</th>
-            </tr>
-          </thead>
-          <tbody>
-            {events.length === 0 && (
-              <tr className="empty-row"><td colSpan={6}>No events for this date.</td></tr>
-            )}
-            {events.map((r) => (
-              <tr key={r.id}>
-                <td><input type="checkbox" aria-label={`Select event ${r.id}`}
-                  checked={selEvents.includes(r.id)}
-                  onChange={() => toggleSel(selEvents, setSelEvents, r.id)} /></td>
-                <td>{r.at}</td>
-                <td>G{r.global_id}</td>
-                <td>{r.person_id ?? '—'}</td>
-                <td>{r.event}</td>
-                <td>{r.channel}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </section>
-
-      {user && <PipelineControl />}
-
-      {user && (
-        <section className="card danger">
-          <h2>History management (admin, demo reset)</h2>
-          <p className="footnote">
-            Selected: {selAttend.length} attendance · {selRoom.length} room · {selEvents.length} events.
-            Delete-all scopes for {day}:{' '}
-            {(['attendance', 'room', 'events', 'faces'] as DeleteScope[]).map((s) => (
-              <label key={s} className="scope-check">
-                <input type="checkbox" checked={scopes.includes(s)} onChange={() => toggleScope(s)} /> {s}
-              </label>
-            ))}
-          </p>
-          <div className="danger-row">
-            <button className="danger-btn" disabled={selectedCount === 0 || deleting}
-              onClick={() => setPendingDelete('selected')}>
-              Delete selected ({selectedCount})
-            </button>
-            <button className="danger-btn" disabled={scopes.length === 0 || deleting}
-              onClick={() => setPendingDelete('all')}>
-              Delete all for {day}
-            </button>
-          </div>
-          {pendingDelete && (
-            <div className="warn-box">
-              <strong>Warning: this permanently deletes{' '}
-                {pendingDelete === 'all'
-                  ? `ALL ${scopes.join(', ')} history for ${day}`
-                  : `${selectedCount} selected record(s)`}.</strong>
-              <span> Face-crop files in Storage are removed too. This cannot be undone.</span>
-              <div className="danger-row">
-                <button className="danger-btn" disabled={deleting} onClick={confirmDelete}>
-                  {deleting ? 'Deleting...' : 'Yes, delete permanently'}
-                </button>
-                <button className="ghost" disabled={deleting} onClick={() => setPendingDelete(null)}>
-                  Cancel
-                </button>
+      <main className="admin-panel">
+        {adminTab === 'attendance' && (
+          <section aria-labelledby="attendance-title">
+            <div className="section-heading"><div><h2 id="attendance-title">Danh sách điểm danh</h2><p>Dữ liệu theo ngày đã chọn</p></div></div>
+            {pendingAttendance.length > 0 && (
+              <div className="sync-notice">
+                <div><strong>{pendingAttendance.length} bản ghi chờ đồng bộ</strong><span>Dữ liệu đã được lưu an toàn trên máy này.</span></div>
+                <button onClick={sendPendingAttendance} disabled={sendingAttendance}>{sendingAttendance ? 'Đang gửi...' : 'Gửi lên Supabase'}</button>
               </div>
-            </div>
-          )}
-        </section>
-      )}
+            )}
+            <div className="table-scroll"><table>
+              <thead><tr>
+                <th><input type="checkbox" aria-label="Chọn tất cả bản ghi điểm danh" checked={attendance.length > 0 && selAttend.length === attendance.length} onChange={(e) => setSelAttend(e.target.checked ? attendance.map((row) => row.person_id) : [])} /></th>
+                <th>Nhân viên</th><th>Global ID</th><th>Thời gian vào</th><th>Độ tin cậy</th><th>Kết quả</th>{user && <th>Thao tác</th>}
+              </tr></thead>
+              <tbody>
+                {attendance.length === 0 && <tr className="empty-row"><td colSpan={user ? 7 : 6}>Chưa có bản ghi trong ngày này.</td></tr>}
+                {attendance.map((row) => <tr key={row.person_id}>
+                  <td><input type="checkbox" aria-label={`Chọn ${row.person_name}`} checked={selAttend.includes(row.person_id)} onChange={() => toggleSel(selAttend, setSelAttend, row.person_id)} /></td>
+                  <td><strong>{row.person_name}</strong><small>{row.person_id}</small></td><td>G{row.global_id ?? '—'}</td><td>{formatDateTime(row.check_in_at)}</td><td>{row.face_score?.toFixed(2) ?? '—'}</td>
+                  <td><span className={row.attended ? 'status-pill success' : 'status-pill muted'}>{row.attended ? 'Có mặt' : 'Vắng'}</span></td>
+                  {user && <td><button className="table-action" onClick={() => toggleAttend(row)}>{row.attended ? 'Đánh dấu vắng' : 'Đánh dấu có mặt'}</button></td>}
+                </tr>)}
+              </tbody>
+            </table></div>
+          </section>
+        )}
+
+        {adminTab === 'room' && (
+          <section aria-labelledby="room-title">
+            <div className="section-heading"><div><h2 id="room-title">Trạng thái phòng</h2><p>Vị trí gần nhất của nhân viên trong ngày</p></div></div>
+            <div className="table-scroll"><table><thead><tr>
+              <th><input type="checkbox" aria-label="Chọn tất cả trạng thái" checked={room.length > 0 && selRoom.length === room.length} onChange={(e) => setSelRoom(e.target.checked ? room.map((row) => row.global_id) : [])} /></th>
+              <th>Global ID</th><th>Nhân viên</th><th>Trạng thái</th><th>Trong phòng</th><th>Vào lúc</th><th>Rời lúc</th>{user && <th>Thao tác</th>}
+            </tr></thead><tbody>
+              {room.length === 0 && <tr className="empty-row"><td colSpan={user ? 8 : 7}>Chưa có dữ liệu trạng thái trong ngày này.</td></tr>}
+              {room.map((row) => <tr key={row.global_id}>
+                <td><input type="checkbox" aria-label={`Chọn G${row.global_id}`} checked={selRoom.includes(row.global_id)} onChange={() => toggleSel(selRoom, setSelRoom, row.global_id)} /></td>
+                <td>G{row.global_id}</td><td><strong>{row.person_name ?? 'Chưa xác định'}</strong><small>{row.person_id ?? '—'}</small></td><td><span className={labelClass(row.label)}>{labelText(row.label, Boolean(row.person_id || row.person_name))}</span></td>
+                <td><span className={row.in_room ? 'status-pill success' : 'status-pill muted'}>{row.in_room ? 'Có' : 'Không'}</span></td><td>{formatDateTime(row.last_enter_at)}</td><td>{formatDateTime(row.last_leave_at)}</td>
+                {user && <td><button className="table-action" onClick={() => toggleInRoom(row)}>Cập nhật</button></td>}
+              </tr>)}
+            </tbody></table></div>
+          </section>
+        )}
+
+        {adminTab === 'events' && (
+          <section aria-labelledby="events-title">
+            <div className="section-heading"><div><h2 id="events-title">Nhật ký di chuyển</h2><p>Tối đa 100 sự kiện gần nhất trong ngày</p></div></div>
+            <div className="table-scroll"><table><thead><tr>
+              <th><input type="checkbox" aria-label="Chọn tất cả sự kiện" checked={events.length > 0 && selEvents.length === events.length} onChange={(e) => setSelEvents(e.target.checked ? events.map((row) => row.id) : [])} /></th>
+              <th>Thời gian</th><th>Global ID</th><th>Mã nhân viên</th><th>Sự kiện</th><th>Camera</th>
+            </tr></thead><tbody>
+              {events.length === 0 && <tr className="empty-row"><td colSpan={6}>Chưa có sự kiện trong ngày này.</td></tr>}
+              {events.map((row) => <tr key={row.id}>
+                <td><input type="checkbox" aria-label={`Chọn sự kiện ${row.id}`} checked={selEvents.includes(row.id)} onChange={() => toggleSel(selEvents, setSelEvents, row.id)} /></td>
+                <td>{formatDateTime(row.at)}</td><td>G{row.global_id}</td><td>{row.person_id ?? '—'}</td><td><span className="status-pill info">{row.event}</span></td><td>{row.channel}</td>
+              </tr>)}
+            </tbody></table></div>
+          </section>
+        )}
+
+        {adminTab === 'maintenance' && (
+          <section className="maintenance-panel" aria-labelledby="maintenance-title">
+            <div className="section-heading"><div><h2 id="maintenance-title">Vận hành hệ thống</h2><p>Kiểm soát pipeline và dữ liệu quản trị</p></div></div>
+            {canManage && <PipelineControl />}
+            {user && <div className="danger-zone">
+              <h3>Xóa lịch sử</h3><p>Chọn phạm vi dữ liệu cần xóa cho ngày {day}. Thao tác này không thể hoàn tác.</p>
+              <div className="scope-list">{(['attendance', 'room', 'events', 'faces'] as DeleteScope[]).map((scope) => <label key={scope}><input type="checkbox" checked={scopes.includes(scope)} onChange={() => toggleScope(scope)} /> {scope}</label>)}</div>
+              <div className="danger-row"><button className="danger-btn" disabled={selectedCount === 0 || deleting} onClick={() => setPendingDelete('selected')}>Xóa {selectedCount} mục đã chọn</button><button className="danger-btn" disabled={scopes.length === 0 || deleting} onClick={() => setPendingDelete('all')}>Xóa dữ liệu ngày này</button></div>
+              {pendingDelete && <div className="warn-box"><strong>Xác nhận xóa vĩnh viễn {pendingDelete === 'all' ? `dữ liệu ${scopes.join(', ')}` : `${selectedCount} mục đã chọn`}.</strong><div className="danger-row"><button className="danger-btn" disabled={deleting} onClick={confirmDelete}>{deleting ? 'Đang xóa...' : 'Xác nhận xóa'}</button><button className="ghost" disabled={deleting} onClick={() => setPendingDelete(null)}>Hủy</button></div></div>}
+            </div>}
+          </section>
+        )}
+      </main>
     </div>
   )
 }

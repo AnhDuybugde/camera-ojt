@@ -81,6 +81,10 @@ class GlobalIdentityConfig:
     min_appearance_similarity: float = 0.30
     # Strong evidence for merging two simultaneously active cross-camera IDs.
     active_duplicate_similarity: float = 0.60
+    # A person cannot transition between non-overlapping camera views in the
+    # same instant. This also prevents sequential A/B updates in one loop from
+    # assigning two visible people to the same Global ID.
+    cross_channel_min_transition_s: float = 1.0
     # Lifecycle windows (seconds when timestamps are given, else steps).
     temp_lost_s: float = 5.0
     long_lost_s: float = 60.0
@@ -259,6 +263,12 @@ class GlobalIdentityManager:
         record = self._identities.get(global_id)
         return record.employee_id if record is not None else None
 
+    def unbind_employee(self, employee_id: str) -> None:
+        """Remove a deleted enrollment from all live session identities."""
+        for record in self._identities.values():
+            if record.employee_id == employee_id:
+                record.employee_id = None
+
     def merge_identity(self, duplicate_gid: int, canonical_gid: int) -> bool:
         """Redirect a duplicate Global ID into an older canonical ID."""
         if duplicate_gid == canonical_gid:
@@ -312,6 +322,15 @@ class GlobalIdentityManager:
                 if (
                     left.channel == right.channel
                     and not _same_camera_duplicate(left, right)
+                ):
+                    continue
+                # Body ReID alone is not reliable enough to collapse two
+                # people visible on different cameras at the same time.
+                # Cross-camera active identities may merge only after both
+                # faces independently resolve to the same employee.
+                if left.channel != right.channel and not (
+                    left.employee_id
+                    and left.employee_id == right.employee_id
                 ):
                     continue
                 if (
@@ -396,6 +415,13 @@ class GlobalIdentityManager:
             return None  # Gating: looks like a different person.
 
         same_channel = channel == record.channel
+        if (
+            not same_channel
+            and record.state in (IdentityState.ACTIVE, IdentityState.TEMP_LOST)
+            and self._missing_amount(record, now_s)
+            < cfg.cross_channel_min_transition_s
+        ):
+            return None  # simultaneous views need independent IDs/face proof.
         distance = _normalized_distance(bbox, record, frame_shape)
         if same_channel and distance is not None and distance > cfg.max_center_distance_ratio:
             return None  # Gating: same camera, implausible jump.

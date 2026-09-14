@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import Brand from './Brand'
 
 export type KioskPerson = {
   gid: number
@@ -162,13 +163,7 @@ export default function KioskCheckIn({
   return (
     <main className="kiosk" data-state={state}>
       <header className="kiosk-header">
-        <div className="kiosk-brand">
-          <span className="brand-mark">FPT</span>
-          <div>
-            <strong>Hệ thống chấm công</strong>
-            <span>FPT University</span>
-          </div>
-        </div>
+        <Brand section="Nhận diện và chấm công" />
         <div className="kiosk-header-actions">
           <span className={`connection-state${liveOk ? ' online' : ''}`}>
             <i />{liveOk ? 'Camera trực tuyến' : 'Mất kết nối'}
@@ -190,7 +185,9 @@ export default function KioskCheckIn({
               <strong>Camera nhận diện</strong>
               <span>Channel {cameraChannel} · Camera chấm công</span>
             </div>
-            <span className="camera-mode">LIVE</span>
+            <span className={`camera-mode${liveOk ? '' : ' offline'}`}>
+              {liveOk ? 'LIVE' : 'OFFLINE'}
+            </span>
           </div>
           <div className="camera-viewport">
             <img

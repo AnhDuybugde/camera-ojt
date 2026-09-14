@@ -74,6 +74,25 @@ class GlobalIdentityTest(TestCase):
         self.assertEqual(refreshed[0].global_person_id, 1)
         self.assertEqual(refreshed[0].employee_id, "employee_123")
 
+    def test_unbind_employee_clears_all_live_identity_metadata(self) -> None:
+        manager = make_manager(min_appearance_similarity=1.1)
+        frame = make_frame()
+        first = manager.update(
+            channel="A", frame=frame,
+            tracks=[raw_track(10, BoundingBox(20, 40, 120, 160))], now_s=0.0,
+        )
+        second = manager.update(
+            channel="B", frame=frame,
+            tracks=[raw_track(20, BoundingBox(260, 40, 360, 160))], now_s=0.1,
+        )
+        manager.bind_employee(first[0].global_person_id, "employee_123")
+        manager.bind_employee(second[0].global_person_id, "employee_123")
+
+        manager.unbind_employee("employee_123")
+
+        self.assertIsNone(manager.employee_id_of(first[0].global_person_id))
+        self.assertIsNone(manager.employee_id_of(second[0].global_person_id))
+
     def test_merge_identity_redirects_duplicate_tracklets(self) -> None:
         manager = make_manager()
         frame = make_frame()
@@ -98,7 +117,7 @@ class GlobalIdentityTest(TestCase):
         )
         assert rebound[0].global_person_id == first[0].global_person_id
 
-    def test_active_cross_channel_duplicates_are_reconciled(self) -> None:
+    def test_active_cross_channel_duplicates_need_face_confirmation(self) -> None:
         manager = make_manager(
             min_appearance_similarity=1.1,
             active_duplicate_similarity=0.8,
@@ -112,9 +131,29 @@ class GlobalIdentityTest(TestCase):
             channel="B", frame=frame,
             tracks=[raw_track(20, BoundingBox(20, 40, 120, 160))], now_s=0.1,
         )
+        assert manager.reconcile_active_duplicates() == {}
+        assert set(manager.identities) == {1, 2}
+
+        manager.bind_employee(1, "employee_123")
+        manager.bind_employee(2, "employee_123")
         aliases = manager.reconcile_active_duplicates()
         assert aliases == {2: 1}
         assert set(manager.identities) == {1}
+
+    def test_simultaneous_cross_channel_people_get_distinct_ids(self) -> None:
+        manager = make_manager(min_appearance_similarity=0.0)
+        frame = make_frame()
+        first = manager.update(
+            channel="A", frame=frame,
+            tracks=[raw_track(10, BoundingBox(20, 40, 120, 160))], now_s=10.0,
+        )
+        second = manager.update(
+            channel="B", frame=frame,
+            tracks=[raw_track(20, BoundingBox(20, 40, 120, 160))], now_s=10.0,
+        )
+
+        assert first[0].global_person_id == 1
+        assert second[0].global_person_id == 2
 
     def test_active_same_camera_nested_duplicates_are_reconciled(self) -> None:
         manager = make_manager(
