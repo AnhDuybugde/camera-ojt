@@ -107,6 +107,7 @@ def draw_global_labels(
 
     - Chi hien Global ID (track.track_id da la global id tu manager).
     - Ten chi hien khi da tick diem danh (caller truyen vao).
+    - Khong co mat (chua face-match) -> hien "(Unknown)", khong doan.
     - Label ASCII (Working/Away/Out of office/Returning/Unknown) vi
       font Hershey cua OpenCV khong ve duoc tieng Viet co dau.
     - Khong hien ByteTrack raw ID (current ID) bao gio.
@@ -127,6 +128,8 @@ def draw_global_labels(
             # question marks in the live overlay.
             identity = f"ID {employee_id} - {name}" if employee_id else str(name)
             parts.append(f"({identity})")
+        else:
+            parts.append("(Unknown)")
         if label:
             parts.append(str(label))
         text = " | ".join(parts)

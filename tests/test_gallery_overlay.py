@@ -1,4 +1,6 @@
 """Test gallery load tu data/images + overlay chi hien Global ID."""
+import json
+
 import numpy as np
 
 from camera_tracking.face.gallery import load_gallery
@@ -44,6 +46,50 @@ def test_load_gallery_maps_filename_to_employee_id(tmp_path) -> None:
     assert gallery.people[0].employee_id == "1"
 
 
+def test_load_gallery_reads_registration_metadata(tmp_path) -> None:
+    image_path = tmp_path / "NV001.jpg"
+    image_path.write_bytes(b"fake")
+    (tmp_path / "registry.json").write_text(json.dumps({
+        "NV001": {
+            "display_name": "Nguyen Van A",
+            "employee_id": "NV001",
+        }
+    }), encoding="utf-8")
+
+    gallery = load_gallery(tmp_path, _StubEmbedder())
+
+    assert len(gallery) == 1
+    assert gallery.people[0].display_name == "Nguyen Van A"
+    assert gallery.people[0].employee_id == "NV001"
+
+
+def test_load_gallery_folder_per_person_multi_image(tmp_path) -> None:
+    pytest_cv2 = pytest_import_cv2()
+    if pytest_cv2 is None:
+        return
+    person_dir = tmp_path / "NV002"
+    person_dir.mkdir()
+    img = np.full((40, 40, 3), 128, dtype=np.uint8)
+    pytest_cv2.imwrite(str(person_dir / "front.jpg"), img)
+    pytest_cv2.imwrite(str(person_dir / "left.jpg"), img)
+    gallery = load_gallery(tmp_path, _StubEmbedder())
+    assert len(gallery) == 1
+    assert gallery.people[0].person_id == "NV002"
+    assert gallery.people[0].embedding is not None
+
+
+def test_save_prototype_never_overwrites(tmp_path) -> None:
+    import numpy as np
+
+    from camera_tracking.face.gallery import save_prototype
+
+    vec = np.ones(8, dtype=np.float32)
+    first = save_prototype(tmp_path, "NV003", vec, index=0)
+    second = save_prototype(tmp_path, "NV003", vec, index=0)
+    assert first != second
+    assert first.is_file() and second.is_file()
+
+
 def pytest_import_cv2():
     try:
         import cv2
@@ -68,6 +114,27 @@ def test_draw_global_labels_hides_raw_ids() -> None:
                                  display_name="An")}
     out = draw_global_labels(frame, tracks, status, {5: "An"}, {5: "1"})
     assert out.shape == frame.shape  # khong crash; raw ByteTrack id khong duoc ve
+
+
+def test_draw_global_labels_marks_unknown_without_face() -> None:
+    pytest_cv2 = pytest_import_cv2()
+    if pytest_cv2 is None:
+        return
+    from camera_tracking.domain import BoundingBox, Track
+    from camera_tracking.visualization import draw_global_labels
+    from camera_tracking.workstate.room_fusion import RoomPersonStatus
+
+    frame = np.zeros((100, 200, 3), dtype=np.uint8)
+    tracks = [Track(track_id=7, bbox=BoundingBox(10, 10, 50, 80),
+                    confidence=0.9, age=1, hits=1, confirmed=True)]
+    status = {7: RoomPersonStatus(global_id=7, label="Working", in_room=True,
+                                  display_name=None)}
+    # Khong mat -> khong ten: van ve "(Unknown)" thay vi de trong.
+    named = draw_global_labels(frame.copy(), tracks, status, {7: "An"}, {7: "1"})
+    unnamed = draw_global_labels(frame.copy(), tracks, status, {}, {})
+    assert unnamed.shape == frame.shape
+    assert bool((unnamed != frame).any())
+    assert bool((named != unnamed).any())
 
 
 def test_status_colors_by_label() -> None:

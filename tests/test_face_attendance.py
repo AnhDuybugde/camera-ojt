@@ -71,3 +71,14 @@ def test_matcher_threshold() -> None:
     assert matched.is_known and matched.person is not None and matched.person.person_id == "An"
     strict = FaceMatcher(gallery, threshold=1.01)
     assert strict.match(query).is_known is False
+
+
+def test_prune_drops_dead_gid_best_and_expired_window() -> None:
+    svc = FaceAttendanceService(debounce_hits=2, window_s=5.0)
+    day = "2026-09-12"
+    svc.observe(day=day, global_id=9, person_id="An", display_name="An",
+                score=0.8, now_s=0.0, wall_time_iso=f"{day}T08:00:00")
+    assert 9 in svc._pending_best
+    svc.prune(now_s=100.0, alive_global_ids=set())
+    assert 9 not in svc._pending_best
+    assert len(svc._windows["An"]) == 0

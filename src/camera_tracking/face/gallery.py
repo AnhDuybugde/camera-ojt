@@ -1,6 +1,7 @@
 """Enroll gallery tu thu muc `data/images/`."""
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -9,6 +10,8 @@ import numpy as np
 from camera_tracking.face.embeddings import FaceEmbedder, cosine_similarity
 
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+_REGISTRY_FILE = "registry.json"
+_PROTOTYPES_DIR = ".prototypes"
 
 
 @dataclass(slots=True)
@@ -18,6 +21,7 @@ class EnrolledPerson:
     embedding: np.ndarray | None  # None neu chua tinh duoc (van hien ten khi fallback)
     source_path: str = ""
     employee_id: str | None = None
+    prototypes: list[np.ndarray] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -33,18 +37,58 @@ class FaceGallery:
         """Tra (person | None, score). Khong dat nguong -> None."""
         if query is None or not self.people:
             return None, 0.0
-        best: EnrolledPerson | None = None
-        best_score = -1.0
-        for person in self.people:
-            if person.embedding is None:
-                continue
-            score = cosine_similarity(query, person.embedding)
-            if score > best_score:
-                best_score = score
-                best = person
+        ranked = self.ranked_matches(query)
+        if not ranked:
+            return None, 0.0
+        best, best_score = ranked[0]
         if best is None or best_score < threshold:
             return None, max(best_score, 0.0)
         return best, float(best_score)
+
+    def ranked_matches(
+        self, query: np.ndarray | None
+    ) -> list[tuple[EnrolledPerson, float]]:
+        """Rank employees, using their best trusted prototype."""
+        if query is None:
+            return []
+        ranked: list[tuple[EnrolledPerson, float]] = []
+        for person in self.people:
+            samples = ([person.embedding] if person.embedding is not None else [])
+            samples.extend(person.prototypes)
+            if samples:
+                ranked.append(
+                    (person, max(cosine_similarity(query, sample) for sample in samples))
+                )
+        return sorted(ranked, key=lambda item: item[1], reverse=True)
+
+    def add_prototype(
+        self,
+        person_id: str,
+        embedding: np.ndarray,
+        *,
+        seed_similarity: float,
+        min_seed_similarity: float = 0.80,
+        max_prototypes: int = 10,
+        min_distance: float = 0.03,
+    ) -> bool:
+        """Grow a gallery only from a result already anchored to its seed."""
+        if seed_similarity < min_seed_similarity:
+            return False
+        person = next((p for p in self.people if p.person_id == person_id), None)
+        if person is None or person.embedding is None:
+            return False
+        vector = np.asarray(embedding, dtype=np.float32).ravel()
+        norm = float(np.linalg.norm(vector))
+        if norm <= 1e-12:
+            return False
+        vector = vector / norm
+        samples = [person.embedding, *person.prototypes]
+        if any(1.0 - cosine_similarity(vector, sample) < min_distance for sample in samples):
+            return False
+        person.prototypes.append(vector)
+        if len(person.prototypes) > max(0, max_prototypes - 1):
+            person.prototypes.pop(0)
+        return True
 
 
 def _read_image(path: Path) -> np.ndarray | None:
@@ -56,42 +100,178 @@ def _read_image(path: Path) -> np.ndarray | None:
     return img
 
 
+def load_registry(gallery_dir: str | Path) -> dict[str, dict[str, str]]:
+    """Load locally enrolled display metadata without making YAML mutable."""
+    path = Path(gallery_dir) / _REGISTRY_FILE
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    registry: dict[str, dict[str, str]] = {}
+    for person_id, value in payload.items():
+        if not isinstance(person_id, str) or not isinstance(value, dict):
+            continue
+        display_name = value.get("display_name")
+        employee_id = value.get("employee_id")
+        if isinstance(display_name, str) and isinstance(employee_id, str):
+            registry[person_id] = {
+                "display_name": display_name,
+                "employee_id": employee_id,
+            }
+    return registry
+
+
 def load_gallery(
     gallery_dir: str | Path,
     embedder: FaceEmbedder | None,
     name_map: dict[str, str] | None = None,
     employee_map: dict[str, str] | None = None,
 ) -> FaceGallery:
-    """Load one enrolled face per image and optional Employee ID mapping."""
+    """Load enrolled faces with multi-image support.
+
+    Hỗ trợ 2 layout (tương thích ngược):
+    - Legacy: ``data/images/<person_id>.jpg`` (1 ảnh/người).
+    - Thực tế: ``data/images/<person_id>/*.jpg`` (3-5 góc/người).
+      Embedding chính = khuôn mặt nét nhất trong các ảnh; các ảnh còn lại
+      thành prototypes để matching đa góc ngay từ đầu (không chờ live adapt).
+    """
     root = Path(gallery_dir)
     gallery = FaceGallery()
     if not root.is_dir():
         return gallery
-    name_map = name_map or {}
-    employee_map = employee_map or {}
+    registry = load_registry(root)
+    registry_names = {
+        person_id: value["display_name"] for person_id, value in registry.items()
+    }
+    registry_employees = {
+        person_id: value["employee_id"] for person_id, value in registry.items()
+    }
+    name_map = {**registry_names, **(name_map or {})}
+    employee_map = {**registry_employees, **(employee_map or {})}
+    # Gom theo person_id từ cả 2 layout.
+    buckets: dict[str, list[Path]] = {}
     for path in sorted(root.iterdir()):
-        if path.suffix.lower() not in _IMAGE_EXTS or not path.is_file():
+        if not path.is_file() or path.suffix.lower() not in _IMAGE_EXTS:
             continue
-        person_id = path.stem
+        buckets.setdefault(path.stem, []).append(path)
+    for path in sorted((root).glob("*")):
+        if not path.is_dir() or path.name.startswith("."):
+            continue
+        images = sorted(
+            p for p in path.iterdir()
+            if p.is_file() and p.suffix.lower() in _IMAGE_EXTS
+        )
+        if images:
+            buckets.setdefault(path.name, []).extend(images)
+    for person_id in sorted(buckets):
+        paths = buckets[person_id]
         display_name = name_map.get(person_id, person_id)
         employee_id = employee_map.get(person_id)
-        embedding: np.ndarray | None = None
-        if embedder is not None:
-            img = _read_image(path)
-            if img is not None:
-                try:
-                    dets = embedder.detect_embed(img)
-                except RuntimeError:
-                    dets = []  # insightface chua cai -> enroll chay che do ten-only
-                if dets:
-                    embedding = np.asarray(dets[0].embedding, dtype=np.float32)
+        embedding, extra = _embed_best(paths, embedder)
+        prototypes = _load_prototypes(root, person_id)
+        # Ảnh enroll phụ (ngoài ảnh tốt nhất) thành seed prototypes ngay.
+        for vector in extra:
+            _append_seed_prototype(prototypes, vector, max_prototypes=10)
         gallery.people.append(
             EnrolledPerson(
                 person_id=person_id,
                 display_name=display_name,
                 embedding=embedding,
-                source_path=str(path),
+                source_path=str(paths[0]),
                 employee_id=employee_id,
+                prototypes=prototypes,
             )
         )
     return gallery
+
+
+def _embed_best(
+    paths: list[Path], embedder: FaceEmbedder | None
+) -> tuple[np.ndarray | None, list[np.ndarray]]:
+    """Chọn embedding nét nhất làm chính, các góc khác làm seed prototypes."""
+    if embedder is None:
+        return None, []
+    scored: list[tuple[float, np.ndarray]] = []
+    for path in paths:
+        img = _read_image(path)
+        if img is None:
+            continue
+        try:
+            dets = embedder.detect_embed(img)
+        except RuntimeError:
+            dets = []  # insightface chua cai -> enroll chay che do ten-only
+        for det in dets:
+            width = det.bbox[2] - det.bbox[0]
+            height = det.bbox[3] - det.bbox[1]
+            size = min(width, height)
+            if size <= 0:
+                continue
+            scored.append((float(det.score) + min(size, 200.0) / 1000.0,
+                           np.asarray(det.embedding, dtype=np.float32)))
+    if not scored:
+        return None, []
+    scored.sort(key=lambda item: item[0], reverse=True)
+    best = scored[0][1]
+    extra = [vec for _, vec in scored[1:4]]
+    return best, extra
+
+
+def _append_seed_prototype(
+    prototypes: list[np.ndarray], vector: np.ndarray, *, max_prototypes: int = 10
+) -> None:
+    norm = float(np.linalg.norm(vector))
+    if norm <= 1e-12:
+        return
+    vector = np.asarray(vector, dtype=np.float32).ravel() / norm
+    samples = list(prototypes)
+    if any(1.0 - cosine_similarity(vector, s) < 0.03 for s in samples):
+        return
+    prototypes.append(vector)
+    while len(prototypes) > max(0, max_prototypes - 1):
+        prototypes.pop(0)
+
+
+def _load_prototypes(root: Path, person_id: str) -> list[np.ndarray]:
+    prototypes: list[np.ndarray] = []
+    directory = root / _PROTOTYPES_DIR / person_id
+    if not directory.is_dir():
+        return prototypes
+    for path in sorted(directory.glob("*.npy")):
+        try:
+            vector = np.asarray(np.load(path, allow_pickle=False), dtype=np.float32).ravel()
+        except (OSError, ValueError):
+            continue
+        norm = float(np.linalg.norm(vector))
+        if norm > 1e-12:
+            prototypes.append(vector / norm)
+    return prototypes
+
+
+def save_prototype(
+    gallery_dir: str | Path,
+    person_id: str,
+    embedding: np.ndarray,
+    *,
+    index: int,
+) -> Path:
+    """Persist one trusted embedding without storing another raw face image.
+
+    Tên file tăng dần tới slot trống để không ghi đè prototype cũ khi
+    gallery memory đã pop (circular buffer) nhưng file vẫn append-only.
+    """
+    directory = Path(gallery_dir) / _PROTOTYPES_DIR / person_id
+    directory.mkdir(parents=True, exist_ok=True)
+    slot = max(0, int(index))
+    while True:
+        path = directory / f"prototype_{slot:02d}.npy"
+        if not path.exists():
+            break
+        slot += 1
+        if slot > 9999:  #Practically unreachable; guard against infinite loop.
+            break
+    np.save(path, np.asarray(embedding, dtype=np.float32), allow_pickle=False)
+    return path

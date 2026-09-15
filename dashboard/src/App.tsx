@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
-import KioskCheckIn from './KioskCheckIn'
+import KioskCheckIn, { type KioskEvent } from './KioskCheckIn'
+import PersonRegistration from './PersonRegistration'
 import PipelineControl from './PipelineControl'
 import { supabase, supabaseConfigured } from './lib/supabase'
 import {
@@ -93,12 +94,25 @@ function labelClass(label: string): string {
   return 'badge badge-unknown'
 }
 
+const EVENT_VI: Record<string, string> = {
+  CHECK_IN: 'Điểm danh',
+  LEAVE_OFFICE: 'Rời văn phòng',
+  RETURN: 'Quay lại',
+}
+
+function eventClass(event: string): string {
+  if (event === 'CHECK_IN') return 'badge badge-working'
+  if (event === 'LEAVE_OFFICE') return 'badge badge-out'
+  if (event === 'RETURN') return 'badge badge-returning'
+  return 'badge badge-unknown'
+}
+
 function todayISO(): string {
   return new Date().toISOString().slice(0, 10)
 }
 
 export default function App() {
-  const [screen, setScreen] = useState<'kiosk' | 'admin'>('kiosk')
+  const [screen, setScreen] = useState<'kiosk' | 'admin' | 'registration'>('kiosk')
   const [day, setDay] = useState(todayISO())
   const [attendance, setAttendance] = useState<AttendanceRow[]>([])
   const [room, setRoom] = useState<RoomRow[]>([])
@@ -116,6 +130,7 @@ export default function App() {
   const [isError, setIsError] = useState(false)
   const [livePeople, setLivePeople] = useState<LivePerson[]>([])
   const [pendingAttendance, setPendingAttendance] = useState<PendingAttendance[]>([])
+  const [liveEvents, setLiveEvents] = useState<KioskEvent[]>([])
   const [sendingAttendance, setSendingAttendance] = useState(false)
   const [liveOk, setLiveOk] = useState(false)
 
@@ -184,6 +199,9 @@ export default function App() {
         if (!alive) return
         setLivePeople((data.people ?? []) as LivePerson[])
         setPendingAttendance((data.pending_attendance ?? []) as PendingAttendance[])
+        if (Array.isArray(data.recent_events)) {
+          setLiveEvents(data.recent_events as KioskEvent[])
+        }
         if (Array.isArray(data.attendance_today)) {
           setAttendance(data.attendance_today as AttendanceRow[])
         }
@@ -275,6 +293,10 @@ export default function App() {
     }
   }
 
+  if (screen === 'registration') {
+    return <PersonRegistration streamUrl={STREAM_URL} onBack={() => setScreen('admin')} />
+  }
+
   if (screen === 'kiosk') {
     return (
       <KioskCheckIn
@@ -284,6 +306,7 @@ export default function App() {
         people={livePeople}
         attendance={attendance}
         pendingAttendance={pendingAttendance}
+        events={liveEvents}
         onOpenAdmin={() => setScreen('admin')}
       />
     )
@@ -296,9 +319,16 @@ export default function App() {
           <h1>Attendance &amp; Room Status</h1>
           <p>Face check-in once per person per day, live room presence per Global ID.</p>
         </div>
-        <button type="button" className="header-action" onClick={() => setScreen('kiosk')}>
-          Màn hình điểm danh
-        </button>
+        <div className="app-header-actions">
+          {(user || !supabaseConfigured) && (
+            <button type="button" className="header-action" onClick={() => setScreen('registration')}>
+              Đăng ký nhân viên
+            </button>
+          )}
+          <button type="button" className="header-action" onClick={() => setScreen('kiosk')}>
+            Màn hình điểm danh
+          </button>
+        </div>
       </header>
 
       <div className="toolbar">
@@ -347,12 +377,31 @@ export default function App() {
               {livePeople.length === 0 && <span className="footnote">No one tracked right now.</span>}
               {livePeople.map((p) => (
                 <span key={p.gid} className="live-chip">
-                  G{p.gid}{p.name ? ` · ${p.name}` : ''}{' '}
+                  G{p.gid}{p.name ? ` · ${p.name}` : ' · Unknown'}{' '}
                   <span className={labelClass(p.label)}>{displayLabel(p.label)}</span>
                 </span>
               ))}
             </div>
           </>
+        )}
+      </section>
+
+      <section className="card">
+        <h2>Sự kiện trực tiếp {liveOk && <span className="badge badge-working">LIVE</span>}</h2>
+        {!liveOk ? (
+          <p className="footnote">Pipeline offline — sự kiện mới sẽ hiện tại đây khi camera chạy lại.</p>
+        ) : liveEvents.length === 0 ? (
+          <p className="footnote">Chưa có sự kiện nào trong phiên chạy này.</p>
+        ) : (
+          <ul className="live-events">
+            {liveEvents.slice().reverse().map((e, i) => (
+              <li key={`${e.at ?? ''}-${e.global_id ?? ''}-${e.event}-${i}`}>
+                <span className={eventClass(e.event)}>{EVENT_VI[e.event] ?? e.event}</span>
+                <strong>{e.person_name ?? `G${e.global_id ?? '?'}`}</strong>
+                <span className="footnote">Cam {e.channel ?? '?'} · {e.at ?? '—'}</span>
+              </li>
+            ))}
+          </ul>
         )}
       </section>
 

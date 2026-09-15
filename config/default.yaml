@@ -7,26 +7,34 @@ camera:
   process_every_n_frames: 2
 
 detection:
-  # auto = cuda neu co GPU, khong thi mps, khong thi cpu.
-  # YOLO26s @ 800px was benchmarked on RTX 3050 6 GB for this two-camera view.
-  model_path: yolo26s.pt
-  # Recall-first (chong nhap nhay khi che): giu box yeu de ByteTrack +
-  # GlobalID noi lai. Danh doi: ghost ID tang, can loc bang min-area.
+  # Thuần GPU: cuda bắt buộc. TensorRT FP16 dynamic batch
+  # (build tu yolo26s.pt, TRT 10.9, sm_89). ~185 frame/s vs ~50 cua .pt.
+  # Rebuild khi doi GPU/model:
+  # yolo export model=yolo26s.pt format=engine half=True imgsz=640 device=0 dynamic=True batch=16
+  # Nếu thiếu .engine / TRT sẽ tự fallback .pt (vẫn cuda) + cảnh báo.
+  model_path: yolo26s.engine
+  # Recall-first nhưng bớt ghost: 0.25 đủ cho ByteTrack low-conf nối lại.
+  # 0.10 cũ đẻ quá nhiều box yếu -> ghost GID.
   confidence_threshold: 0.25
   nms_iou_threshold: 0.50
   # Loại thêm bbox nhỏ nằm gần như hoàn toàn trong bbox lớn.
   nested_box_containment_threshold: 0.85
   person_class_id: 0
   image_size: 640
-  device: auto
+  device: cuda
 
 tracking:
+  # Legacy IoUTracker (scripts/run_pipeline.py demo) dùng 2 dòng dưới.
+  # Production ByteTrack (scripts/run_workstate.py) dùng từ track_high_threshold trở xuống.
   max_lost_frames: 15
   min_hits: 3
   iou_threshold: 0.3
   # IoU association của ByteTrack production (khác IoUTracker legacy).
   # 0.3 = de noi lai sau che (mac dinh cu 0.5 hay dut ID).
-  byte_match_threshold: 0.3
+  track_high_threshold: 0.50
+  track_low_threshold: 0.10
+  new_track_threshold: 0.60
+  byte_match_threshold: 0.80
   # Giu track mat dau 90 frame (~7s @ effective 12fps) de choi qua che/goc khuat.
   track_buffer: 90
 
@@ -38,18 +46,28 @@ identity:
   spatial_weight: 0.15
   time_weight: 0.15
   channel_weight: 0.10
-  match_threshold: 0.35
+  # Precision-first: thà bỏ sót còn hơn tái sử dụng nhầm Global ID.
+  match_threshold: 0.70
   max_center_distance_ratio: 0.35
-  min_appearance_similarity: 0.35
-  named_appearance_floor: 0.45
-  active_duplicate_similarity: 0.60
+  same_camera_reconnect_distance_ratio: 0.08
+  same_camera_reconnect_s: 2.0
+  min_appearance_similarity: 0.70
+  named_appearance_floor: 0.70
+  active_duplicate_similarity: 0.90
   temp_lost_s: 10.0
   long_lost_s: 120.0
-  unresolved_keep_s: 600.0
+  unresolved_keep_s: 86400.0
   min_gallery_confidence: 0.25
-  reid_backend: osnet
-  reid_model: osnet_x1_0
-  reid_device: auto
+  # Event-driven ReID: track ổn định giữ ID theo spatial fast-path,
+  # chỉ extract OSNet khi track mới / mất rồi quay lại / cross-camera.
+  # refresh 10 bước (thay vì 5) để giảm ~90% ReID calls khi đông người.
+  gallery_refresh_steps: 10
+  tentative_min_hits: 5
+  state_db: output/identity_state.db
+  # Lightweight mặc định: x0_25 (~0.4M params, nhanh ~3x so với x1_0).
+  # Cần chính xác hơn thì tune lên x0_5 / x1_0.
+  reid_model: osnet_x0_25
+  reid_device: cuda
 
 analytics:
   floor_width_m: 8.0
@@ -89,17 +107,31 @@ output:
   video_filename: annotated.mp4
   report_filename: report.json
 
-# Face attendance (channel B = cua ra vao). InsightFace buffalo_s.
+# Face attendance + nhan dien (InsightFace buffalo_s, thuần GPU).
+# Thuần GPU: YOLO (cuda/TensorRT) + OSNet (cuda FP16) + InsightFace
+# (CUDAExecutionProvider). MediaPipe palm chỉ chạy gated 3-5 FPS trên CPU.
+# Threshold đã hạ nhẹ để nhận diện tốt hơn: 0.60 + margin 0.05 + consensus 2.
 face:
   enabled: true
+  channels: [A, B]
+  # cuda = bắt buộc GPU (khuyến nghị). auto = cuda nếu có provider, không thì cpu.
+  face_device: cuda
   gallery_dir: data/images
   model_pack: buffalo_s
-  match_threshold: 0.45
+  match_threshold: 0.60
+  min_margin: 0.05
+  consensus_hits: 2
+  consensus_window_s: 3.0
+  gallery_accept_threshold: 0.70
+  gallery_max_prototypes: 10
   min_face_px: 40
+  min_face_score: 0.5
   min_blur_variance: 40.0
-  min_person_area_px: 2000.0
+  min_person_area_px: 8000.0
   process_every_k: 3
-  det_size: 640
+<  # Lightweight: 320 nhanh ~3-4x so với 640, đủ cho kiosk 1-2m.
+  # Mặt xa >4m mới cần 640.
+  det_size: 320
   name_map:
     AnhDuy: Anh Duy
     VanDai: Van Dai
@@ -112,14 +144,15 @@ face:
     LeHoang: "4"
 
 attendance:
-  debounce_hits: 1
+  debounce_hits: 2
   window_s: 8.0
   active_hour_start: null
   active_hour_end: null
 
 room_fusion:
   leave_confirm_window_s: 300.0
-  inroom_min_interval_s: 3600.0
+  inroom_min_interval_s: 600.0
+  absent_fallback_s: 900.0
   flush_s: 15.0
 
 # Workstations in FLOOR METERS (same frame as analytics.calibration
@@ -140,12 +173,69 @@ workstate:
   hysteresis_m: 0.3       # spatial band against border flicker
   motion_influence: 0.0   # 0 = pure position+time (motion never decides)
   prune_after_s: 300.0    # forget per-ID memory after this absence
-  tentative_min_hits: 5   # identity younger than this never touches the DB
   person_map: {}          # {"LeHoAnhDuy": "desk1"} stable seat override
   # INTERIM (camera chua co dinh / chua ve ROI): lech tam bbox (0..1) khoi
-  # diem neo vuot nguong nay -> Away. 0 = tat, chi dung hien dien.
-  move_ratio: 0.15
+  # diem neo vuot nguong nay -> Away. 0 = tat, chi dung hien dien
+  # (khuyến nghị mặc định tới khi ROI được đo thật).
+  move_ratio: 0.0
   settle_ratio: 0.02
+
+# Voice: vay tay -> "Xin chao <ten>" (quen) / "Xin chào quý khách" (la).
+# + face-triggered: dung truoc camera, nhan dien mat -> chao ngay ra loa
+# camera (khong can vay tay). Bat bang --greet (edge-tts can mang lan dau,
+# cache mp3 de offline sau).
+# backend imou_p2p (mac dinh moi): TTS mp3 -> ffmpeg AAC -> P2P VisualTalk
+# thang ra loa camera. Khong can browser/WebSDK/APP_ID. imou_web giu lai
+# de fallback legacy.
+voice:
+  enabled: false
+  backend: imou_p2p
+  voice: vi-VN-HoaiMyNeural
+  cache_dir: output/voice_cache
+  # Thong nhat 10s cho ca quen lan la; chi kich hoat khi gio tay 5 ngon.
+  cooldown_s: 10.0
+  # Nguoi la gio tay: chao ngay, 10s duoc chao lai, khong can doi face.
+  unknown_cooldown_s: 10.0
+  palm_unknown_immediate: true
+  unknown_phrase: Xin chào quý khách
+  command_ttl_s: 5.0
+  bridge_host: 127.0.0.1
+  # 8765=stream, 8766=supervisor -> voice legacy dùng 8767 để khỏi đụng port.
+  bridge_port: 8767
+  talk_tail_s: 0.3
+  launch_browser: true
+  # Palm-only: chi gio tay 5 ngon moi chao (ap dung chung quen + la).
+  # Muon dung truoc cam la chao ngay thi dat greet_on_face: true.
+  # greet_unknown_on_face=true thi mat la (khong can gio tay) cung chao.
+  greet_on_face: false
+  greet_unknown_on_face: false
+  # P2P VisualTalk (vendor tu test-sound-camera-imou): chi can
+  # IMOU_DEVICE_ID (serial) + IMOU_CAMERA_PASSWORD (safety code).
+  p2p_channel: 1
+  p2p_timeout_s: 20.0
+  p2p_attempts: 2
+  p2p_retry_delay_s: 5.0
+  p2p_sample_rate: 16000
+  # WAV chao tao san (scripts/build_greeting_wavs.py, ZeroTTS).
+  greeting_dir: output/voice_greetings
+  zerotts_voice: maichi
+  zerotts_model: zeroweight-ai/ZeroTTS
+  # every_k=3, window=2.5s -> ~10 mau co tay/window, du cho min_reversals=4.
+  # (every_k cu =6 chi ~3 mau/1.5s -> khong bao gio du 4 dao chieu.)
+  # Legacy wave (giữ tương thích). Mặc định mới dùng open-palm bên dưới.
+  wave_every_k: 3
+  wave_max_people: 2
+  wave_window_s: 2.5
+  wave_min_reversals: 4
+  wave_cooldown_s: 30.0
+  # Open-palm: giơ đủ bàn tay 5 ngón -> chào (trigger duy nhat). Gated 3-5 FPS.
+  palm_every_k: 4
+  palm_max_people: 2
+  palm_cooldown_s: 10.0
+  palm_min_person_area_px: 8000.0
+  # Face async worker: queue nhỏ, drop cũ khi quá tải để giữ realtime.
+  face_max_queue: 2
+  face_recheck_s: 30.0
 
 store:
   local_faces_dir: data/faces

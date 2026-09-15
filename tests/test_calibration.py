@@ -4,8 +4,8 @@ import pytest
 from camera_tracking.calibration import (
     build_location_config,
     detect_tile_grid,
-    topdown_pairs,
     tile_to_meters,
+    topdown_pairs,
     validate_workstation,
 )
 

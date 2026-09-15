@@ -236,6 +236,33 @@ class GlobalIdentityTest(TestCase):
             )
         self.assertEqual(len(manager.identities[1].gallery), 4)
 
+    def test_lazy_gallery_refresh_skips_stable_tracks(self) -> None:
+        calls = {"n": 0}
+
+        class CountingEmbedding(MeanColorEmbedding):
+            def extract(self, crop_bgr):
+                calls["n"] += 1
+                return super().extract(crop_bgr)
+
+        cfg = GlobalIdentityConfig(gallery_refresh_steps=3)
+        manager = GlobalIdentityManager(CountingEmbedding(), cfg)
+        frame = make_frame()
+        box = BoundingBox(20, 40, 120, 160)
+        for i in range(6):
+            manager.update(
+                channel="A", frame=frame,
+                tracks=[raw_track(10, box)], now_s=float(i),
+            )
+        # Steps 3 and 6 refresh (1 extraction each); new identity at
+        # step 1 extracts once. Total 3 instead of 7.
+        self.assertEqual(calls["n"], 3)
+        # Stable track keeps its Global ID without fresh appearance.
+        result = manager.update(
+            channel="A", frame=frame,
+            tracks=[raw_track(11, box)], now_s=7.0,
+        )
+        self.assertEqual(result[0].track_id, 1)
+
 
 class BusinessSeparationTest(TestCase):
     def test_business_states_do_not_change_global_ids(self) -> None:

@@ -113,6 +113,21 @@ class FaceAttendanceService:
         for record in records:
             self._ticked.setdefault((record.day, record.person_id), record)
 
+    def forget_gid(self, global_id: int) -> None:
+        """Xóa best-shot của GID đã retire để khỏi rò memory/hiển thị sai."""
+        self._pending_best.pop(int(global_id), None)
+
+    def prune(self, now_s: float, alive_global_ids: set[int] | None = None) -> None:
+        """Dọn window hết hạn + best-shot của GID chết (gọi mỗi flush)."""
+        cutoff = now_s - self.window_s
+        for window in self._windows.values():
+            while window and window[0].at_s < cutoff:
+                window.popleft()
+        if alive_global_ids is None:
+            return
+        for gid in [g for g in self._pending_best if g not in alive_global_ids]:
+            self._pending_best.pop(gid, None)
+
     # -- phu --
     def _in_active_hours(self, wall_time_iso: str) -> bool:
         if self.active_hour_start is None or self.active_hour_end is None:
@@ -132,6 +147,6 @@ def guid_safe(gid: int) -> int:
 
 
 def today_str(local_date: date | None = None) -> str:
-    from datetime import date as _date
+    from datetime import datetime
 
-    return (local_date or _date.today()).isoformat()
+    return (local_date or datetime.now().astimezone().date()).isoformat()

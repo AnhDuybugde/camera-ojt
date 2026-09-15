@@ -83,7 +83,7 @@ class ChannelBusinessTracker:
     person_map: dict[str, str] = field(default_factory=dict)
     prune_after_s: float = 300.0
     # Interim displacement mode (positions in normalized 0..1 units).
-    move_ratio: float = 0.15
+    move_ratio: float = 0.0
     settle_ratio: float = 0.02
     _last_present_s: dict[int, float] = field(default_factory=dict, init=False)
     _last_absent_s: dict[int, float] = field(default_factory=dict, init=False)

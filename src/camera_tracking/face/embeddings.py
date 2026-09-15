@@ -18,6 +18,43 @@ class FaceEmbedder(Protocol):
     def detect_embed(self, person_crop_bgr: np.ndarray | None) -> list[FaceDetection]: ...
 
 
+def ensure_cuda_dlls() -> list[str]:
+    """Dua site-packages/nvidia/*/bin vao DLL search path (Windows).
+
+    May khong co CUDA Toolkit he thong van dung duoc CUDA/cuDNN tu pip
+    wheels (nvidia-cuda-runtime-cu12, nvidia-cudnn-cu12, ...). Goi truoc
+    khi tao InsightFace/onnxruntime session. Idempotent.
+    """
+    import os
+    import sys
+
+    added: list[str] = []
+    roots: set[str] = set()
+    try:
+        import site as _site
+        for path in (_site.getsitepackages() + [_site.getusersitepackages()]):
+            if path:
+                roots.add(path)
+    except (AttributeError, ImportError, OSError):
+        pass
+    roots.update(sys.path)
+    for root in sorted(roots):
+        candidate = os.path.join(root, "nvidia")
+        if not os.path.isdir(candidate):
+            continue
+        for pkg in sorted(os.listdir(candidate)):
+            bin_dir = os.path.join(candidate, pkg, "bin")
+            if not os.path.isdir(bin_dir) or bin_dir in added:
+                continue
+            try:
+                os.add_dll_directory(bin_dir)
+            except OSError:  # old runtime, PATH fallback below
+                pass
+            os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+            added.append(bin_dir)
+    return added
+
+
 def cosine_similarity(left: np.ndarray, right: np.ndarray) -> float:
     left = np.asarray(left, dtype=np.float32).ravel()
     right = np.asarray(right, dtype=np.float32).ravel()
@@ -52,14 +89,26 @@ class InsightFaceEmbedder:
     ro rang, caller co the bat va chay o che do khong-face.
     """
 
-    def __init__(self, model_pack: str = "buffalo_s", det_size: int = 640) -> None:
+    def __init__(self, model_pack: str = "buffalo_s", det_size: int = 320,
+                 device: str = "auto") -> None:
         self.model_pack = model_pack
         self.det_size = det_size
+        self.device_name = (device or "auto").strip().lower()
+        self.resolved_device = "cpu"
         self._app = None
+
+    @staticmethod
+    def _cuda_provider_available() -> bool:
+        try:
+            import onnxruntime as ort
+            return "CUDAExecutionProvider" in ort.get_available_providers()
+        except ImportError:
+            return False
 
     def _load(self):
         if self._app is not None:
             return self._app
+        ensure_cuda_dlls()
         try:
             from insightface.app import FaceAnalysis
         except ImportError as error:
@@ -67,12 +116,24 @@ class InsightFaceEmbedder:
                 "insightface chua cai. Chay: pip install insightface onnxruntime "
                 "(~300MB model tai lan dau)."
             ) from error
-        app = FaceAnalysis(name=self.model_pack)
-        # ctx_id=-1 => CPU; neu co GPU onnxruntime-gpu thi doi thanh 0.
+        want_cuda = self.device_name in ("auto", "cuda")
+        use_cuda = want_cuda and self._cuda_provider_available()
+        if self.device_name == "cuda" and not use_cuda:
+            raise RuntimeError(
+                "face_device=cuda nhung thieu CUDAExecutionProvider. "
+                "Cai CUDA Toolkit 12.x + cuDNN roi: pip install onnxruntime-gpu. "
+                "Tam dung face_device=cpu."
+            )
+        providers: list[str] | None = ["CUDAExecutionProvider", "CPUExecutionProvider"] \
+            if use_cuda else None
+        app = FaceAnalysis(name=self.model_pack, providers=providers)
+        # ctx_id=-1 => CPU; 0 => GPU dau tien (can onnxruntime-gpu).
+        ctx_id = 0 if use_cuda else -1
+        self.resolved_device = "cuda" if use_cuda else "cpu"
         try:
-            app.prepare(ctx_id=-1, det_size=(self.det_size, self.det_size))
+            app.prepare(ctx_id=ctx_id, det_size=(self.det_size, self.det_size))
         except TypeError:
-            app.prepare(ctx_id=-1)
+            app.prepare(ctx_id=ctx_id)
         self._app = app
         return app
 

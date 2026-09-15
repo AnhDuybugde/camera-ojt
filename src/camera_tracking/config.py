@@ -23,11 +23,11 @@ class CameraConfig(StrictModel):
 
 class DetectionConfig(StrictModel):
     model_path: str = "yolo26s.pt"
-    confidence_threshold: float = Field(default=0.4, ge=0, le=1)
+    confidence_threshold: float = Field(default=0.25, ge=0, le=1)
     nms_iou_threshold: float = Field(default=0.50, ge=0, le=1)
     nested_box_containment_threshold: float = Field(default=0.85, ge=0, le=1)
     person_class_id: int = 0
-    image_size: int = 800
+    image_size: int = 640
     device: str = "auto"
 
 
@@ -35,32 +35,47 @@ class TrackingConfig(StrictModel):
     max_lost_frames: int = Field(default=15, ge=0)
     min_hits: int = Field(default=3, ge=1)
     iou_threshold: float = Field(default=0.3, ge=0, le=1)
-    byte_match_threshold: float = Field(default=0.50, ge=0, le=1)
-    track_buffer: int = Field(default=30, ge=1)
+    track_high_threshold: float = Field(default=0.50, ge=0, le=1)
+    track_low_threshold: float = Field(default=0.10, ge=0, le=1)
+    new_track_threshold: float = Field(default=0.60, ge=0, le=1)
+    byte_match_threshold: float = Field(default=0.80, ge=0, le=1)
+    track_buffer: int = Field(default=90, ge=1)
+
+    @model_validator(mode="after")
+    def validate_threshold_order(self) -> TrackingConfig:
+        if self.track_low_threshold > self.track_high_threshold:
+            raise ValueError("track_low_threshold must not exceed track_high_threshold")
+        if self.new_track_threshold < self.track_high_threshold:
+            raise ValueError("new_track_threshold must be at least track_high_threshold")
+        return self
 
 
 class GlobalIdentityConfig(StrictModel):
     """Cau hinh Global Identity Manager (xem tracking/global_identity.py)."""
 
     gallery_size: int = Field(default=8, ge=1)
-    appearance_weight: float = Field(default=0.55, ge=0)
-    spatial_weight: float = Field(default=0.20, ge=0)
+    appearance_weight: float = Field(default=0.60, ge=0)
+    spatial_weight: float = Field(default=0.15, ge=0)
     time_weight: float = Field(default=0.15, ge=0)
     channel_weight: float = Field(default=0.10, ge=0)
-    match_threshold: float = Field(default=0.40, ge=0, le=1)
+    match_threshold: float = Field(default=0.70, ge=0, le=1)
     max_center_distance_ratio: float = Field(default=0.35, gt=0)
-    min_appearance_similarity: float = Field(default=0.30, ge=0, le=1)
+    same_camera_reconnect_distance_ratio: float = Field(default=0.08, gt=0)
+    same_camera_reconnect_s: float = Field(default=2.0, ge=0)
+    min_appearance_similarity: float = Field(default=0.70, ge=0, le=1)
     # Gate rieng cho ID da co ten (employee_id): muon tai su dung GID nay,
     # appearance phai >= nguong nay ke ca khi spatial/time cao. Chong vu
     # G1-LeHoAnhDuy an di roi gán sang nguoi khac dung gan.
-    named_appearance_floor: float = Field(default=0.45, ge=0, le=1)
-    active_duplicate_similarity: float = Field(default=0.60, ge=0, le=1)
-    temp_lost_s: float = Field(default=5.0, ge=0)
-    long_lost_s: float = Field(default=60.0, ge=0)
-    unresolved_keep_s: float = Field(default=300.0, ge=0)
+    named_appearance_floor: float = Field(default=0.70, ge=0, le=1)
+    active_duplicate_similarity: float = Field(default=0.90, ge=0, le=1)
+    temp_lost_s: float = Field(default=10.0, ge=0)
+    long_lost_s: float = Field(default=120.0, ge=0)
+    unresolved_keep_s: float = Field(default=86400.0, ge=0)
     min_gallery_confidence: float = Field(default=0.25, ge=0, le=1)
-    reid_backend: Literal["osnet", "histogram"] = "osnet"
-    reid_model: str = "osnet_x1_0"
+    gallery_refresh_steps: int = Field(default=5, ge=1)
+    tentative_min_hits: int = Field(default=5, ge=1)
+    state_db: Path = Path("output/identity_state.db")
+    reid_model: str = "osnet_x0_25"
     reid_device: Literal["auto", "cpu", "cuda"] = "auto"
 
 
@@ -113,27 +128,45 @@ class OutputConfig(StrictModel):
 
 
 class FaceConfig(StrictModel):
-    """Nhan dien khuon mat channel B (diem danh). InsightFace buffalo_s."""
+    """Nhan dien khuon mat (diem danh). Chay tren cac channel chi dinh."""
 
     enabled: bool = True
+    # Channel chay face recognition/diem danh, vi du ["B"] (cua) hoac
+    # ["A", "B"] (ca 2 camera nhu nhau).
+    channels: list[str] = Field(default_factory=lambda: ["A", "B"])
+    # Thiet bi InsightFace: auto = cuda neu co CUDAExecutionProvider (can
+    # onnxruntime-gpu + CUDA Toolkit), khong thi cpu.
+    face_device: Literal["auto", "cpu", "cuda"] = "auto"
     gallery_dir: Path = Path("data/images")
     model_pack: str = "buffalo_s"
-    match_threshold: float = Field(default=0.3, ge=0, le=1)
-    min_face_px: int = Field(default=32, ge=8)
-    min_blur_variance: float = Field(default=20.0, ge=0)
-    min_person_area_px: float = Field(default=2000.0, ge=0)
+    match_threshold: float = Field(default=0.60, ge=0, le=1)
+    min_margin: float = Field(default=0.05, ge=0, le=1)
+    consensus_hits: int = Field(default=2, ge=1)
+    consensus_window_s: float = Field(default=3.0, gt=0)
+    gallery_accept_threshold: float = Field(default=0.70, ge=0, le=1)
+    gallery_max_prototypes: int = Field(default=10, ge=1)
+    min_face_px: int = Field(default=40, ge=8)
+    min_face_score: float = Field(default=0.5, ge=0, le=1)
+    min_blur_variance: float = Field(default=40.0, ge=0)
+    min_person_area_px: float = Field(default=8000.0, ge=0)
     process_every_k: int = Field(default=3, ge=1)
-    det_size: int = Field(default=640, ge=160)
+    det_size: int = Field(default=320, ge=160)
     # Ten hien thi: {"LeHoAnhDuy": "Le Ho Anh Duy"}; mac dinh dung stem file.
     name_map: dict[str, str] = Field(default_factory=dict)
     # Employee ID trong database: {"LeHoAnhDuy": "1"}.
     employee_map: dict[str, str] = Field(default_factory=dict)
 
+    @model_validator(mode="after")
+    def validate_gallery_threshold(self) -> FaceConfig:
+        if self.gallery_accept_threshold < self.match_threshold:
+            raise ValueError("gallery_accept_threshold must be at least match_threshold")
+        return self
+
 
 class AttendanceConfig(StrictModel):
     """Debounce tick diem danh: k hit cung person trong window moi tick."""
 
-    debounce_hits: int = Field(default=1, ge=1)
+    debounce_hits: int = Field(default=2, ge=1)
     window_s: float = Field(default=8.0, ge=0)
     # Chi tick trong khung gio nay (gio dia phuong, 24h). None = ca ngay.
     # Vi du lam viec: start 6, end 22.
@@ -145,7 +178,8 @@ class RoomFusionConfig(StrictModel):
     """Fuse trang thai phong tu channel A (room) + B (door)."""
 
     leave_confirm_window_s: float = Field(default=300.0, ge=0)
-    inroom_min_interval_s: float = Field(default=3600.0, ge=0)
+    inroom_min_interval_s: float = Field(default=600.0, ge=0)
+    absent_fallback_s: float = Field(default=900.0, ge=0)
     flush_s: float = Field(default=15.0, ge=1)
 
 
@@ -170,18 +204,81 @@ class WorkstateConfig(StrictModel):
     hysteresis_m: float = Field(default=0.3, ge=0)
     motion_influence: float = Field(default=0.0, ge=0, le=1)
     prune_after_s: float = Field(default=300.0, ge=0)
-    tentative_min_hits: int = Field(default=5, ge=1)
     person_map: dict[str, str] = Field(default_factory=dict)
     # INTERIM (no fixed camera / no ROI yet): normalized 0..1 bbox-center
     # displacement from the first-seen anchor counting as leave-seat.
-    # 0 disables -> pure presence mode.
-    move_ratio: float = Field(default=0.15, ge=0, le=1)
+    # 0 disables -> pure presence mode (khuyến nghị mặc định cho tới
+    # khi ROI được đo thật).
+    move_ratio: float = Field(default=0.0, ge=0, le=1)
     settle_ratio: float = Field(default=0.02, ge=0, le=1)
+
+
+class VoiceConfig(StrictModel):
+    """Chao bang giong noi khi co nguoi vay tay (MediaPipe + edge-tts).
+
+    backend ``imou_p2p`` (mac dinh moi): TTS -> ffmpeg AAC -> P2P VisualTalk
+    thang ra loa camera, khong can browser/WebSDK/APP_ID. ``imou_web`` giu
+    lai de fallback legacy.
+    """
+
+    enabled: bool = False
+    backend: Literal["local", "imou_web", "imou_p2p"] = "imou_p2p"
+    voice: str = "vi-VN-HoaiMyNeural"
+    cache_dir: Path = Path("output/voice_cache")
+    # Thong nhat 10s cho ca quen lan la; chi kich hoat khi gio tay 5 ngon.
+    cooldown_s: float = Field(default=10.0, ge=0)
+    # Cooldown rieng cho nguoi la (giu de tuy chinh, mac dinh cung 10s).
+    unknown_cooldown_s: float = Field(default=10.0, ge=0)
+    # Palm cua nguoi chua co ket qua face: True = chao ngay "Xin chào quý khách",
+    # khong can doi FaceWorker. False = hanh vi cu (bo qua + log hint).
+    palm_unknown_immediate: bool = True
+    unknown_phrase: str = "Xin chào quý khách"
+    command_ttl_s: float = Field(default=5.0, gt=0)
+    bridge_host: str = "127.0.0.1"
+    bridge_port: int = Field(default=8767, ge=0, le=65535)
+    talk_tail_s: float = Field(default=0.3, ge=0)
+    launch_browser: bool = True
+    # P2P VisualTalk (vendor tu test-sound-camera-imou).
+    p2p_channel: int = Field(default=1, ge=1)
+    p2p_timeout_s: float = Field(default=20.0, gt=0)
+    p2p_attempts: int = Field(default=2, ge=1)
+    p2p_retry_delay_s: float = Field(default=5.0, ge=0)
+    p2p_sample_rate: int = Field(default=16000, ge=8000)
+    # WAV chao tao san bang ZeroTTS (scripts/build_greeting_wavs.py):
+    # manifest.json anh xa nguyen van cau chao -> file wav.
+    greeting_dir: Path = Path("output/voice_greetings")
+    zerotts_voice: str = "maichi"
+    zerotts_model: str = "zeroweight-ai/ZeroTTS"
+    # Chào mặt (face-triggered): mac dinh TAT, chi chao khi gio tay 5 ngon
+    # (palm-only, ap dung chung cho ca quen lan la). Muon dung truoc cam
+    # la chao ngay thi bat greet_on_face=true.
+    # Dùng chung VoiceGreeter queue/cooldown với wave để không spam.
+    greet_on_face: bool = False
+    greet_unknown_on_face: bool = False
+    # Wave detector cadence + gioi han tai (MediaPipe chay CPU).
+    # Toan cadence: process ~12.5 frame/s (fps/2) / every_k = tan so lay mau
+    # co tay; can >= min_reversals+2 diem trong window moi fire duoc.
+    # every_k=3, window=2.5s -> ~10 diem/window (du cho min_reversals=4).
+    # Legacy wave (giữ để tương thích test cũ).
+    wave_every_k: int = Field(default=3, ge=1)
+    wave_max_people: int = Field(default=2, ge=1)
+    wave_window_s: float = Field(default=2.5, gt=0)
+    wave_min_reversals: int = Field(default=4, ge=2)
+    wave_cooldown_s: float = Field(default=30.0, ge=0)
+    # Open-palm greeting: giơ đủ bàn tay 5 ngón -> chào (trigger duy nhat).
+    # Event-driven + gated: chỉ chạy ~3-5 FPS trên candidate đủ lớn.
+    # Thong nhat 10s nhu cooldown loa.
+    palm_every_k: int = Field(default=4, ge=1)
+    palm_max_people: int = Field(default=2, ge=1)
+    palm_cooldown_s: float = Field(default=10.0, ge=0)
+    palm_min_person_area_px: float = Field(default=8000.0, ge=0)
+    # Face async worker: hàng đợi job, drop cũ khi quá tải để giữ realtime.
+    face_max_queue: int = Field(default=2, ge=1)
+    face_recheck_s: float = Field(default=30.0, ge=0)
 
 
 class StoreConfig(StrictModel):
     """Luu tru daily: local faces + Supabase (optional, bat khi co .env)."""
-
     local_faces_dir: Path = Path("data/faces")
     queue_db: Path = Path("output/queue.db")
     supabase_enabled: bool = False
@@ -202,6 +299,7 @@ class AppConfig(StrictModel):
     room_fusion: RoomFusionConfig = Field(default_factory=RoomFusionConfig)
     workstations: list[WorkstationConfig] = Field(default_factory=list)
     workstate: WorkstateConfig = Field(default_factory=WorkstateConfig)
+    voice: VoiceConfig = Field(default_factory=VoiceConfig)
     store: StoreConfig = Field(default_factory=StoreConfig)
 
 

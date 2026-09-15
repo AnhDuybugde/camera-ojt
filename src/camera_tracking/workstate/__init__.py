@@ -10,11 +10,7 @@ from camera_tracking.workstate.channel_status import (
 )
 from camera_tracking.workstate.consumer import WorkstateConsumer
 from camera_tracking.workstate.reconcile import IdentityReconciler
-from camera_tracking.workstate.reid import (
-    HistogramEmbedding,
-    OsnetEmbedding,
-    cosine_similarity,
-)
+from camera_tracking.workstate.reid import OsnetEmbedding, cosine_similarity
 from camera_tracking.workstate.room_fusion import (
     LABEL_AWAY_SEAT,
     LABEL_NEAR_SEAT,
@@ -40,7 +36,6 @@ __all__ = [
     "LABEL_UNKNOWN",
     "LABEL_WORKING",
     "ChannelBusinessTracker",
-    "HistogramEmbedding",
     "IdentityReconciler",
     "OsnetEmbedding",
     "PersonBusinessState",

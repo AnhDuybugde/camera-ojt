@@ -1,0 +1,11 @@
+{
+  "phrases": {
+    "Xin chào Lê Hồ Anh Duy": "LeHoAnhDuy.wav",
+    "Xin chào Lê Văn Đại": "LeVanDai.wav",
+    "Xin chào Bùi Hữu Quốc Ngọc": "QuocNgoc.wav",
+    "Xin chào Trần Bá Lê Hoàng": "TranBaLeHoang.wav",
+    "Xin chào quý khách": "unknown.wav"
+  },
+  "model": "zeroweight-ai/ZeroTTS",
+  "voice": "maichi"
+}

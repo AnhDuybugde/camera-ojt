@@ -40,6 +40,10 @@ class RoomPresenceAggregator:
     """Gop ChannelBusinessTracker A/B + attendance names thanh label hien thi."""
 
     leave_confirm_window_s: float = 300.0
+    # Fallback thực tế: vắng A quá lâu mà không có B (ra bằng cửa khuất)
+    # thì vẫn kết luận Out để dashboard khỏi kẹt "Away" cả ngày.
+    # 0 = tắt fallback, giữ behavior bảo thủ cũ.
+    absent_fallback_s: float = 900.0
     _last_seen_b: dict[int, float] = field(default_factory=dict, init=False)
     _absent_since: dict[int, float] = field(default_factory=dict, init=False)
     _was_out: dict[int, bool] = field(default_factory=dict, init=False)
@@ -117,9 +121,18 @@ class RoomPresenceAggregator:
                     just_left = True
                 label, in_room, out_now = LABEL_OUT_OFFICE, False, True
             elif state_a == "POSSIBLY_OUT":
-                # Absent long in A but no B evidence yet -> stay conservative:
-                # still away from seat, do not conclude out of office.
-                label, in_room, out_now = LABEL_AWAY_SEAT, True, False
+                absent_for = now_s - absent_start
+                if (
+                    self.absent_fallback_s > 0
+                    and absent_for >= self.absent_fallback_s
+                ):
+                    if not was_out:
+                        just_left = True
+                    label, in_room, out_now = LABEL_OUT_OFFICE, False, True
+                else:
+                    # Absent long in A but no B evidence yet -> stay conservative:
+                    # still away from seat, do not conclude out of office.
+                    label, in_room, out_now = LABEL_AWAY_SEAT, True, False
             elif gid in present_b and not in_a and was_out:
                 label, in_room, out_now = LABEL_OUT_OFFICE, False, True
             else:

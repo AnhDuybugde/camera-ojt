@@ -7,7 +7,11 @@ export type KioskPerson = {
   label: string
   in_room: boolean
   face_score?: number | null
+  identity_state?: 'employee' | 'unknown'
+  identity_confidence?: number | null
+  employee_confidence?: number | null
   camera?: string | null
+  cameras?: string[]
   tracking_state?: string | null
 }
 
@@ -18,6 +22,15 @@ export type KioskAttendance = {
   attended?: boolean
   check_in_at: string | null
   face_score: number | null
+}
+
+export type KioskEvent = {
+  event: 'CHECK_IN' | 'LEAVE_OFFICE' | 'RETURN' | string
+  global_id: number | null
+  channel: string | null
+  at: string | null
+  person_id?: string | null
+  person_name?: string | null
 }
 
 type RecognitionState =
@@ -36,6 +49,7 @@ type Props = {
   people: KioskPerson[]
   attendance: KioskAttendance[]
   pendingAttendance: KioskAttendance[]
+  events: KioskEvent[]
   onOpenAdmin: () => void
 }
 
@@ -70,6 +84,16 @@ const STATE_COPY: Record<RecognitionState, { title: string; detail: string }> = 
   },
 }
 
+const EVENT_COPY: Record<string, { label: string; className: string }> = {
+  CHECK_IN: { label: 'Điểm danh', className: 'event-checkin' },
+  LEAVE_OFFICE: { label: 'Rời văn phòng', className: 'event-leave' },
+  RETURN: { label: 'Quay lại', className: 'event-return' },
+}
+
+function eventCopy(event: string): { label: string; className: string } {
+  return EVENT_COPY[event] ?? { label: event, className: 'event-other' }
+}
+
 function initials(name: string | null | undefined): string {
   if (!name) return 'ID'
   return name
@@ -94,6 +118,7 @@ export default function KioskCheckIn({
   people,
   attendance,
   pendingAttendance,
+  events,
   onOpenAdmin,
 }: Props) {
   const [now, setNow] = useState(new Date())
@@ -112,18 +137,22 @@ export default function KioskCheckIn({
     const active = people.filter((person) =>
       !person.tracking_state || person.tracking_state === 'ACTIVE',
     )
-    const hasCameraMetadata = active.some((person) => Boolean(person.camera))
+    const hasCameraMetadata = active.some((person) =>
+      Boolean(person.camera || person.cameras?.length),
+    )
     return hasCameraMetadata
-      ? active.filter((person) => person.camera === cameraChannel)
+      ? active.filter((person) =>
+        person.cameras?.includes(cameraChannel) || person.camera === cameraChannel,
+      )
       : active
   }, [cameraChannel, people])
 
   const countA = useMemo(
-    () => people.filter((p) => p.camera === 'A' && (!p.tracking_state || p.tracking_state === 'ACTIVE')).length,
+    () => people.filter((p) => (p.cameras?.includes('A') || p.camera === 'A') && (!p.tracking_state || p.tracking_state === 'ACTIVE')).length,
     [people],
   )
   const countB = useMemo(
-    () => people.filter((p) => p.camera === 'B' && (!p.tracking_state || p.tracking_state === 'ACTIVE')).length,
+    () => people.filter((p) => (p.cameras?.includes('B') || p.camera === 'B') && (!p.tracking_state || p.tracking_state === 'ACTIVE')).length,
     [people],
   )
 
@@ -265,6 +294,7 @@ export default function KioskCheckIn({
         </aside>
       </div>
 
+      <div className="kiosk-bottom">
       <section className="recent-checkins" aria-label="Lượt điểm danh gần đây">
         <div className="recent-heading">
           <strong>Lượt điểm danh gần đây</strong>
@@ -283,6 +313,32 @@ export default function KioskCheckIn({
           ))}
         </div>
       </section>
+
+      <section className="activity-feed" aria-label="Hoạt động gần đây">
+        <div className="recent-heading">
+          <strong>Hoạt động</strong>
+          <span>{liveOk ? 'Trực tiếp từ pipeline' : 'Ngoại tuyến'}</span>
+        </div>
+        <ul className="activity-list">
+          {events.length === 0 && (
+            <li className="recent-empty">Chưa có hoạt động nào</li>
+          )}
+          {events.slice(-8).reverse().map((item, index) => {
+            const copy = eventCopy(item.event)
+            return (
+              <li key={`${item.at ?? ''}-${item.global_id ?? ''}-${item.event}-${index}`} className="activity-item">
+                <span className={`activity-dot ${copy.className}`} aria-hidden="true" />
+                <span className="activity-body">
+                  <strong>{item.person_name ?? `G${item.global_id ?? '?'}`}</strong>
+                  <small>{copy.label}{item.channel ? ` · Cam ${item.channel}` : ''}</small>
+                </span>
+                <time>{formatTime(item.at, now)}</time>
+              </li>
+            )
+          })}
+        </ul>
+      </section>
+      </div>
     </main>
   )
 }
