@@ -101,9 +101,15 @@ face:
   process_every_k: 3
   det_size: 640
   name_map:
-    LeHoAnhDuy: Le Ho Anh Duy
+    AnhDuy: Anh Duy
+    VanDai: Van Dai
+    QuocNgoc: Quoc Ngoc
+    LeHoang: Le Hoang
   employee_map:
-    LeHoAnhDuy: "1"
+    AnhDuy: "1"
+    VanDai: "2"
+    QuocNgoc: "3"
+    LeHoang: "4"
 
 attendance:
   debounce_hits: 1

@@ -10,9 +10,13 @@ create table if not exists public.persons (
   created_at timestamptz not null default now()
 );
 
--- Initial enrolled employee for data/images/LeHoAnhDuy.jpg.
+-- Enrolled employees for data/images/*.
 insert into public.persons (person_id, display_name, photo_url, active)
-values ('1', 'Le Ho Anh Duy', 'data/images/LeHoAnhDuy.jpg', true)
+values
+  ('1', 'Anh Duy',    'data/images/AnhDuy.jpeg',    true),
+  ('2', 'Van Dai',    'data/images/VanDai.jpeg',    true),
+  ('3', 'Quoc Ngoc',  'data/images/QuocNgoc.jpeg',  true),
+  ('4', 'Le Hoang',   'data/images/LeHoang.jpeg',   true)
 on conflict (person_id) do update set
   display_name = excluded.display_name,
   photo_url = excluded.photo_url,
