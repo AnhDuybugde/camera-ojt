@@ -244,8 +244,8 @@ def _index_grid(points: list[tuple[float, float]]):
     # desks and feet share the transform): anchor indices at each axis min.
     indexed = []
     for (x, y), (u, v) in zip(points, proj):
-        col = int(round((u - proj[:, 0].min()) / spacings[0]))
-        row = int(round((v - proj[:, 1].min()) / spacings[1]))
+        col = round((u - proj[:, 0].min()) / spacings[0])
+        row = round((v - proj[:, 1].min()) / spacings[1])
         residual = (abs(u - (proj[:, 0].min() + col * spacings[0]))
                     + abs(v - (proj[:, 1].min() + row * spacings[1])))
         if residual < 0.35 * (spacings[0] + spacings[1]) / 2:

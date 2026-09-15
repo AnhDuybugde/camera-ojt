@@ -87,3 +87,40 @@ def test_face_consumer_processes_channel_a_independently_from_b() -> None:
 
     assert len(result_b) == 1
     assert len(result_a) == 1
+
+
+def test_face_consumer_requires_consensus_before_emitting() -> None:
+    consumer = FaceTrackConsumer(
+        FakeEmbedder(), FakeMatcher(), min_person_area_px=1,
+        min_face_px=20, min_blur_variance=1,
+        unknown_cooldown_s=0, consensus_hits=3, consensus_window_s=3,
+    )
+    event = _event("A")
+    assert consumer.consume(event, now_s=0.0) == []
+    assert consumer.consume(event, now_s=1.0) == []
+    assert len(consumer.consume(event, now_s=2.0)) == 1
+
+
+def test_one_face_is_assigned_to_only_one_overlapping_track() -> None:
+    first = _track()
+    second = Track(8, BoundingBox(20, 10, 180, 190), 0.9, 3, 3, True,
+                   local_track_id=13, global_person_id=8)
+    consumer = FaceTrackConsumer(
+        FakeEmbedder(), FakeMatcher(), min_person_area_px=1,
+        min_face_px=20, min_blur_variance=1,
+    )
+    event = TrackEvent("A", Frame(1, 0.0, _image()), (first, second))
+    assert len(consumer.consume(event, now_s=0.0)) == 1
+
+
+class LowScoreEmbedder:
+    def detect_embed(self, crop_bgr):
+        return [FaceDetection((20, 20, 80, 100), 0.2, np.ones(4, dtype=np.float32))]
+
+
+def test_face_consumer_filters_low_detector_score() -> None:
+    consumer = FaceTrackConsumer(
+        LowScoreEmbedder(), FakeMatcher(), min_person_area_px=1,
+        min_face_px=20, min_blur_variance=1, min_face_score=0.5,
+    )
+    assert consumer.consume(_event("A"), now_s=0.0) == []

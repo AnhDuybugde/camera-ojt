@@ -136,6 +136,25 @@ class SupabaseStore:
             self._error = str(error)
             return False
 
+    def fetch_attendance_day(self, day: str) -> list[dict]:
+        """Lấy attendance đã tick trong ngày để preload sau restart.
+
+        Offline/thiếu env/lib -> trả [] (caller giữ behavior RAM-only).
+        """
+        if not self.connect():
+            return []
+        try:
+            response = (
+                self._client.table("attendance_daily")
+                .select("date,person_id,person_name,global_id,check_in_at,face_score")
+                .eq("date", day)
+                .execute()
+            )
+            return list(getattr(response, "data", None) or [])
+        except Exception as error:  # noqa: BLE001
+            self._error = str(error)
+            return []
+
     def upload_face_crop(self, local_path: str, storage_path: str) -> bool:
         """Upload len bucket 'face-crops'. storage_path dang YYYY-MM-DD/..."""
         if not self.connect():

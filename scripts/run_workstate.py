@@ -51,15 +51,17 @@ import numpy as np
 from camera_tracking.camera import FrameHub
 from camera_tracking.config import load_config
 from camera_tracking.detection import YoloPersonDetector, resolve_device
+
 try:  # CUDA/cuDNN tu pip wheels (khong can CUDA Toolkit he thong).
     from camera_tracking.face.embeddings import ensure_cuda_dlls
     ensure_cuda_dlls()
-except Exception:  # noqa: BLE001 - CPU fallback van chay
-    pass
+except (ImportError, OSError) as error:
+    print(f"CUDA runtime discovery skipped: {error}", file=sys.stderr)
 from camera_tracking.domain import Frame, Track, TrackEvent
 from camera_tracking.runtime import StageMetrics
 from camera_tracking.tracking import (
     ByteTrackTracker,
+    DailyIdentityStore,
     GlobalIdentityConfig,
     GlobalIdentityManager,
     StablePersonCount,
@@ -68,7 +70,6 @@ from camera_tracking.visualization import draw_global_labels, draw_person_tracks
 from camera_tracking.workstate import (
     LABEL_UNKNOWN,
     ChannelBusinessTracker,
-    HistogramEmbedding,
     IdentityReconciler,
     OsnetEmbedding,
     RoomPresenceAggregator,
@@ -337,17 +338,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--min-area", type=float, default=2000.0,
                         help="Bo box nguoi nho hon nguong (px^2) de giam nhieu.")
-    parser.add_argument("--match-threshold", type=float, default=None,
-                        help="Override identity match_threshold trong config.")
-    parser.add_argument("--away-grace-s", type=float, default=1.5,
+    parser.add_argument("--away-grace-s", type=float, default=5.0,
                         help="Business: absent/seat-leave over N sec -> AWAY.")
-    parser.add_argument("--out-after-s", type=float, default=20.0,
+    parser.add_argument("--out-after-s", type=float, default=60.0,
                         help="Business: absent over N sec -> POSSIBLY_OUT.")
     parser.add_argument("--return-stable-s", type=float, default=2.0,
                         help="Business: stable presence N sec -> WORKING.")
-    parser.add_argument("--new-track-conf", type=float, default=0.25,
-                        help="Min YOLO score that may spawn a NEW tracklet "
-                        "(ghosts below this never become Global IDs).")
     parser.add_argument("--move-ratio", type=float, default=None,
                         help="Interim displacement threshold 0..1 (default from "
                         "workstate.move_ratio, 0 = presence-only).")
@@ -361,11 +357,14 @@ def parse_args() -> argparse.Namespace:
                         help="cuda / mps / cpu / auto (mac dinh lay theo config).")
     parser.add_argument("--no-face", action="store_true",
                         help="Tat nhan dien khuon mat ca 2 kenh (chi tracking).")
-    parser.add_argument("--face-threshold", type=float, default=None,
-                        help="Override face.match_threshold trong config.")
     parser.add_argument("--face-channels", default=None,
                         help="Override face.channels trong config "
                         "(vi du 'B' chi diem danh 1 cam, 'AB' ca 2).")
+    parser.add_argument("--greet", action="store_true",
+                        help="Bat voice: vay tay -> xin chao ten (quen) / "
+                        "troll (la). Mac dinh tat.")
+    parser.add_argument("--identity-log", type=Path, default=None,
+                        help="Write identity predictions CSV for replay evaluation.")
     parser.add_argument("--metrics-log-s", type=float, default=60.0,
                         help="In StageMetrics moi N giay de soi bottleneck "
                         "(0 = tat, chi in khi thoat).")
@@ -386,7 +385,8 @@ def _track_floor_points(tracks, projector) -> dict[int, tuple[float, float]]:
     for track in tracks:
         try:
             pos[track.track_id] = projector.project(track.bbox.foot_point)
-        except Exception:  # noqa: BLE001 - bad calibration, skip this point
+        except (ArithmeticError, ValueError) as error:
+            print(f"Projection skipped for G{track.track_id}: {error}")
             continue
     return pos
 
@@ -410,9 +410,12 @@ def _sane_box(bbox, frame_width: int, frame_height: int) -> bool:
         return False
     if bbox.width < 8 or bbox.height < 16:
         return False
-    if bbox.x2 < 0 or bbox.y2 < 0 or bbox.x1 > frame_width or bbox.y1 > frame_height:
-        return False
-    return True
+    return not (
+        bbox.x2 < 0
+        or bbox.y2 < 0
+        or bbox.x1 > frame_width
+        or bbox.y1 > frame_height
+    )
 
 
 def draw_business_states(frame: np.ndarray, tracks, states: dict[int, str]) -> np.ndarray:
@@ -519,13 +522,16 @@ def _merge_same_person_stale(
     day_cache, write_queue, supabase, gid_alias,
     gid_to_person, gid_to_display,
     day_str: str, canon_gid: int, person_id: str, display_name: str,
-    manager, business_trackers=(),
+    manager, business_trackers=(), now_s: float | None = None,
+    channel: str = "",
 ) -> None:
     """Alias duplicate Global IDs of the same face-matched person.
 
     Fixes the G1-OUT + G2-Working split-brain: when the same human was
     fragmented across IDs, the older Global ID is kept as canonical and the
     newer duplicate is backfilled with person info + merged_into.
+
+    Face-confirmed duplicates are merged even in overlapping camera views.
     """
     matching_gids = {
         gid for gid, pid in gid_to_person.items()
@@ -557,9 +563,9 @@ def _merge_same_person_stale(
         for tracker in business_trackers:
             try:
                 tracker.transfer_assignment(old_gid, canonical_gid)
-            except Exception:  # noqa: BLE001 - never break the loop
-                pass
-        cached = day_cache._status.get((day_str, old_gid))
+            except (KeyError, ValueError) as error:
+                print(f"Workstate transfer G{old_gid}->{canonical_gid} skipped: {error}")
+        cached = day_cache.status_of(day_str, old_gid)
         _store_or_queue(write_queue, supabase, "room_status", {
             "date": day_str, "global_id": old_gid,
             "person_id": person_id, "person_name": display_name,
@@ -625,9 +631,9 @@ def _reconcile_unknowns(
         for tracker in business_trackers:
             try:
                 tracker.transfer_assignment(old_gid, canon_gid)
-            except Exception:  # noqa: BLE001 - never break the loop
-                pass
-        cached = day_cache._status.get((day_str, old_gid))
+            except (KeyError, ValueError) as error:
+                print(f"Workstate transfer G{old_gid}->{canon_gid} skipped: {error}")
+        cached = day_cache.status_of(day_str, old_gid)
         _store_or_queue(write_queue, supabase, "room_status", {
             "date": day_str, "global_id": old_gid,
             "person_id": person_id, "person_name": display_name,
@@ -635,10 +641,7 @@ def _reconcile_unknowns(
             "label": cached.label if cached else LABEL_UNKNOWN,
             "merged_into": canon_gid,
         })
-        try:
-            supabase.reassign_face_crops(day_str, owner, person_id)
-        except Exception:  # noqa: BLE001 - best effort, files stay put
-            pass
+        supabase.reassign_face_crops(day_str, owner, person_id)
         reconciler.forget(owner)
         print(f"[Reconcile] G{old_gid} ({owner}) -> G{canon_gid} {display_name}")
 
@@ -646,7 +649,7 @@ def _reconcile_unknowns(
 def _prune_identity_maps(
     manager, gid_to_person, gid_to_display, gid_to_score,
     unknown_of_gid, reconciler, fusion, business_trackers=(),
-    face_consumer=None,
+    face_consumer=None, attendance=None, now_s: float = 0.0,
 ) -> None:
     """Drop per-ID memory for identities the manager already retired.
 
@@ -665,6 +668,11 @@ def _prune_identity_maps(
         tracker.forget_retired(alive)
     for gid in [g for g in list(fusion._was_out) if g not in alive]:
         fusion.forget(gid)
+    if attendance is not None:
+        try:
+            attendance.prune(now_s, alive)
+        except (AttributeError, TypeError, ValueError):
+            pass
 
 
 def _snapshot_new_gids(
@@ -694,8 +702,8 @@ def _snapshot_new_gids(
             crop = _person_crop(frame, bbox)
             if crop is not None and crop.size > 0:
                 cv2.imwrite(str(ghosts_dir / f"G{gid}_{channel}_first.jpg"), crop)
-        except Exception:  # noqa: BLE001 - inspection only, never fatal
-            pass
+        except (OSError, ValueError, cv2.error) as error:
+            print(f"Ghost snapshot G{gid} skipped: {error}")
 
 
 def main() -> None:
@@ -725,9 +733,6 @@ def main() -> None:
 
     detector = YoloPersonDetector(
         model_path=model_path,
-        # Recall-first: feed exactly the configured confidence (0.25).
-        # Giu box yeu khi che de ByteTrack + GlobalID noi lai; loc ghost
-        # bang --min-area + --new-track-conf + prune ve sau.
         confidence=config.detection.confidence_threshold,
         person_class_id=config.detection.person_class_id,
         image_size=image_size,
@@ -741,28 +746,23 @@ def main() -> None:
     tracker_a = ByteTrackTracker(
         frame_rate=effective_fps,
         track_buffer=config.tracking.track_buffer,
-        track_high_threshold=args.new_track_conf,
-        track_low_threshold=args.new_track_conf,
-        new_track_threshold=args.new_track_conf,
+        track_high_threshold=config.tracking.track_high_threshold,
+        track_low_threshold=config.tracking.track_low_threshold,
+        new_track_threshold=config.tracking.new_track_threshold,
         match_threshold=config.tracking.byte_match_threshold,
         min_hits=config.tracking.min_hits,
     )
     tracker_b = ByteTrackTracker(
         frame_rate=effective_fps,
         track_buffer=config.tracking.track_buffer,
-        track_high_threshold=args.new_track_conf,
-        track_low_threshold=args.new_track_conf,
-        new_track_threshold=args.new_track_conf,
+        track_high_threshold=config.tracking.track_high_threshold,
+        track_low_threshold=config.tracking.track_low_threshold,
+        new_track_threshold=config.tracking.new_track_threshold,
         match_threshold=config.tracking.byte_match_threshold,
         min_hits=config.tracking.min_hits,
     )
     identity_cfg = config.identity
-    if args.match_threshold is not None:
-        identity_cfg = identity_cfg.model_copy(
-            update={"match_threshold": args.match_threshold}
-        )
-    # Shared InsightFace (dung chung cho ReID mat + diem danh, load 1 lan).
-    # Can truoc manager vi reid_backend=face lay embedding mat lam appearance.
+    # Face identification is independent from body ReID continuity.
     from camera_tracking.face import InsightFaceEmbedder as _IFEmbedder
     face_cfg_early = config.face
     if args.face_channels is not None:
@@ -770,8 +770,7 @@ def main() -> None:
             update={"channels": [c for c in args.face_channels.upper() if c in ("A", "B")] or ["B"]}
         )
     _need_iface = bool(
-        (face_cfg_early.enabled and not args.no_face and face_cfg_early.channels)
-        or identity_cfg.reid_backend == "face"
+        face_cfg_early.enabled and not args.no_face and face_cfg_early.channels
     )
     shared_face_embedder = None
     if _need_iface:
@@ -785,35 +784,21 @@ def main() -> None:
             shared_face_embedder._load()
             print(f"InsightFace {face_cfg_early.model_pack} "
                   f"({shared_face_embedder.resolved_device})")
-        except Exception as error:  # noqa: BLE001 - fallback body, van chay
-            print(f"InsightFace unavailable, ReID/face fallback body: {error}")
+        except Exception as error:  # noqa: BLE001 - face may be disabled explicitly
+            print(f"InsightFace unavailable; employee recognition disabled: {error}")
             shared_face_embedder = None
+    embedder = OsnetEmbedding(
+        model_name=identity_cfg.reid_model,
+        device=identity_cfg.reid_device,
+    )
     try:
-        if identity_cfg.reid_backend == "face" and shared_face_embedder is not None:
-            from camera_tracking.face import FaceReIDEmbedding
-            embedder = FaceReIDEmbedding(
-                shared_face_embedder,
-                min_face_px=identity_cfg.face_min_px,
-            )
-            print("ReID: FACE (InsightFace, quay lung = khong ep match)")
-        elif identity_cfg.reid_backend == "osnet":
-            embedder = OsnetEmbedding(
-                model_name=identity_cfg.reid_model,
-                device=identity_cfg.reid_device,
-            )
-            # Validate the optional backend before opening camera streams.
-            embedder.load()
-            print(f"ReID: OSNet {identity_cfg.reid_model} ({identity_cfg.reid_device})")
-        else:
-            if identity_cfg.reid_backend == "face":
-                print("ReID face requested nhung thieu InsightFace "
-                      "-> HSV histogram fallback")
-            else:
-                print("ReID: HSV histogram fallback")
-            embedder = HistogramEmbedding()
-    except Exception as error:  # optional backend must not stop camera startup
-        print(f"ReID backend unavailable, fallback histogram: {error}")
-        embedder = HistogramEmbedding()
+        embedder.load()
+    except (ImportError, OSError, RuntimeError) as error:
+        raise RuntimeError(
+            "Production tracking requires OSNet; install the reid extra and "
+            "make the model available. No histogram fallback is allowed."
+        ) from error
+    print(f"ReID: OSNet {identity_cfg.reid_model} ({identity_cfg.reid_device})")
 
     # Mot GlobalIdentityManager dung chung cho ca 2 channel -> Global ID
     # xuyen tracklet, xuyen mat dau dai, xuyen channel.
@@ -827,9 +812,14 @@ def main() -> None:
             channel_weight=identity_cfg.channel_weight,
             match_threshold=identity_cfg.match_threshold,
             max_center_distance_ratio=identity_cfg.max_center_distance_ratio,
+            same_camera_reconnect_distance_ratio=(
+                identity_cfg.same_camera_reconnect_distance_ratio
+            ),
+            same_camera_reconnect_s=identity_cfg.same_camera_reconnect_s,
             min_appearance_similarity=identity_cfg.min_appearance_similarity,
             named_appearance_floor=identity_cfg.named_appearance_floor,
             active_duplicate_similarity=identity_cfg.active_duplicate_similarity,
+            tentative_min_hits=identity_cfg.tentative_min_hits,
             temp_lost_s=identity_cfg.temp_lost_s,
             long_lost_s=identity_cfg.long_lost_s,
             unresolved_keep_s=identity_cfg.unresolved_keep_s,
@@ -837,6 +827,15 @@ def main() -> None:
             gallery_refresh_steps=identity_cfg.gallery_refresh_steps,
         ),
     )
+    identity_store = DailyIdentityStore(
+        identity_cfg.state_db,
+        model_key=f"osnet:{identity_cfg.reid_model}",
+    )
+    startup_day = datetime.now().astimezone().date().isoformat()
+    current_identity_day = startup_day
+    restored_identities = identity_store.load(startup_day, manager)
+    if restored_identities:
+        print(f"Restored {restored_identities} identities for {startup_day}")
     # Business theo channel: position (workstation ROI) + presence,
     # khong bao gio anh huong ID. Channel A (room) dung ROI; channel B
     # (door) presence-only. Trong workstations = fallback presence-only.
@@ -887,15 +886,17 @@ def main() -> None:
         away_grace_s=args.away_grace_s,
         out_after_s=args.out_after_s,
         return_stable_s=args.return_stable_s,
-        workstations=ws_zones if use_roi else [],
+        # Channel B là camera cửa (transit): luôn presence-only, không dùng
+        # workstation ROI của phòng A để khỏi gán nhầm Working/Near seat.
+        workstations=[],
         grace_s=ws_cfg.grace_s,
         dwell_s=ws_cfg.dwell_s,
         assign_dwell_s=ws_cfg.assign_dwell_s,
         hysteresis_m=ws_cfg.hysteresis_m,
         motion_influence=ws_cfg.motion_influence,
-        person_map=dict(ws_cfg.person_map),
+        person_map={},
         prune_after_s=ws_cfg.prune_after_s,
-        move_ratio=move_ratio,
+        move_ratio=0.0,
         settle_ratio=ws_cfg.settle_ratio,
     )
     workstate_a = WorkstateConsumer(business_a)
@@ -907,7 +908,7 @@ def main() -> None:
     # Tat ca optional: thieu model/lib/.env van chay tracking nhu cu.
     # Dung lai shared_face_embedder da load o tren (ReID mat) neu co.
     face_cfg = face_cfg_early
-    face_threshold = args.face_threshold or face_cfg.match_threshold
+    face_threshold = face_cfg.match_threshold
     use_face = bool(face_cfg.enabled and not args.no_face and face_cfg.channels)
     face_embedder = shared_face_embedder
     face_matcher = face_gallery = attendance = face_consumer = None
@@ -929,23 +930,42 @@ def main() -> None:
                 FaceMatcher,
                 load_gallery,
             )
-            from camera_tracking.face.gallery import load_registry
+            from camera_tracking.face.gallery import load_registry, save_prototype
             face_gallery = load_gallery(
                 face_cfg.gallery_dir,
                 face_embedder,
                 face_cfg.name_map,
                 face_cfg.employee_map,
             )
-            face_matcher = FaceMatcher(face_gallery, threshold=face_threshold)
+            face_matcher = FaceMatcher(
+                face_gallery,
+                threshold=face_threshold,
+                min_margin=face_cfg.min_margin,
+            )
             from camera_tracking.face import FaceTrackConsumer
             face_consumer = FaceTrackConsumer(
                 face_embedder,
                 face_matcher,
                 min_person_area_px=face_cfg.min_person_area_px,
                 min_face_px=face_cfg.min_face_px,
+                min_face_score=face_cfg.min_face_score,
                 min_blur_variance=face_cfg.min_blur_variance,
                 channels=tuple(face_cfg.channels),
+                consensus_hits=face_cfg.consensus_hits,
+                consensus_window_s=face_cfg.consensus_window_s,
             )
+            enrolled_by_employee = {
+                (person.employee_id or person.person_id): person
+                for person in face_gallery.people
+            }
+            for restored_gid, restored in manager.identities.items():
+                if not restored.employee_id:
+                    continue
+                person = enrolled_by_employee.get(restored.employee_id)
+                if person is None:
+                    continue
+                gid_to_person[restored_gid] = restored.employee_id
+                gid_to_display[restored_gid] = person.display_name
             attendance = FaceAttendanceService(
                 debounce_hits=config.attendance.debounce_hits,
                 window_s=config.attendance.window_s,
@@ -953,7 +973,9 @@ def main() -> None:
                 active_hour_end=config.attendance.active_hour_end,
             )
             print(f"Face gallery: {len(face_gallery)} nguoi tu {face_cfg.gallery_dir} "
-                  f"| threshold={face_threshold} | channels={list(face_cfg.channels)}")
+                  f"| threshold={face_threshold} margin={face_cfg.min_margin} "
+                  f"consensus={face_cfg.consensus_hits} "
+                  f"| channels={list(face_cfg.channels)}")
         except ImportError as error:
             print(f"Face disabled (thieu module: {error})")
             use_face = False
@@ -989,8 +1011,38 @@ def main() -> None:
     else:
         print("Supabase: disabled; writes remain in local queue.")
     fusion = RoomPresenceAggregator(
-        leave_confirm_window_s=config.room_fusion.leave_confirm_window_s
+        leave_confirm_window_s=config.room_fusion.leave_confirm_window_s,
+        absent_fallback_s=config.room_fusion.absent_fallback_s,
     )
+    # Preload attendance đã tick trong ngày từ Supabase để restart giữa ngày
+    # không tick trùng (RAM-only trước đây là lỗ hổng thực tế).
+    if attendance is not None:
+        try:
+            from camera_tracking.face.attendance import AttendanceRecord as _AR
+
+            preloaded = []
+            for row in supabase.fetch_attendance_day(startup_day):
+                try:
+                    preloaded.append(_AR(
+                        day=str(row.get("date", startup_day)),
+                        person_id=str(row.get("person_id", "")),
+                        display_name=str(row.get("person_name")
+                                         or row.get("person_id", "")),
+                        global_id=int(row.get("global_id") or 0),
+                        first_seen_at=0.0,
+                        wall_time=str(row.get("check_in_at") or ""),
+                        face_score=float(row.get("face_score") or 0.0),
+                    ))
+                except (TypeError, ValueError):
+                    continue
+            preloaded = [r for r in preloaded if r.person_id]
+            if preloaded:
+                attendance.preload(preloaded)
+                day_cache.preload_attendance(
+                    startup_day, [r.person_id for r in preloaded])
+                print(f"Preloaded {len(preloaded)} attendance từ DB ({startup_day})")
+        except Exception as error:  # noqa: BLE001 - offline vẫn chạy RAM-only
+            print(f"Preload attendance bỏ qua (offline): {error}")
     room_status_now: dict = {}
     last_flush_s = 0.0
     last_metrics_log_s = 0.0
@@ -1213,6 +1265,72 @@ def main() -> None:
     face_marks_a: list = []  # (x1,y1,x2,y2,score,known) for cam A overlay
     face_marks_b: list = []  # (x1,y1,x2,y2,score,known) for cam B overlay
     frame_hub = FrameHub()
+    from camera_tracking.evaluation import IdentityTraceWriter
+    identity_trace = IdentityTraceWriter(args.identity_log)
+    # Voice vay tay: opt-in bang --greet; TTS cache + Imou AudioTalk bridge.
+    voice_cfg = config.voice
+    voice_on = bool(args.greet or voice_cfg.enabled)
+    wave_detector = greeter = None
+    voice_bridge = None
+    voice_tick = 0
+    if voice_on:
+        try:
+            from camera_tracking.gesture.wave import (
+                MediaPipeHandDetector,
+                WaveDetector,
+            )
+            from camera_tracking.voice.greeter import VoiceGreeter
+
+            hand_detector = MediaPipeHandDetector()
+            if not hand_detector.available:
+                raise RuntimeError("mediapipe hands unavailable")
+            wave_detector = WaveDetector(
+                window_s=voice_cfg.wave_window_s,
+                min_reversals=voice_cfg.wave_min_reversals,
+                cooldown_s=voice_cfg.wave_cooldown_s,
+                hand_detector=hand_detector,
+            )
+            voice_output = None
+            if voice_cfg.backend == "imou_web":
+                from camera_tracking.voice.imou_bridge import (
+                    ImouAudioTalkBridge,
+                    ImouAudioTalkOutput,
+                )
+
+                voice_bridge = ImouAudioTalkBridge.from_env(
+                    host=voice_cfg.bridge_host,
+                    port=voice_cfg.bridge_port,
+                    command_ttl_s=voice_cfg.command_ttl_s,
+                    talk_tail_s=voice_cfg.talk_tail_s,
+                    launch_browser=voice_cfg.launch_browser,
+                )
+                voice_bridge.start()
+                voice_output = ImouAudioTalkOutput(voice_bridge)
+            greeter = VoiceGreeter(
+                cache_dir=voice_cfg.cache_dir,
+                voice=voice_cfg.voice,
+                cooldown_s=voice_cfg.cooldown_s,
+                unknown_phrase=voice_cfg.unknown_phrase,
+                max_queue_age_s=voice_cfg.command_ttl_s,
+                output=voice_output,
+            )
+            greeter.start()
+            phrases = [voice_cfg.unknown_phrase]
+            if face_gallery is not None:
+                phrases.extend(
+                    f"Xin chào {person.display_name}" for person in face_gallery.people
+                )
+            greeter.prewarm(phrases)
+            print(f"Voice: {voice_cfg.backend}, greet on wave ({voice_cfg.voice}, "
+                  f"cooldown {voice_cfg.cooldown_s:.0f}s, TTL "
+                  f"{voice_cfg.command_ttl_s:.0f}s).")
+        except (ImportError, OSError, RuntimeError, ValueError) as error:
+            print(f"Voice disabled ({error})")
+            voice_on = False
+            wave_detector = greeter = None
+            if voice_bridge is not None:
+                voice_bridge.close()
+                voice_bridge = None
     # Live event feed cho dashboard (kiosk + admin): 20 su kien moi nhat,
     # song song voi WriteQueue -> Supabase (kiosk thay ngay ca khi offline).
     recent_events: deque = deque(maxlen=20)
@@ -1249,9 +1367,8 @@ def main() -> None:
             frame=Frame(frame_idx, now_s, frame),
             tracks=tuple(confirmed_tracks),
         )
-        with metrics.measure("face"):
-            with face_model_lock:
-                observations = face_consumer.consume(event, now_s)
+        with metrics.measure("face"), face_model_lock:
+            observations = face_consumer.consume(event, now_s)
         for observation in observations:
             track = observation.track
             crop = observation.crop_bgr
@@ -1273,30 +1390,73 @@ def main() -> None:
                     match.person.employee_id
                     or match.person.person_id
                 )
-                manager.bind_employee(track.track_id, employee_id)
-                gid_to_score[track.track_id] = match.score
-                gid_to_person[track.track_id] = employee_id
+                identity_gid = track.track_id
+                # A confirmed employee is an immutable anchor. A second GID
+                # with the same consensus is merged into the existing entity;
+                # it never steals the employee because of one higher score.
+                conflict_gid = next(
+                    (gid for gid, record in manager.identities.items()
+                     if gid != identity_gid
+                     and gid not in gid_alias
+                     and record.employee_id == employee_id),
+                    None,
+                )
+                if conflict_gid is not None:
+                    if not manager.merge_identity(identity_gid, conflict_gid):
+                        print(f"[Identity conflict] {employee_id}: keep "
+                              f"G{conflict_gid}; G{identity_gid} stays UNKNOWN")
+                        continue
+                    gid_alias[identity_gid] = conflict_gid
+                    identity_gid = conflict_gid
+                if not manager.bind_employee(identity_gid, employee_id):
+                    print(f"[Identity conflict] refused {employee_id} -> G{identity_gid}")
+                    continue
+                gid_to_score[identity_gid] = max(
+                    match.score, gid_to_score.get(identity_gid, 0.0)
+                )
+                gid_to_person[identity_gid] = employee_id
                 # Show the name as soon as the face matches
                 # (DB tick stays debounced below).
-                gid_to_display[track.track_id] = \
+                gid_to_display[identity_gid] = \
                     match.person.display_name
+                # Chỉ grow gallery từ quan sát chất lượng cao để chống
+                # prototype pollution (ảnh mờ/góc xấu làm bẩn gallery).
+                if (
+                    observation.quality >= 0.25
+                    and observation.sharpness >= 40.0
+                    and face_gallery.add_prototype(
+                        match.person.person_id,
+                        det.embedding,
+                        seed_similarity=match.score,
+                        min_seed_similarity=face_cfg.gallery_accept_threshold,
+                        max_prototypes=face_cfg.gallery_max_prototypes,
+                    )
+                ):
+                    save_prototype(
+                        face_cfg.gallery_dir,
+                        match.person.person_id,
+                        det.embedding,
+                        index=len(match.person.prototypes),
+                    )
                 ticked = attendance.observe(
-                    day=day_str, global_id=track.track_id,
+                    day=day_str, global_id=identity_gid,
                     person_id=employee_id,
                     display_name=match.person.display_name,
                     score=match.score, now_s=now_s,
                     wall_time_iso=wall_iso,
                 )
-                if ticked is not None:
-                    if day_cache.attendance_should_write(
-                            day_str, ticked.person_id):
+                if (
+                    ticked is not None
+                    and day_cache.attendance_should_write(day_str, ticked.person_id)
+                ):
                         _store_or_queue(write_queue, supabase, "attendance", {
                             "date": day_str, "person_id": ticked.person_id,
                             "person_name": ticked.display_name,
                             "global_id": ticked.global_id,
                             "attended": True, "check_in_at": wall_iso,
                             "face_score": ticked.face_score,
-                            "needs_review": False,
+                            # Tick biên (vừa đủ ngưỡng) cần admin review tay.
+                            "needs_review": bool(ticked.face_score < 0.80),
                         })
                         _store_or_queue(write_queue, supabase, "event", {
                             "date": day_str, "global_id": ticked.global_id,
@@ -1320,7 +1480,7 @@ def main() -> None:
                         day_cache, write_queue, supabase,
                         reconciler, gid_alias, gid_to_person,
                         gid_to_display, unknown_of_gid,
-                        day_str, track.track_id,
+                        day_str, identity_gid,
                         employee_id,
                         match.person.display_name,
                         match.person.embedding,
@@ -1333,14 +1493,15 @@ def main() -> None:
                     day_cache, write_queue, supabase,
                     gid_alias, gid_to_person,
                     gid_to_display, day_str,
-                    track.track_id,
+                    identity_gid,
                     employee_id,
                     match.person.display_name,
                     manager, (business_a, business_b),
+                    now_s=now_s, channel=channel,
                 )
                 local = crop_saver.save_best_crop(
                     day=day_str, owner=employee_id,
-                    known=True, global_id=track.track_id,
+                    known=True, global_id=identity_gid,
                     image_bgr=crop, face_score=match.score,
                     sharpness=sharp, time_tag=time_tag,
                 )
@@ -1374,6 +1535,23 @@ def main() -> None:
     try:
         while True:
             now_s = time.time() - start
+            local_day = datetime.now().astimezone().date().isoformat()
+            if local_day != current_identity_day:
+                identity_store.save(current_identity_day, manager)
+                old_gids = set(manager.identities)
+                for gid in old_gids:
+                    fusion.forget(gid)
+                    business_a.forget(gid)
+                    business_b.forget(gid)
+                manager.reset_for_new_day()
+                identity_store.load(local_day, manager)
+                gid_to_person.clear()
+                gid_to_display.clear()
+                gid_to_score.clear()
+                gid_alias.clear()
+                unknown_of_gid.clear()
+                unknown_counter = 0
+                current_identity_day = local_day
             ret_a, frame_a = stream_a.read()
             ret_b, frame_b = stream_b.read()
             if not ret_a and not ret_b:
@@ -1423,74 +1601,62 @@ def main() -> None:
                         zip(batch_names, detector.detect_batch(batch_images), strict=True)
                     )
 
-            # --- Channel A: ByteTrack (ngan han) + Global ID (toan cuc) ---
-            if ret_a and frame_a is not None:
-                if process_frame:
-                    with metrics.measure("tracking_A"):
-                        tracks_a = tracker_a.update(batch_detections["A"])
-                        tracks_a = [t for t in tracks_a
-                                    if t.bbox.area >= args.min_area
-                                    and _sane_box(t.bbox, config.camera.frame_width,
-                                                  config.camera.frame_height)]
-                        confirmed_a = manager.update(
-                            channel="A",
-                            frame=frame_a,
-                            tracks=[t for t in tracks_a if t.confirmed],
-                            now_s=now_s,
+            # Local trackers run independently; global association sees both
+            # cameras at one timestamp and may return the same GID in overlap.
+            if process_frame:
+                identity_inputs: dict[str, tuple[np.ndarray, list[Track]]] = {}
+                for channel, frame, tracker in (
+                    ("A", frame_a if ret_a else None, tracker_a),
+                    ("B", frame_b if ret_b else None, tracker_b),
+                ):
+                    if frame is None:
+                        continue
+                    with metrics.measure(f"tracking_{channel}"):
+                        local_tracks = tracker.update(batch_detections[channel])
+                    local_tracks = [
+                        track for track in local_tracks
+                        if track.confirmed
+                        and track.bbox.area >= args.min_area
+                        and _sane_box(
+                            track.bbox,
+                            config.camera.frame_width,
+                            config.camera.frame_height,
                         )
+                    ]
+                    identity_inputs[channel] = (frame, local_tracks)
+                global_tracks = manager.update_batch(identity_inputs, now_s=now_s)
+                confirmed_a = global_tracks.get("A", [])
+                confirmed_b = global_tracks.get("B", [])
+                if ret_a and frame_a is not None:
                     last_tracks_a = confirmed_a
                     count_a.update(len(confirmed_a))
-                    if use_roi:
-                        floor_a = _track_floor_points(confirmed_a, projector)
-                    else:
-                        # Interim: normalized centers, displacement mode.
-                        floor_a = _track_norm_centers(
-                            confirmed_a, config.camera.frame_width,
-                            config.camera.frame_height)
+                    floor_a = (
+                        _track_floor_points(confirmed_a, projector)
+                        if use_roi
+                        else _track_norm_centers(
+                            confirmed_a,
+                            config.camera.frame_width,
+                            config.camera.frame_height,
+                        )
+                    )
                     states_a = workstate_a.consume(
                         TrackEvent("A", Frame(frame_idx, now_s, frame_a), tuple(confirmed_a)),
                         floor_a,
                         gid_to_person,
                     )
-                    last_states_a = {g: s.value for g, s in states_a.items()}
-                    if face_tick_a:
-                        now_dt_a = datetime.now().astimezone()
-                        _process_face_channel(
-                            channel="A", frame=frame_a,
-                            confirmed_tracks=confirmed_a,
-                            face_marks=face_marks_a,
-                            day_str=now_dt_a.date().isoformat(),
-                            wall_iso=now_dt_a.isoformat(timespec="seconds"),
-                            time_tag=now_dt_a.strftime("%H%M%S"),
-                            now_s=now_s,
-                        )
-                else:
-                    confirmed_a = last_tracks_a
-
-            # --- Channel B: ByteTrack + Global ID + Face diem danh ---
-            if ret_b and frame_b is not None:
-                if process_frame:
-                    with metrics.measure("tracking_B"):
-                        tracks_b = tracker_b.update(batch_detections["B"])
-                        tracks_b = [t for t in tracks_b
-                                    if t.bbox.area >= args.min_area
-                                    and _sane_box(t.bbox, config.camera.frame_width,
-                                                  config.camera.frame_height)]
-                        confirmed_b = manager.update(
-                            channel="B",
-                            frame=frame_b,
-                            tracks=[t for t in tracks_b if t.confirmed],
-                            now_s=now_s,
-                        )
+                    last_states_a = {gid: state.value for gid, state in states_a.items()}
+                if ret_b and frame_b is not None:
                     last_tracks_b = confirmed_b
                     count_b.update(len(confirmed_b))
-                    if use_roi:
-                        floor_b = _track_floor_points(confirmed_b, projector)
-                    else:
-                        # Interim: normalized centers, displacement mode (nhu A).
-                        floor_b = _track_norm_centers(
-                            confirmed_b, config.camera.frame_width,
-                            config.camera.frame_height)
+                    floor_b = (
+                        _track_floor_points(confirmed_b, projector)
+                        if use_roi
+                        else _track_norm_centers(
+                            confirmed_b,
+                            config.camera.frame_width,
+                            config.camera.frame_height,
+                        )
+                    )
                     try:
                         states_b = workstate_b.consume(
                             TrackEvent("B", Frame(frame_idx, now_s, frame_b), tuple(confirmed_b)),
@@ -1498,25 +1664,25 @@ def main() -> None:
                             gid_to_person,
                         )
                     except (KeyError, ValueError, RuntimeError) as error:
-                        # Attendance remains usable if a workstation rule or
-                        # calibration input is malformed for one tick.
                         print(f"Workstate B skipped for frame: {error}")
                         states_b = {}
-                    last_states_b = {g: s.value for g, s in states_b.items()}
-
-                    if face_tick_b:
-                        now_dt = datetime.now().astimezone()
+                    last_states_b = {gid: state.value for gid, state in states_b.items()}
+                now_dt = datetime.now().astimezone()
+                for channel, frame, tracks, marks, should_run in (
+                    ("A", frame_a if ret_a else None, confirmed_a, face_marks_a, face_tick_a),
+                    ("B", frame_b if ret_b else None, confirmed_b, face_marks_b, face_tick_b),
+                ):
+                    if frame is not None and should_run:
                         _process_face_channel(
-                            channel="B", frame=frame_b,
-                            confirmed_tracks=confirmed_b,
-                            face_marks=face_marks_b,
+                            channel=channel,
+                            frame=frame,
+                            confirmed_tracks=tracks,
+                            face_marks=marks,
                             day_str=now_dt.date().isoformat(),
                             wall_iso=now_dt.isoformat(timespec="seconds"),
                             time_tag=now_dt.strftime("%H%M%S"),
                             now_s=now_s,
                         )
-                else:
-                    confirmed_b = last_tracks_b
 
             active_merges = manager.reconcile_active_duplicates()
             for duplicate_gid, canonical_gid in active_merges.items():
@@ -1527,8 +1693,11 @@ def main() -> None:
                 for tracker in (business_a, business_b):
                     try:
                         tracker.transfer_assignment(duplicate_gid, canonical_gid)
-                    except Exception:  # noqa: BLE001 - merge must not stop video
-                        pass
+                    except (KeyError, ValueError) as error:
+                        print(
+                            f"Workstate merge G{duplicate_gid}->{canonical_gid} "
+                            f"skipped: {error}"
+                        )
                 print(
                     f"[Reconcile] active G{duplicate_gid} -> "
                     f"G{canonical_gid} (high ReID similarity)"
@@ -1538,6 +1707,9 @@ def main() -> None:
             # older canonical GID. Rewrite live tracks before fusion/render.
             last_tracks_a = _remap_tracks(last_tracks_a, gid_alias, manager)
             last_tracks_b = _remap_tracks(last_tracks_b, gid_alias, manager)
+            if process_frame:
+                identity_trace.write(frame_idx, "A", last_tracks_a, gid_to_person)
+                identity_trace.write(frame_idx, "B", last_tracks_b, gid_to_person)
 
             # --- Fuse trang thai phong A+B (moi frame xu ly) ---
             if process_frame:
@@ -1564,8 +1736,7 @@ def main() -> None:
                     # Tentative identities (too young) never touch the DB:
                     # ghost boxes die here instead of polluting history.
                     record = manager.identities.get(wgid)
-                    established = (record is not None and record.total_hits
-                                   >= ws_cfg.tentative_min_hits)
+                    established = record is not None
                     write_row, log_event = day_cache.status_should_write(
                         day=day_str, global_id=wgid, label=st.label,
                         in_room=st.in_room, now_s=now_s,
@@ -1592,7 +1763,9 @@ def main() -> None:
                             person_name=gid_to_display.get(wgid),
                         )
                     if write_row and established:
-                        row = day_cache._status[(day_str, wgid)]
+                        row = day_cache.status_of(day_str, wgid)
+                        if row is None:
+                            continue
                         _store_or_queue(write_queue, supabase, "room_status", {
                             "date": day_str, "global_id": wgid,
                             "person_id": gid_to_person.get(wgid),
@@ -1609,6 +1782,7 @@ def main() -> None:
                                 "since": row.last_enter_at or wall_iso,
                                 "camera_id": "A" if gid in present_a else "B",
                                 "global_id": wgid,
+                                "confidence": gid_to_score.get(wgid),
                                 "updated_at": wall_iso,
                             })
                 if now_s - last_flush_s >= config.room_fusion.flush_s:
@@ -1617,8 +1791,62 @@ def main() -> None:
                         manager, gid_to_person, gid_to_display,
                         gid_to_score, unknown_of_gid, reconciler,
                         fusion, (business_a, business_b),
-                        face_consumer,
+                        face_consumer, attendance, now_s,
                     )
+                    identity_store.save(day_str, manager)
+                # --- Wave -> voice: vay tay thi chao (quen ten / la troll) ---
+                if voice_on and wave_detector is not None and greeter is not None:
+                    voice_tick += 1
+                    if voice_tick % max(1, voice_cfg.wave_every_k) == 0:
+                        with metrics.measure("wave"):
+                            for _ch, _frame, _tracks in (
+                                ("A", frame_a if ret_a else None, last_tracks_a),
+                                ("B", frame_b if ret_b else None, last_tracks_b),
+                            ):
+                                if _frame is None:
+                                    continue
+                                biggest = sorted(
+                                    _tracks, key=lambda t: t.bbox.area,
+                                    reverse=True,
+                                )[:max(1, voice_cfg.wave_max_people)]
+                                for _track in biggest:
+                                    _crop = _person_crop(_frame, _track.bbox)
+                                    if _crop is None:
+                                        continue
+                                    try:
+                                        waved = wave_detector.observe(
+                                            _track.track_id, _crop, now_s)
+                                    except RuntimeError:
+                                        waved = False
+                                    if not waved:
+                                        continue
+                                    _gid = _track.track_id
+                                    # Manager la nguon authoritative. Neu face worker
+                                    # chua tra ket qua thi bo qua, khong troll nham.
+                                    _bound_employee = manager.employee_id_of(_gid)
+                                    _mapped_employee = gid_to_person.get(_gid)
+                                    if (_bound_employee is not None
+                                            and _mapped_employee == _bound_employee):
+                                        _pid = _bound_employee
+                                        _name = gid_to_display.get(_gid)
+                                        if not _name:
+                                            continue
+                                    elif _gid in unknown_of_gid:
+                                        _pid = _name = None
+                                    else:
+                                        continue
+                                    if greeter.wave_greet(
+                                        day=day_str, person_id=_pid,
+                                        display_name=_name, now_s=now_s,
+                                        global_id=_gid,
+                                    ):
+                                        _note_event(
+                                            event="WAVE", global_id=_gid,
+                                            channel=_ch, at_iso=wall_iso,
+                                            person_id=_pid, person_name=_name,
+                                        )
+                                        print(f"[Wave][{_ch}] "
+                                              f"{_name or 'Unknown'} (G{_gid})")
 
             # --- Live view: annotated Global-ID frames for window/stream ---
             need_vis = args.display or stream_on
@@ -1676,7 +1904,17 @@ def main() -> None:
                             "label": st.label,
                             "in_room": st.in_room,
                             "face_score": gid_to_score.get(gid),
+                            "identity_state": (
+                                "employee" if gid_to_person.get(gid) else "unknown"
+                            ),
+                            "identity_confidence": (
+                                identity.last_match_score if identity else None
+                            ),
+                            "employee_confidence": gid_to_score.get(gid),
                             "camera": identity.channel if identity else None,
+                            "cameras": (
+                                sorted(identity.sightings) if identity else []
+                            ),
                             "tracking_state": (
                                 identity.state.value if identity else None
                             ),
@@ -1723,6 +1961,10 @@ def main() -> None:
             if args.max_frames is not None and frame_idx >= args.max_frames:
                 break
     finally:
+        identity_trace.close()
+        identity_store.save(
+            current_identity_day, manager
+        )
         try:
             write_worker.stop()
         except Exception as error:  # noqa: BLE001
@@ -1731,6 +1973,8 @@ def main() -> None:
             jpeg_renderer.stop()
         if streamer is not None:
             streamer.stop()
+        if voice_bridge is not None:
+            voice_bridge.close()
         stream_a.close()
         stream_b.close()
         cv2.destroyAllWindows()
@@ -1743,7 +1987,7 @@ def main() -> None:
         record = manager.identities[gid]
         print(f"  G{gid}: state={record.state.value} last_channel={record.channel} "
               f"hits={record.total_hits} gallery={len(record.gallery)}")
-    ghost_hits = max(10, 2 * ws_cfg.tentative_min_hits)
+    ghost_hits = max(10, 2 * identity_cfg.tentative_min_hits)
     ghosts = sorted(
         ((gid, manager.identities[gid].total_hits) for gid in gids
          if manager.identities[gid].total_hits < ghost_hits),
@@ -1754,23 +1998,17 @@ def main() -> None:
               + ", ".join(f"G{g}({h})" for g, h in ghosts)
               + f" — crop dau xem tai {ghosts_dir}/")
     if attendance is not None:
-        try:
-            day_now = datetime.now().astimezone().date().isoformat()
-            ticked = attendance.records_for_day(day_now)
-            print(f"Diem danh {day_now}: {len(ticked)} nguoi")
-            for rec in ticked:
-                print(f"  {rec.display_name} (G{rec.global_id}, "
-                      f"score={rec.face_score:.2f}, in={rec.wall_time})")
-            if unknown_of_gid:
-                print(f"Mat la: {len(unknown_of_gid)} ({', '.join(sorted(unknown_of_gid.values()))})")
-        except Exception:
-            pass
-    try:
-        pending = len(write_queue)
-        if pending:
-            print(f"Queue ton {pending} writes (offline/miss env) -> se flush lan chay sau.")
-    except Exception:
-        pass
+        day_now = datetime.now().astimezone().date().isoformat()
+        ticked = attendance.records_for_day(day_now)
+        print(f"Diem danh {day_now}: {len(ticked)} nguoi")
+        for rec in ticked:
+            print(f"  {rec.display_name} (G{rec.global_id}, "
+                  f"score={rec.face_score:.2f}, in={rec.wall_time})")
+        if unknown_of_gid:
+            print(f"Mat la: {len(unknown_of_gid)} ({', '.join(sorted(unknown_of_gid.values()))})")
+    pending = len(write_queue)
+    if pending:
+        print(f"Queue ton {pending} writes (offline/miss env) -> se flush lan chay sau.")
 
 
 if __name__ == "__main__":

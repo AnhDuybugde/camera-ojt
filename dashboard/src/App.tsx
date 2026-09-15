@@ -377,7 +377,7 @@ export default function App() {
               {livePeople.length === 0 && <span className="footnote">No one tracked right now.</span>}
               {livePeople.map((p) => (
                 <span key={p.gid} className="live-chip">
-                  G{p.gid}{p.name ? ` · ${p.name}` : ''}{' '}
+                  G{p.gid}{p.name ? ` · ${p.name}` : ' · Unknown'}{' '}
                   <span className={labelClass(p.label)}>{displayLabel(p.label)}</span>
                 </span>
               ))}

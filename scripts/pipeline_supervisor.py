@@ -73,8 +73,9 @@ class PipelineSupervisor:
             for line in proc.stdout:
                 with self._lock:
                     self._logs.append(line.rstrip("\n"))
-        except Exception:
-            pass
+        except (OSError, ValueError) as error:
+            with self._lock:
+                self._logs.append(f"[supervisor] log reader stopped: {error}")
 
     def stop(self) -> dict:
         with self._lock:

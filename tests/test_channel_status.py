@@ -16,9 +16,9 @@ FAR = (5.0, 5.0)
 
 
 def _zoned(**kwargs) -> ChannelBusinessTracker:
-    params = dict(workstations=[DESK], grace_s=1.0, dwell_s=1.0,
-                  assign_dwell_s=100.0, hysteresis_m=0.0,
-                  away_grace_s=3.0, out_after_s=20.0, return_stable_s=2.0)
+    params = {"workstations": [DESK], "grace_s": 1.0, "dwell_s": 1.0,
+              "assign_dwell_s": 100.0, "hysteresis_m": 0.0,
+              "away_grace_s": 3.0, "out_after_s": 20.0, "return_stable_s": 2.0}
     params.update(kwargs)
     return ChannelBusinessTracker(channel="A", **params)
 
@@ -33,9 +33,9 @@ FAR2_N = (0.85, 0.55)
 
 
 def _moved(**kwargs) -> ChannelBusinessTracker:
-    params = dict(grace_s=1.0, dwell_s=1.0, away_grace_s=3.0,
-                  out_after_s=20.0, return_stable_s=2.0,
-                  move_ratio=0.15, settle_ratio=0.02)
+    params = {"grace_s": 1.0, "dwell_s": 1.0, "away_grace_s": 3.0,
+              "out_after_s": 20.0, "return_stable_s": 2.0,
+              "move_ratio": 0.15, "settle_ratio": 0.02}
     params.update(kwargs)
     return ChannelBusinessTracker(channel="A", **params)
 

@@ -24,6 +24,7 @@ dependencies = [
   face = ["insightface>=0.7.3", "onnxruntime>=1.17.0"]
   store = ["supabase>=2.9.0"]
   reid = ["torchreid>=0.2.5", "gdown>=6.0.0"]
+  voice = ["edge-tts>=7.0.0", "mediapipe>=0.10.14"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

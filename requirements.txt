@@ -7,3 +7,5 @@ ultralytics>=8.4.0
 scipy>=1.10.0
 lap>=0.5.12
 pytest>=8.2.0
+edge-tts>=7.0.0
+mediapipe>=0.10.14

@@ -73,21 +73,24 @@ class GlobalIdentityConfig:
     time_weight: float = 0.15
     channel_weight: float = 0.10
     # Minimum total score to accept an observation <-> identity match.
-    match_threshold: float = 0.40
+    match_threshold: float = 0.70
     # Gating: same-channel pairs farther apart (normalized) are implausible.
     max_center_distance_ratio: float = 0.35
+    same_camera_reconnect_distance_ratio: float = 0.08
+    same_camera_reconnect_s: float = 2.0
     # Gating: pairs less similar than this in appearance are implausible
     # (only when both sides actually have an embedding).
-    min_appearance_similarity: float = 0.30
+    min_appearance_similarity: float = 0.70
     # Stricter appearance floor for reusing a named (employee-bound) identity.
     # Ngăn GID đã gắn tên bị body khác mặc đồ khác chiếm chỉ vì đứng gần.
-    named_appearance_floor: float = 0.45
+    named_appearance_floor: float = 0.70
     # Strong evidence for merging two simultaneously active cross-camera IDs.
-    active_duplicate_similarity: float = 0.60
+    active_duplicate_similarity: float = 0.90
+    tentative_min_hits: int = 1
     # Lifecycle windows (seconds when timestamps are given, else steps).
     temp_lost_s: float = 5.0
     long_lost_s: float = 60.0
-    unresolved_keep_s: float = 300.0
+    unresolved_keep_s: float = 86400.0
     temp_lost_steps: int = 60
     long_lost_steps: int = 600
     unresolved_keep_steps: int = 3600
@@ -112,6 +115,16 @@ class GlobalIdentityConfig:
 
 
 @dataclass
+class CameraSighting:
+    """Latest observation of one identity on one camera."""
+
+    bbox: BoundingBox
+    center: tuple[float, float]
+    last_seen_step: int
+    last_seen_s: float | None
+
+
+@dataclass
 class IdentityRecord:
     """All global state kept for one person (one Global ID)."""
 
@@ -130,6 +143,18 @@ class IdentityRecord:
     tracklet_keys: set[str] = field(default_factory=set)
     last_match_score: float = 0.0
     employee_id: str | None = None
+    sightings: dict[str, CameraSighting] = field(default_factory=dict)
+
+
+@dataclass
+class _TentativeIdentity:
+    channel: str
+    raw_track_id: int
+    bbox: BoundingBox
+    embedding: np.ndarray | None
+    hits: int
+    last_seen_step: int
+    last_seen_s: float | None
 
 
 class GlobalIdentityManager:
@@ -155,6 +180,7 @@ class GlobalIdentityManager:
         self._identities: dict[int, IdentityRecord] = {}
         # Short-term continuity: "A:7" (channel + ByteTrack id) -> global id.
         self._tracklet_to_gid: dict[str, int] = {}
+        self._tentative: dict[str, _TentativeIdentity] = {}
 
     # ------------------------------------------------------------------ API
     @property
@@ -163,6 +189,14 @@ class GlobalIdentityManager:
 
     def state_of(self, global_id: int) -> IdentityState:
         return self._identities[global_id].state
+
+    def reset_for_new_day(self) -> None:
+        """Start a fresh public GID namespace at the local day boundary."""
+        self._step = 0
+        self._next_global_id = 1
+        self._identities.clear()
+        self._tracklet_to_gid.clear()
+        self._tentative.clear()
 
     def update(
         self,
@@ -237,9 +271,11 @@ class GlobalIdentityManager:
                               now_s, score=score)
             for row in unmatched_rows:
                 track = pending[row]
-                record = self._create_identity(
+                record = self._promote_tentative(
                     channel, track, embeddings[track.track_id], now_s
                 )
+                if record is None:
+                    continue
                 assignments[track.track_id] = record.global_id
                 claimed_gids.add(record.global_id)
 
@@ -260,23 +296,82 @@ class GlobalIdentityManager:
                 employee_id=self._identities[assignments[track.track_id]].employee_id,
             )
             for track in tracks
+            if track.track_id in assignments
         ]
 
-    def bind_employee(self, global_id: int, employee_id: str) -> None:
-        """Attach durable face identity metadata without changing Global ID.
+    def update_batch(
+        self,
+        observations: dict[str, tuple[np.ndarray, list[Track]]],
+        *,
+        now_s: float | None = None,
+    ) -> dict[str, list[Track]]:
+        """Update a synchronized set of cameras while preserving overlap."""
+        return {
+            channel: self.update(
+                channel=channel, frame=frame, tracks=tracks, now_s=now_s
+            )
+            for channel, (frame, tracks) in observations.items()
+        }
+
+    def bind_employee(self, global_id: int, employee_id: str) -> bool:
+        """Attach one employee to exactly one live Global ID.
 
         Global IDs describe session-level association; employee IDs are the
         durable face result. Keeping the binding here makes that distinction
         available to downstream consumers without making face recognition a
-        prerequisite for tracking.
+        prerequisite for tracking. Any previous binding of the same employee
+        is removed atomically before the new binding is installed.
         """
         record = self._identities.get(global_id)
-        if record is not None and employee_id:
-            record.employee_id = employee_id
+        if record is None or not employee_id:
+            return False
+        if record.employee_id not in (None, employee_id):
+            return False
+        if any(
+            other_gid != global_id and other.employee_id == employee_id
+            for other_gid, other in self._identities.items()
+        ):
+            return False
+        record.employee_id = employee_id
+        return True
 
     def employee_id_of(self, global_id: int) -> str | None:
         record = self._identities.get(global_id)
         return record.employee_id if record is not None else None
+
+    def unbind_employee(self, global_id: int) -> bool:
+        """Remove a wrong employee binding (face conflict loser keeps no name).
+
+        Returns True when something was actually unbound.
+        """
+        record = self._identities.get(global_id)
+        if record is None or not record.employee_id:
+            return False
+        record.employee_id = None
+        return True
+
+    def restore_identity(
+        self,
+        global_id: int,
+        *,
+        employee_id: str | None,
+        gallery: list[np.ndarray],
+    ) -> None:
+        """Restore a day identity as an unresolved ReID candidate."""
+        normalized = [item for item in (_normalize_embedding(v) for v in gallery)
+                      if item is not None]
+        if employee_id and any(
+            record.employee_id == employee_id for record in self._identities.values()
+        ):
+            employee_id = None
+        self._identities[global_id] = IdentityRecord(
+            global_id=global_id,
+            gallery=deque(normalized, maxlen=self.config.gallery_size),
+            state=IdentityState.UNRESOLVED,
+            last_seen_s=0.0,
+            employee_id=employee_id,
+        )
+        self._next_global_id = max(self._next_global_id, global_id + 1)
 
     def merge_identity(self, duplicate_gid: int, canonical_gid: int) -> bool:
         """Redirect a duplicate Global ID into an older canonical ID."""
@@ -296,6 +391,7 @@ class GlobalIdentityManager:
             canonical.employee_id = duplicate.employee_id
         canonical.gallery.extend(duplicate.gallery)
         canonical.tracklet_keys.update(duplicate.tracklet_keys)
+        canonical.sightings.update(duplicate.sightings)
         canonical.total_hits += duplicate.total_hits
         if duplicate.last_seen_step > canonical.last_seen_step:
             canonical.bbox = duplicate.bbox
@@ -407,6 +503,19 @@ class GlobalIdentityManager:
         """Total match score, or None when the pair is gated out."""
         cfg = self.config
         appearance = _gallery_similarity(embedding, record.gallery)
+        same_sighting = record.sightings.get(channel)
+        distance = _normalized_distance_to_sighting(
+            bbox, same_sighting, frame_shape
+        )
+        if embedding is None or not record.gallery:
+            if (
+                same_sighting is not None
+                and distance is not None
+                and distance <= cfg.same_camera_reconnect_distance_ratio
+                and self._missing_amount(record, now_s) <= cfg.same_camera_reconnect_s
+            ):
+                return cfg.match_threshold
+            return None
         if (
             embedding is not None
             and len(record.gallery) > 0
@@ -423,9 +532,8 @@ class GlobalIdentityManager:
             and appearance < cfg.named_appearance_floor
         ):
             return None
-
-        same_channel = channel == record.channel
-        distance = _normalized_distance(bbox, record, frame_shape)
+        # thi khong duoc gán cho tracklet kenh nay -> tach GID moi.
+        same_channel = same_sighting is not None
         if same_channel and distance is not None and distance > cfg.max_center_distance_ratio:
             return None  # Gating: same camera, implausible jump.
         if same_channel and distance is not None:
@@ -488,7 +596,45 @@ class GlobalIdentityManager:
         record.disappear_center = None
         record.tracklet_keys.add(_tracklet_key(channel, track.track_id))
         record.last_match_score = score
+        record.sightings[channel] = CameraSighting(
+            bbox=track.bbox,
+            center=record.center,
+            last_seen_step=self._step,
+            last_seen_s=now_s,
+        )
         self._tracklet_to_gid[_tracklet_key(channel, track.track_id)] = record.global_id
+
+    def _promote_tentative(
+        self,
+        channel: str,
+        track: Track,
+        embedding: np.ndarray | None,
+        now_s: float | None,
+    ) -> IdentityRecord | None:
+        key = _tracklet_key(channel, track.track_id)
+        candidate = self._tentative.get(key)
+        if candidate is None:
+            candidate = _TentativeIdentity(
+                channel=channel,
+                raw_track_id=track.track_id,
+                bbox=track.bbox,
+                embedding=embedding,
+                hits=1,
+                last_seen_step=self._step,
+                last_seen_s=now_s,
+            )
+            self._tentative[key] = candidate
+        else:
+            candidate.bbox = track.bbox
+            if embedding is not None:
+                candidate.embedding = embedding
+            candidate.hits += 1
+            candidate.last_seen_step = self._step
+            candidate.last_seen_s = now_s
+        if candidate.hits < max(1, self.config.tentative_min_hits):
+            return None
+        self._tentative.pop(key, None)
+        return self._create_identity(channel, track, candidate.embedding, now_s)
 
     def _create_identity(
         self,
@@ -516,20 +662,46 @@ class GlobalIdentityManager:
             last_seen_s=now_s,
             total_hits=1,
             tracklet_keys={_tracklet_key(channel, track.track_id)},
+            sightings={
+                channel: CameraSighting(
+                    bbox=track.bbox,
+                    center=_center(track.bbox),
+                    last_seen_step=self._step,
+                    last_seen_s=now_s,
+                )
+            },
         )
         self._identities[gid] = record
         self._tracklet_to_gid[_tracklet_key(channel, track.track_id)] = gid
         return record
 
     def _refresh_states(self, now_s: float | None) -> None:
+        stale_tentative = [
+            key for key, candidate in self._tentative.items()
+            if (
+                max(0.0, now_s - candidate.last_seen_s)
+                if now_s is not None and candidate.last_seen_s is not None
+                else float(self._step - candidate.last_seen_step)
+            ) > self._temp_window(now_s)
+        ]
+        for key in stale_tentative:
+            self._tentative.pop(key, None)
         for record in self._identities.values():
-            if record.last_seen_step == self._step:
+            for channel, sighting in list(record.sightings.items()):
+                missing = (
+                    max(0.0, now_s - sighting.last_seen_s)
+                    if now_s is not None and sighting.last_seen_s is not None
+                    else float(self._step - sighting.last_seen_step)
+                )
+                if missing > self._temp_window(now_s):
+                    record.sightings.pop(channel, None)
+            missing = self._missing_amount(record, now_s)
+            if record.last_seen_step == self._step or missing <= 1e-9:
                 record.state = IdentityState.ACTIVE
                 continue
             if record.state == IdentityState.ACTIVE and record.disappear_center is None:
                 record.disappear_center = record.center
                 record.disappear_channel = record.channel
-            missing = self._missing_amount(record, now_s)
             if missing <= self._temp_window(now_s):
                 record.state = IdentityState.TEMP_LOST
             elif missing <= self._long_window(now_s):
@@ -560,9 +732,10 @@ class GlobalIdentityManager:
         frame_shape: tuple[int, ...],
         record: IdentityRecord,
     ) -> bool:
-        if channel != record.channel:
+        sighting = record.sightings.get(channel)
+        if sighting is None:
             return True  # cross-channel pairs are decided by global matching.
-        distance = _normalized_distance(bbox, record, frame_shape)
+        distance = _normalized_distance_to_sighting(bbox, sighting, frame_shape)
         return distance is not None and distance <= self.config.max_center_distance_ratio
 
     def _missing_amount(self, record: IdentityRecord, now_s: float | None) -> float:
@@ -578,7 +751,6 @@ class GlobalIdentityManager:
 
     def _keep_window(self, now_s: float | None) -> float:
         return self.config.unresolved_keep_s if now_s is not None else float(self.config.unresolved_keep_steps)
-
 
 def _solve_assignment(costs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     if _HUNGARIAN_AVAILABLE:
@@ -611,18 +783,18 @@ def _center(bbox: BoundingBox) -> tuple[float, float]:
     return ((bbox.x1 + bbox.x2) / 2.0, (bbox.y1 + bbox.y2) / 2.0)
 
 
-def _normalized_distance(
+def _normalized_distance_to_sighting(
     bbox: BoundingBox,
-    record: IdentityRecord,
+    sighting: CameraSighting | None,
     frame_shape: tuple[int, ...],
 ) -> float | None:
-    if record.bbox is None:
+    if sighting is None:
         return None
     frame_height, frame_width = frame_shape[:2]
     left = _center(bbox)
     return hypot(
-        (left[0] - record.center[0]) / max(1, frame_width),
-        (left[1] - record.center[1]) / max(1, frame_height),
+        (left[0] - sighting.center[0]) / max(1, frame_width),
+        (left[1] - sighting.center[1]) / max(1, frame_height),
     )
 
 
@@ -711,6 +883,7 @@ def _crop(frame: np.ndarray, bbox: BoundingBox) -> np.ndarray | None:
 __all__ = [
     "CROSS_CHANNEL_SPATIAL_SCORE",
     "GATED_COST",
+    "CameraSighting",
     "EmbeddingExtractor",
     "GlobalIdentityConfig",
     "GlobalIdentityManager",

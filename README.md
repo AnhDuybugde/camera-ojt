@@ -50,8 +50,8 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\yolovenv\Scripts\Activate.ps1
 ```
 
-`reid` là dependency tùy chọn. Có thể cài bằng lệnh sau; nếu không cài được,
-pipeline tự dùng HSV histogram:
+`reid` là dependency bắt buộc cho production. Pipeline sẽ dừng rõ ràng nếu
+OSNet không tải được; không tự hạ xuống histogram vì có thể nối nhầm người:
 
 ```powershell
 python -m pip install -e ".[reid]"
@@ -251,6 +251,9 @@ flowchart LR
 
 Entry point production chính là `scripts/run_workstate.py`.
 `scripts/run_pipeline.py` chỉ là demo analytics một camera dùng cho smoke test.
+
+Contract Global ID, face consensus và replay benchmark được mô tả tại
+[docs/IDENTITY_ARCHITECTURE.md](docs/IDENTITY_ARCHITECTURE.md).
 
 ## Bảo mật dữ liệu
 

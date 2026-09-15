@@ -7,7 +7,11 @@ export type KioskPerson = {
   label: string
   in_room: boolean
   face_score?: number | null
+  identity_state?: 'employee' | 'unknown'
+  identity_confidence?: number | null
+  employee_confidence?: number | null
   camera?: string | null
+  cameras?: string[]
   tracking_state?: string | null
 }
 
@@ -133,18 +137,22 @@ export default function KioskCheckIn({
     const active = people.filter((person) =>
       !person.tracking_state || person.tracking_state === 'ACTIVE',
     )
-    const hasCameraMetadata = active.some((person) => Boolean(person.camera))
+    const hasCameraMetadata = active.some((person) =>
+      Boolean(person.camera || person.cameras?.length),
+    )
     return hasCameraMetadata
-      ? active.filter((person) => person.camera === cameraChannel)
+      ? active.filter((person) =>
+        person.cameras?.includes(cameraChannel) || person.camera === cameraChannel,
+      )
       : active
   }, [cameraChannel, people])
 
   const countA = useMemo(
-    () => people.filter((p) => p.camera === 'A' && (!p.tracking_state || p.tracking_state === 'ACTIVE')).length,
+    () => people.filter((p) => (p.cameras?.includes('A') || p.camera === 'A') && (!p.tracking_state || p.tracking_state === 'ACTIVE')).length,
     [people],
   )
   const countB = useMemo(
-    () => people.filter((p) => p.camera === 'B' && (!p.tracking_state || p.tracking_state === 'ACTIVE')).length,
+    () => people.filter((p) => (p.cameras?.includes('B') || p.camera === 'B') && (!p.tracking_state || p.tracking_state === 'ACTIVE')).length,
     [people],
   )
 

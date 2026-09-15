@@ -66,7 +66,8 @@ class DailyStateCache:
         if row is None:
             self._status[key] = RoomStatusRow(
                 day=day, global_id=global_id, label=label, in_room=in_room,
-                last_write_s=now_s, last_inroom_flip_s=now_s if True else None,
+                last_write_s=now_s,
+                last_inroom_flip_s=now_s,
             )
             return True, True
         label_changed = row.label != label
@@ -96,3 +97,6 @@ class DailyStateCache:
             row.last_leave_at = leave_at
         if enter_at is not None:
             row.last_enter_at = enter_at
+
+    def status_of(self, day: str, global_id: int) -> RoomStatusRow | None:
+        return self._status.get((day, global_id))

@@ -52,3 +52,21 @@ def test_return_to_room() -> None:
     out = agg.update(200.0, present_a={1}, present_b=set(),
                      states_a={1: "WORKING"}, states_b={}, names={1: "An"})
     assert out[1].label == LABEL_WORKING and out[1].just_returned is True
+
+
+def test_absent_fallback_marks_out_without_door() -> None:
+    agg = RoomPresenceAggregator(absent_fallback_s=900.0)
+    agg.update(0.0, present_a=set(), present_b=set(),
+               states_a={1: "POSSIBLY_OUT"}, states_b={}, names={})
+    out = agg.update(901.0, present_a=set(), present_b=set(),
+                     states_a={1: "POSSIBLY_OUT"}, states_b={}, names={})
+    assert out[1].label == LABEL_OUT_OFFICE and out[1].in_room is False
+
+
+def test_absent_fallback_disabled_stays_away() -> None:
+    agg = RoomPresenceAggregator(absent_fallback_s=0)
+    agg.update(0.0, present_a=set(), present_b=set(),
+               states_a={1: "POSSIBLY_OUT"}, states_b={}, names={})
+    out = agg.update(5000.0, present_a=set(), present_b=set(),
+                     states_a={1: "POSSIBLY_OUT"}, states_b={}, names={})
+    assert out[1].label == LABEL_AWAY_SEAT and out[1].in_room is True

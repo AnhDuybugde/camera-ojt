@@ -35,7 +35,7 @@ def ensure_cuda_dlls() -> list[str]:
         for path in (_site.getsitepackages() + [_site.getusersitepackages()]):
             if path:
                 roots.add(path)
-    except Exception:  # noqa: BLE001 - best effort
+    except (AttributeError, ImportError, OSError):
         pass
     roots.update(sys.path)
     for root in sorted(roots):
@@ -48,7 +48,7 @@ def ensure_cuda_dlls() -> list[str]:
                 continue
             try:
                 os.add_dll_directory(bin_dir)
-            except Exception:  # noqa: BLE001 - old runtime, PATH fallback below
+            except OSError:  # old runtime, PATH fallback below
                 pass
             os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
             added.append(bin_dir)
@@ -89,7 +89,7 @@ class InsightFaceEmbedder:
     ro rang, caller co the bat va chay o che do khong-face.
     """
 
-    def __init__(self, model_pack: str = "buffalo_s", det_size: int = 640,
+    def __init__(self, model_pack: str = "buffalo_s", det_size: int = 320,
                  device: str = "auto") -> None:
         self.model_pack = model_pack
         self.det_size = det_size

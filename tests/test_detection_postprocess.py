@@ -1,5 +1,5 @@
-from camera_tracking.domain import BoundingBox, Detection
 from camera_tracking.detection.yolo import suppress_nested_detections
+from camera_tracking.domain import BoundingBox, Detection
 
 
 def test_nested_person_box_is_removed_but_side_by_side_boxes_remain() -> None:
