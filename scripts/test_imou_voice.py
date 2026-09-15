@@ -44,7 +44,11 @@ def main() -> None:
     try:
         bridge.start()
         print(f"AudioTalk bridge: {bridge.url.split('?')[0]}")
-        result = bridge.play(audio_path)
+        try:
+            result = bridge.play(audio_path)
+        except Exception:
+            print(f"Bridge page state: {bridge.debug_state()}")
+            raise
         print(f"Camera playback: {result.status}")
     finally:
         bridge.close()

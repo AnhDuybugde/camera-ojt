@@ -139,11 +139,11 @@ class FaceConfig(StrictModel):
     face_device: Literal["auto", "cpu", "cuda"] = "auto"
     gallery_dir: Path = Path("data/images")
     model_pack: str = "buffalo_s"
-    match_threshold: float = Field(default=0.70, ge=0, le=1)
-    min_margin: float = Field(default=0.10, ge=0, le=1)
-    consensus_hits: int = Field(default=3, ge=1)
+    match_threshold: float = Field(default=0.60, ge=0, le=1)
+    min_margin: float = Field(default=0.05, ge=0, le=1)
+    consensus_hits: int = Field(default=2, ge=1)
     consensus_window_s: float = Field(default=3.0, gt=0)
-    gallery_accept_threshold: float = Field(default=0.80, ge=0, le=1)
+    gallery_accept_threshold: float = Field(default=0.70, ge=0, le=1)
     gallery_max_prototypes: int = Field(default=10, ge=1)
     min_face_px: int = Field(default=40, ge=8)
     min_face_score: float = Field(default=0.5, ge=0, le=1)
@@ -214,10 +214,15 @@ class WorkstateConfig(StrictModel):
 
 
 class VoiceConfig(StrictModel):
-    """Chao bang giong noi khi co nguoi vay tay (MediaPipe + edge-tts)."""
+    """Chao bang giong noi khi co nguoi vay tay (MediaPipe + edge-tts).
+
+    backend ``imou_p2p`` (mac dinh moi): TTS -> ffmpeg AAC -> P2P VisualTalk
+    thang ra loa camera, khong can browser/WebSDK/APP_ID. ``imou_web`` giu
+    lai de fallback legacy.
+    """
 
     enabled: bool = False
-    backend: Literal["local", "imou_web"] = "imou_web"
+    backend: Literal["local", "imou_web", "imou_p2p"] = "imou_p2p"
     voice: str = "vi-VN-HoaiMyNeural"
     cache_dir: Path = Path("output/voice_cache")
     cooldown_s: float = Field(default=60.0, ge=0)
@@ -227,12 +232,41 @@ class VoiceConfig(StrictModel):
     bridge_port: int = Field(default=8767, ge=0, le=65535)
     talk_tail_s: float = Field(default=0.3, ge=0)
     launch_browser: bool = True
+    # P2P VisualTalk (vendor tu test-sound-camera-imou).
+    p2p_channel: int = Field(default=1, ge=1)
+    p2p_timeout_s: float = Field(default=20.0, gt=0)
+    p2p_attempts: int = Field(default=2, ge=1)
+    p2p_retry_delay_s: float = Field(default=5.0, ge=0)
+    p2p_sample_rate: int = Field(default=16000, ge=8000)
+    # WAV chao tao san bang ZeroTTS (scripts/build_greeting_wavs.py):
+    # manifest.json anh xa nguyen van cau chao -> file wav.
+    greeting_dir: Path = Path("output/voice_greetings")
+    zerotts_voice: str = "maichi"
+    zerotts_model: str = "zeroweight-ai/ZeroTTS"
+    # Chào mặt (face-triggered): đứng trước camera, nhận diện đủ
+    # consensus -> phát "Xin chào <tên>" ra loa camera, không cần vẫy tay.
+    # Dùng chung VoiceGreeter queue/cooldown với wave để không spam.
+    greet_on_face: bool = True
+    greet_unknown_on_face: bool = False
     # Wave detector cadence + gioi han tai (MediaPipe chay CPU).
-    wave_every_k: int = Field(default=6, ge=1)
+    # Toan cadence: process ~12.5 frame/s (fps/2) / every_k = tan so lay mau
+    # co tay; can >= min_reversals+2 diem trong window moi fire duoc.
+    # every_k=3, window=2.5s -> ~10 diem/window (du cho min_reversals=4).
+    # Legacy wave (giữ để tương thích test cũ).
+    wave_every_k: int = Field(default=3, ge=1)
     wave_max_people: int = Field(default=2, ge=1)
-    wave_window_s: float = Field(default=1.5, gt=0)
+    wave_window_s: float = Field(default=2.5, gt=0)
     wave_min_reversals: int = Field(default=4, ge=2)
     wave_cooldown_s: float = Field(default=30.0, ge=0)
+    # Open-palm greeting (mới, đơn giản): giơ đủ bàn tay 5 ngón -> chào.
+    # Event-driven + gated: chỉ chạy ~3-5 FPS trên candidate đủ lớn.
+    palm_every_k: int = Field(default=4, ge=1)
+    palm_max_people: int = Field(default=2, ge=1)
+    palm_cooldown_s: float = Field(default=30.0, ge=0)
+    palm_min_person_area_px: float = Field(default=8000.0, ge=0)
+    # Face async worker: hàng đợi job, drop cũ khi quá tải để giữ realtime.
+    face_max_queue: int = Field(default=2, ge=1)
+    face_recheck_s: float = Field(default=30.0, ge=0)
 
 
 class StoreConfig(StrictModel):

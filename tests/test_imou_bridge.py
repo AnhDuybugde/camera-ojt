@@ -40,6 +40,14 @@ def test_credentials_do_not_expose_secrets_in_repr() -> None:
     assert "code" not in rendered
 
 
+def test_openapi_host_follows_data_center() -> None:
+    assert _credentials().openapi_host == "https://openapi-sg.easy4ip.com"
+    eu = ImouCredentials("app", "secret", "device", "code", data_center="fk")
+    assert eu.openapi_host == "https://openapi-fk.easy4ip.com"
+    unknown = ImouCredentials("app", "secret", "device", "code", data_center="xx")
+    assert unknown.openapi_host == "https://openapi-sg.easy4ip.com"
+
+
 def test_token_provider_caches_and_force_refreshes() -> None:
     provider = StubTokenProvider(_credentials())
     assert provider.kit_token() == "kit-2"
@@ -85,5 +93,57 @@ def test_bridge_delivers_and_acknowledges_one_command(tmp_path: Path) -> None:
         session = _get_json(f"{base}/api/session?{urlencode({'key': key})}")
         assert session["deviceCode"] == "code"
         assert session["kitToken"] == "kit-2"
+        assert session["domain"] == "https://openapi-sg.easy4ip.com"
+    finally:
+        bridge.close()
+
+
+def test_bridge_favicon_needs_no_auth(tmp_path: Path) -> None:
+    sdk = tmp_path / "sdk"
+    sdk.mkdir()
+    (sdk / "imou-player.js").write_text("", encoding="utf-8")
+    (sdk / "WasmLib").mkdir()
+    bridge = ImouAudioTalkBridge(
+        credentials=_credentials(), sdk_dir=sdk, port=0,
+        launch_browser=False, token_provider=StubTokenProvider(_credentials()),
+    )
+    bridge.start()
+    try:
+        base = f"{urlsplit(bridge.url).scheme}://{urlsplit(bridge.url).netloc}"
+        with urlopen(f"{base}/favicon.ico", timeout=2) as response:
+            assert response.status == 204
+    finally:
+        bridge.close()
+
+
+def test_bridge_debug_roundtrip(tmp_path: Path) -> None:
+    sdk = tmp_path / "sdk"
+    sdk.mkdir()
+    (sdk / "imou-player.js").write_text("", encoding="utf-8")
+    (sdk / "WasmLib").mkdir()
+    bridge = ImouAudioTalkBridge(
+        credentials=_credentials(), sdk_dir=sdk, port=0,
+        launch_browser=False, token_provider=StubTokenProvider(_credentials()),
+    )
+    bridge.start()
+    try:
+        split = urlsplit(bridge.url)
+        key = parse_qs(split.query)["key"][0]
+        base = f"{split.scheme}://{split.netloc}"
+        assert bridge.debug_state()["page_seen"] is False
+        payload = json.dumps({
+            "liveReady": False, "lastPlayError": "live error 2001",
+            "statusText": "Bridge live loi...",
+        }).encode("utf-8")
+        request = Request(
+            f"{base}/api/debug?{urlencode({'key': key})}", data=payload,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urlopen(request, timeout=2) as response:
+            assert response.status == 200
+        state = bridge.debug_state()
+        assert state["page_seen"] is True
+        assert state["liveReady"] is False
+        assert "2001" in state["lastPlayError"]
     finally:
         bridge.close()

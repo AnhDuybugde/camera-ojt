@@ -1,8 +1,9 @@
 """Chao bang giong noi khi co nguoi vay tay (khong block inference).
 
-- Hang doi + thread rieng phat am thanh; TTS edge-tts vi-VN, cache mp3
-  theo cau de offline sau lan dau.
-- Phat bang ffplay (di kem ffmpeg, khong them dep).
+- Hang doi + thread rieng phat am thanh; uu tien WAV tao san bang ZeroTTS
+  (scripts/build_greeting_wavs.py, 1 cau = 1 file -> phat 1 session P2P
+  khong ngat quang), fallback TTS edge-tts vi-VN cache mp3 theo cau.
+- Phat bang ffplay (di kem ffmpeg, khong them dep) khi backend local.
 - Moi nguoi cooldown rieng (mac dinh 60s) ke ca vay lien tuc.
 """
 from __future__ import annotations
@@ -33,6 +34,9 @@ class VoiceGreeter:
     unknown_phrase: str = "Xin chào quý khách"
     max_queue_age_s: float = 5.0
     output: Callable[[Path], None] | None = None
+    # WAV tao san (ZeroTTS): {cau chao dung nguyen van: duong dan file}.
+    # Khop thi dung ngay, khong goi edge-tts (offline hoan toan).
+    phrase_files: dict[str, str | Path] = field(default_factory=dict)
     _last_spoken: dict[tuple[str, str], float] = field(
         default_factory=dict, init=False)
     _queue: queue.Queue = field(default_factory=queue.Queue, init=False)
@@ -68,6 +72,28 @@ class VoiceGreeter:
         self._queue.put((text, time.monotonic()))
         return True
 
+    def face_greet(
+        self,
+        *,
+        day: str,
+        person_id: str | None,
+        display_name: str | None,
+        now_s: float,
+        global_id: int | None = None,
+    ) -> bool:
+        """Chao khi nhan dien mat (dung truoc camera), khong can vay tay.
+
+        Dung chung cooldown/queue voi wave_greet de khong spam loa khi
+        dung lau truoc camera. Tra True khi da xep hang phat.
+        """
+        return self.wave_greet(
+            day=day,
+            person_id=person_id,
+            display_name=display_name,
+            now_s=now_s,
+            global_id=global_id,
+        )
+
     def prewarm(self, phrases: list[str]) -> None:
         """Tao cache TTS nen; khong chan vong lap camera."""
         unique_phrases = list(dict.fromkeys(text.strip() for text in phrases if text.strip()))
@@ -101,6 +127,11 @@ class VoiceGreeter:
                 self._queue.task_done()
 
     def _synthesize(self, text: str) -> Path | None:
+        pregen = self.phrase_files.get(text)
+        if pregen is not None:
+            path = Path(pregen)
+            if path.is_file() and path.stat().st_size > 0:
+                return path
         if self._tts_failed:
             return None
         cache = Path(self.cache_dir)

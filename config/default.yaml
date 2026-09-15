@@ -7,10 +7,11 @@ camera:
   process_every_n_frames: 2
 
 detection:
-  # auto = cuda neu co GPU, khong thi mps, khong thi cpu.
-  # TensorRT FP16 dynamic batch (build tu yolo26s.pt, TRT 10.9, sm_89).
-  # ~185 frame/s vs ~50 cua .pt. Rebuild khi doi GPU/model:
+  # Thuần GPU: cuda bắt buộc. TensorRT FP16 dynamic batch
+  # (build tu yolo26s.pt, TRT 10.9, sm_89). ~185 frame/s vs ~50 cua .pt.
+  # Rebuild khi doi GPU/model:
   # yolo export model=yolo26s.pt format=engine half=True imgsz=640 device=0 dynamic=True batch=16
+  # Nếu thiếu .engine / TRT sẽ tự fallback .pt (vẫn cuda) + cảnh báo.
   model_path: yolo26s.engine
   # Recall-first nhưng bớt ghost: 0.25 đủ cho ByteTrack low-conf nối lại.
   # 0.10 cũ đẻ quá nhiều box yếu -> ghost GID.
@@ -20,7 +21,7 @@ detection:
   nested_box_containment_threshold: 0.85
   person_class_id: 0
   image_size: 640
-  device: auto
+  device: cuda
 
 tracking:
   # Legacy IoUTracker (scripts/run_pipeline.py demo) dùng 2 dòng dưới.
@@ -57,15 +58,16 @@ identity:
   long_lost_s: 120.0
   unresolved_keep_s: 86400.0
   min_gallery_confidence: 0.25
-  # Perf: track on dinh chi refresh gallery moi 5 buoc (pending van
-  # extract moi frame de matching). Giam ~80% ReID calls khi dong nguoi.
-  gallery_refresh_steps: 5
+  # Event-driven ReID: track ổn định giữ ID theo spatial fast-path,
+  # chỉ extract OSNet khi track mới / mất rồi quay lại / cross-camera.
+  # refresh 10 bước (thay vì 5) để giảm ~90% ReID calls khi đông người.
+  gallery_refresh_steps: 10
   tentative_min_hits: 5
   state_db: output/identity_state.db
   # Lightweight mặc định: x0_25 (~0.4M params, nhanh ~3x so với x1_0).
   # Cần chính xác hơn thì tune lên x0_5 / x1_0.
   reid_model: osnet_x0_25
-  reid_device: auto
+  reid_device: cuda
 
 analytics:
   floor_width_m: 8.0
@@ -105,20 +107,22 @@ output:
   video_filename: annotated.mp4
   report_filename: report.json
 
-# Face attendance + nhan dien (InsightFace buffalo_s, GPU neu co).
-# match_threshold >= 0.5: mat mo/nghieng khong bind bua.
+# Face attendance + nhan dien (InsightFace buffalo_s, thuần GPU).
+# Thuần GPU: YOLO (cuda/TensorRT) + OSNet (cuda FP16) + InsightFace
+# (CUDAExecutionProvider). MediaPipe palm chỉ chạy gated 3-5 FPS trên CPU.
+# Threshold đã hạ nhẹ để nhận diện tốt hơn: 0.60 + margin 0.05 + consensus 2.
 face:
   enabled: true
   channels: [A, B]
-  # auto = cuda neu co onnxruntime-gpu + CUDA Toolkit, khong thi cpu.
-  face_device: auto
+  # cuda = bắt buộc GPU (khuyến nghị). auto = cuda nếu có provider, không thì cpu.
+  face_device: cuda
   gallery_dir: data/images
   model_pack: buffalo_s
-  match_threshold: 0.70
-  min_margin: 0.10
-  consensus_hits: 3
+  match_threshold: 0.60
+  min_margin: 0.05
+  consensus_hits: 2
   consensus_window_s: 3.0
-  gallery_accept_threshold: 0.80
+  gallery_accept_threshold: 0.70
   gallery_max_prototypes: 10
   min_face_px: 40
   min_face_score: 0.5
@@ -170,25 +174,56 @@ workstate:
   settle_ratio: 0.02
 
 # Voice: vay tay -> "Xin chao <ten>" (quen) / "Xin chào quý khách" (la).
-# Bat bang --greet (edge-tts can mang lan dau, cache mp3 de offline sau).
+# + face-triggered: dung truoc camera, nhan dien mat -> chao ngay ra loa
+# camera (khong can vay tay). Bat bang --greet (edge-tts can mang lan dau,
+# cache mp3 de offline sau).
+# backend imou_p2p (mac dinh moi): TTS mp3 -> ffmpeg AAC -> P2P VisualTalk
+# thang ra loa camera. Khong can browser/WebSDK/APP_ID. imou_web giu lai
+# de fallback legacy.
 voice:
   enabled: false
-  backend: imou_web
+  backend: imou_p2p
   voice: vi-VN-HoaiMyNeural
   cache_dir: output/voice_cache
   cooldown_s: 60.0
   unknown_phrase: Xin chào quý khách
   command_ttl_s: 5.0
   bridge_host: 127.0.0.1
-  # 8765=stream, 8766=supervisor -> voice dùng 8767 để khỏi đụng port.
+  # 8765=stream, 8766=supervisor -> voice legacy dùng 8767 để khỏi đụng port.
   bridge_port: 8767
   talk_tail_s: 0.3
   launch_browser: true
-  wave_every_k: 6
+  # Face-triggered greeting (khong can vay tay): mat quen -> "Xin chào <ten>".
+  # greet_unknown_on_face=true thi mat la cung chao unknown_phrase.
+  greet_on_face: true
+  greet_unknown_on_face: false
+  # P2P VisualTalk (vendor tu test-sound-camera-imou): chi can
+  # IMOU_DEVICE_ID (serial) + IMOU_CAMERA_PASSWORD (safety code).
+  p2p_channel: 1
+  p2p_timeout_s: 20.0
+  p2p_attempts: 2
+  p2p_retry_delay_s: 5.0
+  p2p_sample_rate: 16000
+  # WAV chao tao san (scripts/build_greeting_wavs.py, ZeroTTS).
+  greeting_dir: output/voice_greetings
+  zerotts_voice: maichi
+  zerotts_model: zeroweight-ai/ZeroTTS
+  # every_k=3, window=2.5s -> ~10 mau co tay/window, du cho min_reversals=4.
+  # (every_k cu =6 chi ~3 mau/1.5s -> khong bao gio du 4 dao chieu.)
+  # Legacy wave (giữ tương thích). Mặc định mới dùng open-palm bên dưới.
+  wave_every_k: 3
   wave_max_people: 2
-  wave_window_s: 1.5
+  wave_window_s: 2.5
   wave_min_reversals: 4
   wave_cooldown_s: 30.0
+  # Open-palm: giơ đủ bàn tay 5 ngón -> chào. Gated 3-5 FPS, chỉ candidate lớn.
+  palm_every_k: 4
+  palm_max_people: 2
+  palm_cooldown_s: 30.0
+  palm_min_person_area_px: 8000.0
+  # Face async worker: queue nhỏ, drop cũ khi quá tải để giữ realtime.
+  face_max_queue: 2
+  face_recheck_s: 30.0
 
 store:
   local_faces_dir: data/faces
