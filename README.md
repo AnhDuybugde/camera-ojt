@@ -121,21 +121,24 @@ VITE_SUPABASE_ANON_KEY=your_anon_key
 
 Có thể bỏ trống cấu hình Supabase khi chỉ thử camera và đăng ký nhân viên cục bộ.
 
-## 6. Chạy hệ thống
+## 6. Chạy hệ thống (2 lệnh)
 
-Mở terminal thứ nhất tại thư mục gốc:
+Lệnh 1 — backend + supervisor (tự bật sẵn API `:8766` cho dashboard):
 
 ```powershell
 .\yolovenv\Scripts\Activate.ps1
-python scripts\run_workstate.py --display
+python scripts\run_workstate.py --greet
 ```
 
-Mở terminal thứ hai:
+Lệnh 2 — dashboard:
 
 ```powershell
 Set-Location dashboard
 npm run dev
 ```
+
+Muốn tắt supervisor nhúng: thêm `--no-supervisor` (dashboard mất nút
+Start/Stop) hoặc đổi cổng `--supervisor-port 8770`.
 
 Truy cập địa chỉ Vite in trên terminal, thông thường là:
 

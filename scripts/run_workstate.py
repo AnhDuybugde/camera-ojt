@@ -353,6 +353,13 @@ def parse_args() -> argparse.Namespace:
                         help="Live MJPEG bind host.")
     parser.add_argument("--no-stream", action="store_true",
                         help="Disable the live dashboard stream.")
+    parser.add_argument("--supervisor-port", type=int, default=8766,
+                        help="Embedded supervisor port cho dashboard "
+                        "Pipeline card (VITE_CONTROL_URL, 0 disables).")
+    parser.add_argument("--supervisor-host", default="127.0.0.1",
+                        help="Embedded supervisor bind host.")
+    parser.add_argument("--no-supervisor", action="store_true",
+                        help="Tat embedded supervisor (dashboard mat nut Start/Stop).")
     parser.add_argument("--device", default=None,
                         help="cuda / mps / cpu / auto (mac dinh lay theo config).")
     parser.add_argument("--no-face", action="store_true",
@@ -1264,6 +1271,47 @@ def main() -> None:
         else:
             print(f"Stream port {args.stream_port} busy, "
                   f"running without live stream.")
+
+    # --- Embedded supervisor cho dashboard (VITE_CONTROL_URL, :8766) ---
+    # Gộp backend + supervisor vào 1 lệnh: chạy pipeline là dashboard có
+    # ngay API status (Pipeline card). Tắt bằng --no-supervisor hoặc
+    # --supervisor-port 0. Chạy thread nền, không block inference.
+    supervisor_server = None
+    _sup_port = 0 if args.no_supervisor else args.supervisor_port
+    if _sup_port:
+        try:
+            sys.path.insert(0, str(_PROJECT_ROOT / "scripts"))
+            from pipeline_supervisor import serve as _serve_supervisor
+            _sup_args = ["--stream-port", str(args.stream_port)]
+            if args.no_stream:
+                _sup_args = ["--no-stream"]
+            if args.greet:
+                _sup_args.append("--greet")
+            if args.no_face:
+                _sup_args.append("--no-face")
+            supervisor_server = _serve_supervisor(
+                args.supervisor_host, _sup_port,
+                managed_pid=os.getpid(),
+                managed_started_at=time.time(),
+                managed_stream_port=args.stream_port if not args.no_stream else None,
+                managed_args=_sup_args,
+            )
+            _sup_thread = threading.Thread(
+                target=supervisor_server.serve_forever,
+                kwargs={"poll_interval": 0.2},
+                name="embedded-supervisor",
+                daemon=True,
+            )
+            _sup_thread.start()
+            print(f"Supervisor (embedded): http://{args.supervisor_host}:{_sup_port} "
+                  f"(dashboard Pipeline card, VITE_CONTROL_URL)")
+        except OSError as error:
+            supervisor_server = None
+            print(f"Supervisor port {_sup_port} busy ({error}), "
+                  f"dashboard mat nut Start/Stop.")
+        except (ImportError, ValueError) as error:
+            supervisor_server = None
+            print(f"Supervisor embedded disabled ({error}).")
 
     cap_a = open_capture(source_a, attempts=args.open_attempts, camera_name="A")
     opened_a = cap_a.isOpened()
@@ -2243,6 +2291,12 @@ def main() -> None:
             jpeg_renderer.stop()
         if streamer is not None:
             streamer.stop()
+        if supervisor_server is not None:
+            try:
+                supervisor_server.shutdown()
+                supervisor_server.server_close()
+            except Exception as error:  # noqa: BLE001
+                print(f"Supervisor stop loi: {error}")
         if voice_bridge is not None:
             voice_bridge.close()
         stream_a.close()

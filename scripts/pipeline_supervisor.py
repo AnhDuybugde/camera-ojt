@@ -111,6 +111,58 @@ class PipelineSupervisor:
             }
 
 
+class ManagedSupervisor(PipelineSupervisor):
+    """Supervisor nhúng trong pipeline đang chạy (embedded, read-only).
+
+    `run_workstate.py` tự bật server này nên dashboard có ngay API
+    status mà không cần terminal thứ hai. Dashboard thấy running=True
+    + pid thật; Start trả already-running; Stop bị từ chối để không
+    tự kill chính process đang chạy.
+    """
+
+    def __init__(
+        self,
+        pid: int,
+        started_at: float,
+        stream_port: int | None = None,
+        args: list[str] | None = None,
+    ) -> None:
+        super().__init__(root=_PROJECT_ROOT)
+        self._managed_pid = pid
+        self._managed_started_at = started_at
+        self._managed_stream_port = stream_port
+        self._managed_args = list(args or [])
+
+    def start(
+        self,
+        script: str = _DEFAULT_SCRIPT,
+        extra_args: list[str] | None = None,
+        stream_port: int | None = None,
+    ) -> dict:
+        return {
+            "started": False,
+            "reason": "already running",
+            "pid": self._managed_pid,
+        }
+
+    def stop(self) -> dict:
+        return {
+            "stopped": False,
+            "reason": "pipeline embedded; stop the run_workstate process itself",
+        }
+
+    def status(self) -> dict:
+        return {
+            "running": True,
+            "pid": self._managed_pid,
+            "uptime_s": round(time.time() - self._managed_started_at, 1),
+            "stream_port": self._managed_stream_port,
+            "args": list(self._managed_args),
+            "log_tail": ["[supervisor] pipeline running embedded (in-process)"],
+            "embedded": True,
+        }
+
+
 def _build_start_args(body: dict) -> tuple[str, list[str], int | None]:
     """Whitelist dashboard options into run_workstate CLI args."""
     script = str(body.get("script") or _DEFAULT_SCRIPT)
@@ -137,8 +189,26 @@ def _build_start_args(body: dict) -> tuple[str, list[str], int | None]:
     return script, args, (stream_port or None)
 
 
-def serve(host: str = "127.0.0.1", port: int = 8766) -> ThreadingHTTPServer:
-    supervisor = PipelineSupervisor()
+def serve(
+    host: str = "127.0.0.1",
+    port: int = 8766,
+    supervisor: PipelineSupervisor | None = None,
+    *,
+    managed_pid: int | None = None,
+    managed_started_at: float | None = None,
+    managed_stream_port: int | None = None,
+    managed_args: list[str] | None = None,
+) -> ThreadingHTTPServer:
+    if supervisor is None:
+        if managed_pid is not None:
+            supervisor = ManagedSupervisor(
+                pid=managed_pid,
+                started_at=managed_started_at or time.time(),
+                stream_port=managed_stream_port,
+                args=managed_args,
+            )
+        else:
+            supervisor = PipelineSupervisor()
 
     class _Handler(BaseHTTPRequestHandler):
         server_version = "CamSupervisor/1.0"

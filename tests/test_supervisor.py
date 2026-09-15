@@ -79,3 +79,38 @@ def test_start_stop_lifecycle() -> None:
     finally:
         server.shutdown()
         staged.unlink(missing_ok=True)
+
+
+def test_managed_embedded_status() -> None:
+    """Embedded mode (run_workstate): running=True, start/stop read-only."""
+    mod = _load()
+    port = _free_port()
+    server = mod.serve(
+        "127.0.0.1", port, managed_pid=12345,
+        managed_stream_port=8765, managed_args=["--greet"],
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{port}"
+
+        def get(path: str) -> dict:
+            with urllib.request.urlopen(base + path, timeout=15) as res:
+                return json.loads(res.read())
+
+        def post(path: str, body: dict) -> dict:
+            req = urllib.request.Request(
+                base + path, data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=15) as res:
+                return json.loads(res.read())
+
+        status = get("/api/status")
+        assert status["running"] is True
+        assert status["pid"] == 12345
+        assert status["embedded"] is True
+        assert status["stream_port"] == 8765
+        assert post("/api/start", {})["started"] is False  # already running
+        assert post("/api/stop", {})["stopped"] is False  # managed externally
+    finally:
+        server.shutdown()
