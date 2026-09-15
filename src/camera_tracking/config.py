@@ -225,7 +225,13 @@ class VoiceConfig(StrictModel):
     backend: Literal["local", "imou_web", "imou_p2p"] = "imou_p2p"
     voice: str = "vi-VN-HoaiMyNeural"
     cache_dir: Path = Path("output/voice_cache")
-    cooldown_s: float = Field(default=60.0, ge=0)
+    # Thong nhat 10s cho ca quen lan la; chi kich hoat khi gio tay 5 ngon.
+    cooldown_s: float = Field(default=10.0, ge=0)
+    # Cooldown rieng cho nguoi la (giu de tuy chinh, mac dinh cung 10s).
+    unknown_cooldown_s: float = Field(default=10.0, ge=0)
+    # Palm cua nguoi chua co ket qua face: True = chao ngay "Xin chào quý khách",
+    # khong can doi FaceWorker. False = hanh vi cu (bo qua + log hint).
+    palm_unknown_immediate: bool = True
     unknown_phrase: str = "Xin chào quý khách"
     command_ttl_s: float = Field(default=5.0, gt=0)
     bridge_host: str = "127.0.0.1"
@@ -243,10 +249,11 @@ class VoiceConfig(StrictModel):
     greeting_dir: Path = Path("output/voice_greetings")
     zerotts_voice: str = "maichi"
     zerotts_model: str = "zeroweight-ai/ZeroTTS"
-    # Chào mặt (face-triggered): đứng trước camera, nhận diện đủ
-    # consensus -> phát "Xin chào <tên>" ra loa camera, không cần vẫy tay.
+    # Chào mặt (face-triggered): mac dinh TAT, chi chao khi gio tay 5 ngon
+    # (palm-only, ap dung chung cho ca quen lan la). Muon dung truoc cam
+    # la chao ngay thi bat greet_on_face=true.
     # Dùng chung VoiceGreeter queue/cooldown với wave để không spam.
-    greet_on_face: bool = True
+    greet_on_face: bool = False
     greet_unknown_on_face: bool = False
     # Wave detector cadence + gioi han tai (MediaPipe chay CPU).
     # Toan cadence: process ~12.5 frame/s (fps/2) / every_k = tan so lay mau
@@ -258,11 +265,12 @@ class VoiceConfig(StrictModel):
     wave_window_s: float = Field(default=2.5, gt=0)
     wave_min_reversals: int = Field(default=4, ge=2)
     wave_cooldown_s: float = Field(default=30.0, ge=0)
-    # Open-palm greeting (mới, đơn giản): giơ đủ bàn tay 5 ngón -> chào.
+    # Open-palm greeting: giơ đủ bàn tay 5 ngón -> chào (trigger duy nhat).
     # Event-driven + gated: chỉ chạy ~3-5 FPS trên candidate đủ lớn.
+    # Thong nhat 10s nhu cooldown loa.
     palm_every_k: int = Field(default=4, ge=1)
     palm_max_people: int = Field(default=2, ge=1)
-    palm_cooldown_s: float = Field(default=30.0, ge=0)
+    palm_cooldown_s: float = Field(default=10.0, ge=0)
     palm_min_person_area_px: float = Field(default=8000.0, ge=0)
     # Face async worker: hàng đợi job, drop cũ khi quá tải để giữ realtime.
     face_max_queue: int = Field(default=2, ge=1)

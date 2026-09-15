@@ -185,7 +185,11 @@ voice:
   backend: imou_p2p
   voice: vi-VN-HoaiMyNeural
   cache_dir: output/voice_cache
-  cooldown_s: 60.0
+  # Thong nhat 10s cho ca quen lan la; chi kich hoat khi gio tay 5 ngon.
+  cooldown_s: 10.0
+  # Nguoi la gio tay: chao ngay, 10s duoc chao lai, khong can doi face.
+  unknown_cooldown_s: 10.0
+  palm_unknown_immediate: true
   unknown_phrase: Xin chào quý khách
   command_ttl_s: 5.0
   bridge_host: 127.0.0.1
@@ -193,9 +197,10 @@ voice:
   bridge_port: 8767
   talk_tail_s: 0.3
   launch_browser: true
-  # Face-triggered greeting (khong can vay tay): mat quen -> "Xin chào <ten>".
-  # greet_unknown_on_face=true thi mat la cung chao unknown_phrase.
-  greet_on_face: true
+  # Palm-only: chi gio tay 5 ngon moi chao (ap dung chung quen + la).
+  # Muon dung truoc cam la chao ngay thi dat greet_on_face: true.
+  # greet_unknown_on_face=true thi mat la (khong can gio tay) cung chao.
+  greet_on_face: false
   greet_unknown_on_face: false
   # P2P VisualTalk (vendor tu test-sound-camera-imou): chi can
   # IMOU_DEVICE_ID (serial) + IMOU_CAMERA_PASSWORD (safety code).
@@ -216,10 +221,10 @@ voice:
   wave_window_s: 2.5
   wave_min_reversals: 4
   wave_cooldown_s: 30.0
-  # Open-palm: giơ đủ bàn tay 5 ngón -> chào. Gated 3-5 FPS, chỉ candidate lớn.
+  # Open-palm: giơ đủ bàn tay 5 ngón -> chào (trigger duy nhat). Gated 3-5 FPS.
   palm_every_k: 4
   palm_max_people: 2
-  palm_cooldown_s: 30.0
+  palm_cooldown_s: 10.0
   palm_min_person_area_px: 8000.0
   # Face async worker: queue nhỏ, drop cũ khi quá tải để giữ realtime.
   face_max_queue: 2

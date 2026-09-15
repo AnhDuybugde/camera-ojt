@@ -378,6 +378,10 @@ class OpenPalmDetector:
                 return True
         return False
 
+    def cooldown_remaining(self, gid: int, now_s: float) -> float:
+        """So giay con lai truoc khi gid duoc fire tiep (0 = san sang)."""
+        return max(0.0, self.cooldown_s - (now_s - self._last_fire_s.get(gid, float("-inf"))))
+
     def forget_retired(self, alive_gids: set[int]) -> None:
         for gid in [g for g in self._last_fire_s if g not in alive_gids]:
             self._last_fire_s.pop(gid, None)

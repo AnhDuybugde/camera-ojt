@@ -368,10 +368,11 @@ def parse_args() -> argparse.Namespace:
                         help="Override face.channels trong config "
                         "(vi du 'B' chi diem danh 1 cam, 'AB' ca 2).")
     parser.add_argument("--greet", action="store_true",
-                        help="Bat voice ra loa camera: nhan dien mat -> chao ten "
-                        "(quen) + gio ban tay 5 ngon -> chao. Mac dinh tat.")
+                        help="Bat voice ra loa camera: gio ban tay 5 ngon -> chao ten "
+                        "(quen) / chao khach (la), thong nhat 10s. Mac dinh tat.")
     parser.add_argument("--no-face-greet", action="store_true",
-                        help="Chi gio tay moi chao; tat chao tu dong khi nhan dien mat.")
+                        help="Chi gio tay moi chao; tat chao tu dong khi nhan dien mat "
+                        "(mac dinh da palm-only).")
     parser.add_argument("--identity-log", type=Path, default=None,
                         help="Write identity predictions CSV for replay evaluation.")
     parser.add_argument("--metrics-log-s", type=float, default=60.0,
@@ -1368,6 +1369,8 @@ def main() -> None:
     voice_bridge = None
     voice_tick = 0
     wave_hint_at: dict[int, float] = {}
+    # Throttle log chan doan palm (5s/gid) de khong spam console.
+    palm_dbg_at: dict[int, float] = {}
     if voice_on:
         try:
             from camera_tracking.gesture.wave import (
@@ -1384,11 +1387,16 @@ def main() -> None:
             hand_detector.ensure_loaded()
             # Mới: giơ đủ bàn tay 5 ngón -> chào (đơn giản, không cần vẫy).
             # Gated ~3 FPS ở main loop, chỉ candidate đủ lớn.
+            # Detector dung cooldown min(quen, la) de nguoi la duoc chao lai
+            # sau unknown_cooldown_s (10s) thay vi bi chan 30s.
+            _palm_cooldown = float(getattr(
+                voice_cfg, "palm_cooldown_s",
+                getattr(voice_cfg, "wave_cooldown_s", 30.0)))
+            _unknown_cooldown = float(getattr(
+                voice_cfg, "unknown_cooldown_s", 10.0))
             palm_detector = OpenPalmDetector(
                 required_fingers=5,
-                cooldown_s=float(getattr(
-                    voice_cfg, "palm_cooldown_s",
-                    getattr(voice_cfg, "wave_cooldown_s", 30.0))),
+                cooldown_s=min(_palm_cooldown, _unknown_cooldown),
                 hand_detector=hand_detector,
             )
             # Giữ WaveDetector legacy để tương thích (không dùng ở loop mới).
@@ -1435,6 +1443,8 @@ def main() -> None:
                 cache_dir=voice_cfg.cache_dir,
                 voice=voice_cfg.voice,
                 cooldown_s=voice_cfg.cooldown_s,
+                unknown_cooldown_s=float(getattr(
+                    voice_cfg, "unknown_cooldown_s", 10.0)),
                 unknown_phrase=voice_cfg.unknown_phrase,
                 max_queue_age_s=voice_cfg.command_ttl_s,
                 output=voice_output,
@@ -1448,7 +1458,8 @@ def main() -> None:
                 )
             greeter.prewarm(phrases)
             print(f"Voice: {voice_cfg.backend}, greet on wave ({voice_cfg.voice}, "
-                  f"cooldown {voice_cfg.cooldown_s:.0f}s, TTL "
+                  f"cooldown {voice_cfg.cooldown_s:.0f}s quen / "
+                  f"{float(getattr(voice_cfg, 'unknown_cooldown_s', 10.0)):.0f}s la, TTL "
                   f"{voice_cfg.command_ttl_s:.0f}s, pregen={len(phrase_files)}).")
         except (ImportError, OSError, RuntimeError, ValueError) as error:
             print(f"Voice disabled ({error})")
@@ -1457,17 +1468,17 @@ def main() -> None:
             if voice_bridge is not None:
                 voice_bridge.close()
                 voice_bridge = None
-    # Chao mat: dung truoc camera -> nhan dien -> chao ngay, khong can vay.
-    # Tat bang --no-face-greet hoac voice.greet_on_face=false.
+    # Palm-only: mac dinh chi gio tay 5 ngon moi chao (quen + la nhu nhau).
+    # Bat lai chao mat bang voice.greet_on_face=true (khong truyen --no-face-greet).
     face_greet_on = bool(
         voice_on and greeter is not None
-        and getattr(voice_cfg, "greet_on_face", True)
+        and getattr(voice_cfg, "greet_on_face", False)
         and not args.no_face_greet
     )
     if voice_on and not face_greet_on:
-        print("Voice: chi chao khi vay tay (--no-face-greet).")
+        print("Voice: chi chao khi gio tay 5 ngon (palm-only).")
     elif face_greet_on:
-        print("Voice: chao tu dong khi nhan dien mat (khong can vay tay).")
+        print("Voice: chao tu dong khi nhan dien mat (khong can gio tay).")
     # Live event feed cho dashboard (kiosk + admin): 20 su kien moi nhat,
     # song song voi WriteQueue -> Supabase (kiosk thay ngay ca khi offline).
     recent_events: deque = deque(maxlen=20)
@@ -2115,23 +2126,20 @@ def main() -> None:
                                     voice_cfg, "palm_max_people",
                                     getattr(voice_cfg, "wave_max_people", 2))))]
                                 for _track in biggest:
+                                    _gid = _track.track_id
                                     # Gate: bbox quá nhỏ thì tay không đủ pixel.
                                     if _track.bbox.area < float(getattr(
                                             voice_cfg, "palm_min_person_area_px", 8000.0)):
+                                        if now_s - palm_dbg_at.get(_gid, float("-inf")) > 15.0:
+                                            palm_dbg_at[_gid] = now_s
+                                            print(f"[Palm][{_ch}] G{_gid} qua nho "
+                                                  f"(area={_track.bbox.area:.0f}) - bo qua")
                                         continue
-                                    _crop = _person_crop(_frame, _track.bbox)
-                                    if _crop is None:
-                                        continue
-                                    try:
-                                        palmed = palm_detector.observe(
-                                            _track.track_id, _crop, now_s)
-                                    except RuntimeError:
-                                        palmed = False
-                                    if not palmed:
-                                        continue
-                                    _gid = _track.track_id
-                                    # Manager la nguon authoritative. Neu face worker
-                                    # chua tra ket qua thi bo qua, khong chao nham.
+                                    # Quen: chi chao ten khi face da bind (chong chao nham).
+                                    # La / chua co face: chao ngay "Xin chào quý khách",
+                                    # khong can doi FaceWorker (palm_unknown_immediate).
+                                    # Giai quyet danh tinh TRUOC khi chay MediaPipe de
+                                    # khong ton cooldown detector + CPU khi loa dang ban.
                                     _bound_employee = manager.employee_id_of(_gid)
                                     _mapped_employee = gid_to_person.get(_gid)
                                     if (_bound_employee is not None
@@ -2142,11 +2150,53 @@ def main() -> None:
                                             continue
                                     elif _gid in unknown_of_gid:
                                         _pid = _name = None
+                                    elif getattr(voice_cfg, "palm_unknown_immediate", True):
+                                        _pid = _name = None
                                     else:
                                         if now_s - wave_hint_at.get(_gid, float("-inf")) > 5.0:
                                             wave_hint_at[_gid] = now_s
                                             print(f"[Palm][{_ch}] G{_gid} thay gio tay "
                                                   f"nhung chua nhan dien mat")
+                                        continue
+                                    # Peek loa truoc: dang cooldown thi bo qua luon,
+                                    # detector giu nguyen trang thai ready.
+                                    try:
+                                        _loa_remain = float(greeter.cooldown_remaining(
+                                            day=day_str, person_id=_pid,
+                                            now_s=now_s, global_id=_gid))
+                                    except (AttributeError, TypeError, ValueError):
+                                        _loa_remain = 0.0
+                                    if _loa_remain > 0:
+                                        if now_s - palm_dbg_at.get(_gid, float("-inf")) > 5.0:
+                                            palm_dbg_at[_gid] = now_s
+                                            print(f"[Palm][{_ch}] G{_gid} cooldown loa "
+                                                  f"con {_loa_remain:.0f}s")
+                                        continue
+                                    _crop = _person_crop(_frame, _track.bbox)
+                                    if _crop is None:
+                                        continue
+                                    try:
+                                        palmed = palm_detector.observe(
+                                            _track.track_id, _crop, now_s)
+                                    except RuntimeError:
+                                        palmed = False
+                                    if not palmed:
+                                        # Phan biet: dang cooldown detector hay that su
+                                        # khong thay tay (throttle de khoi spam).
+                                        if now_s - palm_dbg_at.get(_gid, float("-inf")) > 5.0:
+                                            remain = 0.0
+                                            try:
+                                                remain = float(palm_detector.cooldown_remaining(
+                                                    _gid, now_s))
+                                            except (AttributeError, TypeError, ValueError):
+                                                remain = 0.0
+                                            palm_dbg_at[_gid] = now_s
+                                            if remain > 0:
+                                                print(f"[Palm][{_ch}] G{_gid} cooldown "
+                                                      f"detector con {remain:.0f}s")
+                                            else:
+                                                print(f"[Palm][{_ch}] G{_gid} khong thay "
+                                                      f"ban tay 5 ngon")
                                         continue
                                     if greeter.face_greet(
                                         day=day_str, person_id=_pid,
@@ -2160,6 +2210,12 @@ def main() -> None:
                                         )
                                         print(f"[Palm][{_ch}] "
                                               f"{_name or 'Unknown'} (G{_gid})")
+                                    elif now_s - palm_dbg_at.get(_gid, float("-inf")) > 5.0:
+                                        # Hiem (don thread): dat cho that bai do race
+                                        # voi worker hoan reservation.
+                                        palm_dbg_at[_gid] = now_s
+                                        print(f"[Palm][{_ch}] G{_gid} loa vua ban, "
+                                              f"giơ lại sau ít giây")
 
             # --- Live view: annotated Global-ID frames for window/stream ---
             need_vis = args.display or stream_on
