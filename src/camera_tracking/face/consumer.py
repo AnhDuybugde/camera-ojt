@@ -20,6 +20,9 @@ class FaceObservation:
     match: MatchResult
     sharpness: float
     quality: float
+    # False van la mot face hop le de UI hien top-2 similarity ngay, nhung
+    # chua du consensus de bind employee/diem danh.
+    identity_confirmed: bool = True
 
 
 @dataclass(slots=True)
@@ -100,8 +103,6 @@ class FaceTrackConsumer:
                 continue
             face_image = _crop_box(crop, detection.bbox)
             sharpness = face_sharpness(face_image)
-            if sharpness < self.min_blur_variance:
-                continue
             quality = _quality(
                 face_width,
                 face_height,
@@ -109,10 +110,25 @@ class FaceTrackConsumer:
                 self.min_face_px,
                 self.min_blur_variance,
             )
+            match = self.matcher.match(detection.embedding)
+            if sharpness < self.min_blur_variance:
+                # Embedding da tinh xong: gui provisional result de live UI
+                # van hien top-2 %. Khong vote/bind/diem danh bang anh mo.
+                observations.append(
+                    FaceObservation(
+                        track=track,
+                        crop_bgr=crop,
+                        detection=detection,
+                        match=match,
+                        sharpness=sharpness,
+                        quality=quality,
+                        identity_confirmed=False,
+                    )
+                )
+                continue
             if quality < gate.best_quality and gate.employee_id:
                 continue
             gate.best_quality = max(gate.best_quality, quality)
-            match = self.matcher.match(detection.embedding)
             employee_id = (
                 match.person.employee_id or match.person.person_id
                 if match.is_known and match.person is not None
@@ -123,11 +139,11 @@ class FaceTrackConsumer:
             gate.votes.append((now_s, employee_id))
             while gate.votes and now_s - gate.votes[0][0] > self.consensus_window_s:
                 gate.votes.popleft()
-            if len(gate.votes) < self.consensus_hits:
-                continue
-            gate.votes.clear()
-            if employee_id is not None:
-                gate.employee_id = employee_id
+            identity_confirmed = len(gate.votes) >= self.consensus_hits
+            if identity_confirmed:
+                gate.votes.clear()
+                if employee_id is not None:
+                    gate.employee_id = employee_id
             observations.append(
                 FaceObservation(
                     track=track,
@@ -136,6 +152,7 @@ class FaceTrackConsumer:
                     match=match,
                     sharpness=sharpness,
                     quality=quality,
+                    identity_confirmed=identity_confirmed,
                 )
             )
         return observations

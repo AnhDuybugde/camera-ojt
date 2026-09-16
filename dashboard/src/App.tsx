@@ -52,6 +52,7 @@ type LivePerson = {
   face_score?: number | null
   camera?: string | null
   tracking_state?: string | null
+  face_candidates?: Array<{ name: string; score: number }>
 }
 
 type PendingAttendance = {
@@ -211,7 +212,9 @@ export default function App() {
       }
     }
     poll()
-    const timer = setInterval(poll, 2000)
+    // status.json o localhost va rat nho; poll nhanh de name/employee ID,
+    // attendance va activity duoc React cap nhat trong cung mot response.
+    const timer = setInterval(poll, 500)
     return () => { alive = false; clearInterval(timer) }
   }, [])
 
@@ -379,6 +382,9 @@ export default function App() {
                 <span key={p.gid} className="live-chip">
                   G{p.gid}{p.name ? ` · ${p.name}` : ' · Unknown'}{' '}
                   <span className={labelClass(p.label)}>{displayLabel(p.label)}</span>
+                  {p.face_candidates?.length ? ` · ${p.face_candidates.slice(0, 2).map(
+                    (candidate, index) => `${index + 1}. ${candidate.name} ${Math.round(Math.max(0, candidate.score) * 100)}%`,
+                  ).join(' · ')}` : ''}
                 </span>
               ))}
             </div>

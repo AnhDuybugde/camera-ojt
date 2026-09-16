@@ -10,7 +10,7 @@ detection:
   # Thuần GPU: cuda bắt buộc. TensorRT FP16 dynamic batch
   # (build tu yolo26s.pt, TRT 10.9, sm_89). ~185 frame/s vs ~50 cua .pt.
   # Rebuild khi doi GPU/model:
-  # yolo export model=yolo26s.pt format=engine half=True imgsz=640 device=0 dynamic=True batch=16
+  # yolo export model=yolo26s.pt format=engine half=True imgsz=640 device=0 dynamic=True batch=2
   # Nếu thiếu .engine / TRT sẽ tự fallback .pt (vẫn cuda) + cảnh báo.
   model_path: yolo26s.engine
   # Recall-first nhưng bớt ghost: 0.25 đủ cho ByteTrack low-conf nối lại.
@@ -110,7 +110,8 @@ output:
 # Face attendance + nhan dien (InsightFace buffalo_s, thuần GPU).
 # Thuần GPU: YOLO (cuda/TensorRT) + OSNet (cuda FP16) + InsightFace
 # (CUDAExecutionProvider). MediaPipe palm chỉ chạy gated 3-5 FPS trên CPU.
-# Threshold đã hạ nhẹ để nhận diện tốt hơn: 0.60 + margin 0.05 + consensus 2.
+# Camera substream 640x480: 0.45 + margin 0.05; mot face ro la xac nhan
+# live/enroll (live crop đo được 0.476; gallery cross-person cao nhất 0.336).
 face:
   enabled: true
   channels: [A, B]
@@ -118,20 +119,22 @@ face:
   face_device: cuda
   gallery_dir: data/images
   model_pack: buffalo_s
-  match_threshold: 0.60
+  match_threshold: 0.45
   min_margin: 0.05
-  consensus_hits: 2
+  # Bind Employee ID + attendance ngay trong cung ket qua top-2 dau tien.
+  consensus_hits: 1
   consensus_window_s: 3.0
   gallery_accept_threshold: 0.70
   gallery_max_prototypes: 10
-  min_face_px: 40
-  min_face_score: 0.5
-  min_blur_variance: 40.0
-  min_person_area_px: 8000.0
-  process_every_k: 3
-<  # Lightweight: 320 nhanh ~3-4x so với 640, đủ cho kiosk 1-2m.
-  # Mặt xa >4m mới cần 640.
-  det_size: 320
+  # Goc rong trong data/samples: mat thuong chi 15-30 px.
+  min_face_px: 16
+  min_face_score: 0.35
+  # RTSP substream bi nen; 20 van loc mat qua mo nhung khong giu ket qua lau.
+  min_blur_variance: 8.0
+  min_person_area_px: 2500.0
+  process_every_k: 2
+  # Substream chỉ 640x480; dùng 640 để giữ recall với mặt 30-40 px.
+  det_size: 640
   name_map:
     AnhDuy: Anh Duy
     VanDai: Van Dai
@@ -144,7 +147,9 @@ face:
     LeHoang: "4"
 
 attendance:
-  debounce_hits: 2
+  # Face da qua threshold + margin + quality gate; ghi trong cung transaction
+  # xu ly de Employee ID va attendance xuat hien dong thoi.
+  debounce_hits: 1
   window_s: 8.0
   active_hour_start: null
   active_hour_end: null
@@ -192,7 +197,7 @@ voice:
   backend: imou_p2p
   voice: vi-VN-HoaiMyNeural
   cache_dir: output/voice_cache
-  # Thong nhat 10s cho ca quen lan la; chi kich hoat khi gio tay 5 ngon.
+  # Thong nhat 10s cho ca quen lan la; chi kich hoat khi gio tay 4-5 ngon.
   cooldown_s: 10.0
   # Nguoi la gio tay: chao ngay, 10s duoc chao lai, khong can doi face.
   unknown_cooldown_s: 10.0
@@ -204,11 +209,18 @@ voice:
   bridge_port: 8767
   talk_tail_s: 0.3
   launch_browser: true
-  # Palm-only: chi gio tay 5 ngon moi chao (ap dung chung quen + la).
-  # Muon dung truoc cam la chao ngay thi dat greet_on_face: true.
-  # greet_unknown_on_face=true thi mat la (khong can gio tay) cung chao.
+  # A=phong (wave-only), B=cua (face-trigger). Global giu palm-only
+  # de tuong thich cu; override per-channel ben duoi moi co hieu luc.
   greet_on_face: false
   greet_unknown_on_face: false
+  # null = fallback ve global. Mac dinh: A khong chao mat, B thay mat la chao.
+  greet_on_face_a: false
+  greet_unknown_on_face_a: false
+  greet_on_face_b: true
+  greet_unknown_on_face_b: true
+  # Gesture theo kenh: wave (vay tay, cho A) / palm (gio tay, legacy) / off.
+  gesture_a: wave
+  gesture_b: "off"
   # P2P VisualTalk (vendor tu test-sound-camera-imou): chi can
   # IMOU_DEVICE_ID (serial) + IMOU_CAMERA_PASSWORD (safety code).
   p2p_channel: 1
@@ -216,26 +228,61 @@ voice:
   p2p_attempts: 2
   p2p_retry_delay_s: 5.0
   p2p_sample_rate: 16000
+  # 0.0=im lang, 0.5=nua am luong, 1.0=giu nguyen file TTS.
+  p2p_volume: 0.5
   # WAV chao tao san (scripts/build_greeting_wavs.py, ZeroTTS).
   greeting_dir: output/voice_greetings
   zerotts_voice: maichi
   zerotts_model: zeroweight-ai/ZeroTTS
   # every_k=3, window=2.5s -> ~10 mau co tay/window, du cho min_reversals=4.
   # (every_k cu =6 chi ~3 mau/1.5s -> khong bao gio du 4 dao chieu.)
-  # Legacy wave (giữ tương thích). Mặc định mới dùng open-palm bên dưới.
+  # Wave la gesture chinh cho A=phong (vay tay de chao).
   wave_every_k: 3
   wave_max_people: 2
   wave_window_s: 2.5
   wave_min_reversals: 4
-  wave_cooldown_s: 30.0
-  # Open-palm: giơ đủ bàn tay 5 ngón -> chào (trigger duy nhat). Gated 3-5 FPS.
-  palm_every_k: 4
-  palm_max_people: 2
+  wave_min_amplitude: 0.06
+  wave_min_gap_s: 0.08
+  wave_cooldown_s: 10.0
+  # Open-palm: 4-5 ngon o vung dau/vai -> chao. Gated tren CPU.
+  palm_every_k: 2
+  palm_max_people: 6
   palm_cooldown_s: 10.0
-  palm_min_person_area_px: 8000.0
-  # Face async worker: queue nhỏ, drop cũ khi quá tải để giữ realtime.
-  face_max_queue: 2
+  # Mot palm hop le la du, nhung mat va tay phai cung Global ID va o gan nhau.
+  palm_confirm_frames: 1
+  palm_release_frames: 2
+  palm_min_detection_confidence: 0.35
+  palm_required_fingers: 4
+  palm_min_input_height_px: 320
+  palm_head_region_max_y: 0.60
+  palm_allow_without_face: true
+  palm_face_ttl_s: 8.0
+  palm_face_max_distance: 3.5
+  palm_min_person_area_px: 2500.0
+  # Face async worker: moi camera/GID toi da 1 job; queue du cho nhieu nguoi
+  # ma khong xoa job cu truoc khi worker kip xu ly.
+  face_max_queue: 8
+  face_max_job_age_s: 5.0
   face_recheck_s: 30.0
+  # Voice-trigger (OR với palm): mic camera nghe "hello/xin chào" thì greet
+  # người gần nhất (unknown + employee như nhau, còn lại không tự greet).
+  # Bật bằng --voice-trigger (cần kèm --greet để có loa). STT faster-whisper
+  # medium/vi như repo test-sound đã chốt; inhibit_s chặn mic tự nghe loa TTS.
+  voice_trigger_enabled: false
+  voice_trigger_words: ["hello", "xin chào"]
+  voice_trigger_window_s: 5.0
+  # Loa P2P co the phat tre; chan mic du lau de khong nghe lai cau chao.
+  voice_trigger_inhibit_s: 12.0
+  # small da cache tren may, nhanh hon medium CPU cho keyword ngan.
+  voice_stt_model: small
+  voice_stt_lang: vi
+  voice_listen_channel: 1
+  voice_listen_subtype: 1
+  # Do thuc te mic sau filter: noise p50~0.0014, speech p90~0.035.
+  voice_vad_threshold: 0.012
+  voice_min_seg_rms: 0.008
+  voice_max_no_speech_prob: 0.55
+  voice_min_avg_logprob: -0.85
 
 store:
   local_faces_dir: data/faces

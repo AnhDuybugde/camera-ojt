@@ -11,6 +11,7 @@ from camera_tracking.gesture.wave import (
     WaveDetector,
     count_extended_fingers,
     count_reversals,
+    is_hand_near_face,
     is_open_palm,
 )
 
@@ -206,6 +207,26 @@ def test_count_extended_fingers_short_input() -> None:
     assert is_open_palm(_palm_landmarks(False)) is False
 
 
+def test_open_palm_rejects_extended_but_downward_fingers() -> None:
+    hand = _palm_landmarks(True)
+    for tip, pip in ((8, 6), (12, 10), (16, 14), (20, 18)):
+        hand[tip] = (hand[tip][0], hand[pip][1] + 0.2)
+    assert is_open_palm(hand) is False
+
+
+def test_open_palm_required_four_allows_occluded_thumb() -> None:
+    hand = _palm_landmarks(True)
+    hand[4] = hand[3]
+    assert is_open_palm(hand, required=4) is True
+    assert is_open_palm(hand, required=5) is False
+
+
+def test_hand_must_be_near_face_in_same_person_crop() -> None:
+    hand = _palm_landmarks(True)
+    assert is_hand_near_face(hand, (25, 20, 75, 70), (200, 100, 3), 2.5)
+    assert not is_hand_near_face(hand, (0, 0, 10, 10), (1000, 1000, 3), 2.5)
+
+
 class _StubLandmarkDetector:
     def __init__(self, hands):
         self._hands = hands
@@ -217,12 +238,24 @@ class _StubLandmarkDetector:
         return [0.5] if self._hands else None
 
 
-def test_open_palm_fires_once_then_cooldown() -> None:
-    detector = OpenPalmDetector(required_fingers=5, cooldown_s=30.0)
+def test_open_palm_requires_confirmation_and_release_before_refire() -> None:
+    detector = OpenPalmDetector(
+        required_fingers=5, cooldown_s=30.0,
+        confirm_frames=2, release_frames=2,
+    )
     stub = _StubLandmarkDetector([_palm_landmarks(True)])
-    assert detector.observe(3, None, 0.0, detector=stub) is True
-    assert detector.observe(3, None, 1.0, detector=stub) is False
-    assert detector.observe(4, None, 1.0, detector=stub) is True
+    assert detector.observe(3, None, 0.0, detector=stub) is False
+    assert detector.observe(3, None, 0.5, detector=stub) is True
+    # Giữ tay qua cả cooldown vẫn không được chào lại.
+    assert detector.observe(3, None, 31.0, detector=stub) is False
+    closed = _StubLandmarkDetector([])
+    assert detector.observe(3, None, 32.0, detector=closed) is False
+    assert detector.observe(3, None, 32.5, detector=closed) is False
+    assert detector.observe(3, None, 33.0, detector=stub) is False
+    assert detector.observe(3, None, 33.5, detector=stub) is True
+
+    assert detector.observe(4, None, 1.0, detector=stub) is False
+    assert detector.observe(4, None, 1.5, detector=stub) is True
 
 
 def test_open_palm_ignores_fist_and_empty() -> None:
@@ -234,9 +267,22 @@ def test_open_palm_ignores_fist_and_empty() -> None:
                             detector=_StubLandmarkDetector([])) is False
 
 
+def test_open_palm_rejects_hand_below_head_region_without_face() -> None:
+    hand = _palm_landmarks(True)
+    hand = [(x, min(0.99, y + 0.35)) for x, y in hand]
+    detector = OpenPalmDetector(
+        required_fingers=4, cooldown_s=0.0, confirm_frames=1,
+        max_hand_center_y=0.60,
+    )
+    assert detector.observe(
+        8, None, 0.0, detector=_StubLandmarkDetector([hand]),
+    ) is False
+
+
 def test_open_palm_forget_retired() -> None:
-    detector = OpenPalmDetector(cooldown_s=30.0)
+    detector = OpenPalmDetector(cooldown_s=30.0, confirm_frames=1)
     stub = _StubLandmarkDetector([_palm_landmarks(True)])
     assert detector.observe(7, None, 0.0, detector=stub) is True
     detector.forget_retired(set())
     assert 7 not in detector._last_fire_s
+    assert 7 not in detector._latched

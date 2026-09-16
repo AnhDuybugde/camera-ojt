@@ -16,8 +16,9 @@ Kiến trúc mới (event-driven):
         queue -> InsightFace detect_embed(crop) -> matcher -> consensus
           └── result_queue -> main loop poll + bind/attendance/greet
 
-Nguyên tắc realtime: drop frame cũ, không xếp backlog. Queue nhỏ
-(``max_queue=2``), job cũ bị drop khi quá tải.
+Nguyên tắc realtime: queue huu han, khong block main loop. Moi
+``(channel, gid)`` chi co mot job dang cho/xu ly; khi day thi giu cac job da
+nhan thay vi xoa job cu, tranh mot nhom track bi doi vo han.
 """
 from __future__ import annotations
 
@@ -54,6 +55,7 @@ class FaceResult:
     match: object
     sharpness: float
     quality: float
+    identity_confirmed: bool
     day_str: str
     wall_iso: str
     time_tag: str
@@ -67,7 +69,7 @@ class FaceWorker:
         self,
         consumer,
         *,
-        max_queue: int = 2,
+        max_queue: int = 8,
         model_lock: threading.Lock | None = None,
         max_job_age_s: float = 2.0,
     ) -> None:
@@ -75,14 +77,15 @@ class FaceWorker:
         self.max_queue = max(1, int(max_queue))
         self.model_lock = model_lock or threading.Lock()
         self.max_job_age_s = max(0.5, float(max_job_age_s))
-        self._jobs: queue.Queue[FaceJob] = queue.Queue()
+        self._jobs: queue.Queue[FaceJob] = queue.Queue(maxsize=self.max_queue)
         self._results: queue.Queue[FaceResult] = queue.Queue()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         # Once-per-track: gid đã có kết quả known thì không enqueue lại
         # cho tới khi hết recheck hoặc mất track lâu.
-        self._known_at: dict[int, float] = {}
-        self._last_attempt: dict[int, float] = {}
+        self._known_at: dict[tuple[str, int], float] = {}
+        self._last_attempt: dict[tuple[str, int], float] = {}
+        self._pending: set[tuple[str, int]] = set()
         self._lock = threading.Lock()
 
     # -- lifecycle --
@@ -109,6 +112,7 @@ class FaceWorker:
         now_s: float,
         recheck_s: float = 30.0,
         unknown_cooldown_s: float = 1.0,
+        channel: str = "*",
     ) -> bool:
         """Track này có cần enqueue Face không?
 
@@ -116,38 +120,43 @@ class FaceWorker:
         - Chưa biết -> cooldown ngắn để thử lại khi góc mặt đẹp hơn.
         """
         with self._lock:
+            key = (channel, gid)
             if known:
-                last = self._known_at.get(gid, float("-inf"))
+                last = self._known_at.get(key, float("-inf"))
                 return (now_s - last) >= max(0.0, recheck_s)
-            last_try = self._last_attempt.get(gid, float("-inf"))
+            last_try = self._last_attempt.get(key, float("-inf"))
             return (now_s - last_try) >= max(0.0, unknown_cooldown_s)
 
-    def mark_attempt(self, gid: int, now_s: float) -> None:
+    def mark_attempt(self, gid: int, now_s: float, channel: str = "*") -> None:
         with self._lock:
-            self._last_attempt[gid] = now_s
+            self._last_attempt[(channel, gid)] = now_s
 
-    def mark_known(self, gid: int, now_s: float) -> None:
+    def mark_known(self, gid: int, now_s: float, channel: str = "*") -> None:
         with self._lock:
-            self._known_at[gid] = now_s
+            self._known_at[(channel, gid)] = now_s
 
     def forget_retired(self, alive: set[int]) -> None:
         with self._lock:
-            for gid in [g for g in self._known_at if g not in alive]:
-                self._known_at.pop(gid, None)
-            for gid in [g for g in self._last_attempt if g not in alive]:
-                self._last_attempt.pop(gid, None)
+            for key in [k for k in self._known_at if k[1] not in alive]:
+                self._known_at.pop(key, None)
+            for key in [k for k in self._last_attempt if k[1] not in alive]:
+                self._last_attempt.pop(key, None)
+            for key in [k for k in self._pending if k[1] not in alive]:
+                self._pending.discard(key)
 
     def submit(self, job: FaceJob) -> bool:
-        """Enqueue job, drop cũ nhất khi đầy. Luôn trả ngay, không block."""
+        """Enqueue khong block; khong xoa job cu va khong lap cung track."""
+        key = (job.channel, job.gid)
+        with self._lock:
+            if key in self._pending:
+                return False
+            self._pending.add(key)
         try:
-            if self._jobs.qsize() >= self.max_queue:
-                try:
-                    self._jobs.get_nowait()
-                except queue.Empty:
-                    pass
             self._jobs.put_nowait(job)
             return True
         except queue.Full:
+            with self._lock:
+                self._pending.discard(key)
             return False
 
     def poll_results(self) -> list[FaceResult]:
@@ -178,6 +187,8 @@ class FaceWorker:
             except Exception:
                 continue
             finally:
+                with self._lock:
+                    self._pending.discard((job.channel, job.gid))
                 try:
                     self._jobs.task_done()
                 except ValueError:
@@ -226,6 +237,7 @@ class FaceWorker:
                 match=obs.match,
                 sharpness=obs.sharpness,
                 quality=obs.quality,
+                identity_confirmed=obs.identity_confirmed,
                 day_str=job.day_str,
                 wall_iso=job.wall_iso,
                 time_tag=job.time_tag,

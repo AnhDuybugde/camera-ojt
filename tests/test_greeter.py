@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import ClassVar
 
 from camera_tracking.voice.greeter import VoiceGreeter
+from camera_tracking.voice.zerotts_tts import add_display_name_aliases
 
 
 class StubGreeter(VoiceGreeter):
@@ -70,3 +71,32 @@ def test_worker_plays_synthesized(tmp_path) -> None:
     assert greeter.synthesized == ["Xin chào Le Van Dai",
                                    "Xin chào quý khách"]
     assert len(StubGreeter._played_paths) == 2
+
+
+def test_pregen_full_names_are_aliased_to_gallery_short_names(tmp_path) -> None:
+    anh_duy = tmp_path / "LeHoAnhDuy.wav"
+    van_dai = tmp_path / "LeVanDai.wav"
+    aliases = add_display_name_aliases(
+        {
+            "Xin chào Lê Hồ Anh Duy": anh_duy,
+            "Xin chào Lê Văn Đại": van_dai,
+        },
+        ["Anh Duy", "Van Dai"],
+    )
+    assert aliases["Xin chào Anh Duy"] == anh_duy
+    assert aliases["Xin chào Van Dai"] == van_dai
+
+
+def test_worker_calls_on_spoken_after_output(tmp_path) -> None:
+    spoken: list[str] = []
+    greeter = StubGreeter(
+        cache_dir=str(tmp_path),
+        cooldown_s=0,
+        on_spoken=spoken.append,
+    )
+    greeter.start()
+    assert greeter.wave_greet(
+        day="2026-09-16", person_id="1", display_name="Anh Duy", now_s=0
+    )
+    greeter._queue.join()
+    assert spoken == ["Xin chào Anh Duy"]

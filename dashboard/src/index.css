@@ -845,6 +845,36 @@ tbody tr:hover { background: #f1f5f9; }
   list-style: none;
 }
 
+.identity-match-list {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.identity-match {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 8px 12px;
+  border: 1px solid #d7e4f2;
+  border-radius: 6px;
+  background: #f5f9ff;
+}
+
+.identity-match strong {
+  flex: 0 0 auto;
+  color: #1859a9;
+  font-size: 13px;
+}
+
+.identity-match span {
+  overflow: hidden;
+  color: #475467;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .activity-item {
   display: flex;
   align-items: center;

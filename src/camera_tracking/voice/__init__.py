@@ -1,6 +1,12 @@
 """Speech generation and camera talk outputs (legacy WebSDK + P2P VisualTalk)."""
 
 from camera_tracking.voice.greeter import VoiceGreeter
+from camera_tracking.voice.voice_trigger import (
+    DEFAULT_TRIGGER_WORDS,
+    VoiceTrigger,
+    is_voice_trigger,
+    normalize_trigger_text,
+)
 from camera_tracking.voice.imou_bridge import (
     AudioTalkError,
     ImouAudioTalkBridge,
@@ -22,4 +28,8 @@ __all__ = [
     "ImouP2PTalkOutput",
     "P2PTalkError",
     "VoiceGreeter",
+    "DEFAULT_TRIGGER_WORDS",
+    "VoiceTrigger",
+    "is_voice_trigger",
+    "normalize_trigger_text",
 ]

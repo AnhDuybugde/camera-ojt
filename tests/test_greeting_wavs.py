@@ -9,6 +9,7 @@ import pytest
 
 from camera_tracking.voice.greeter import VoiceGreeter
 from camera_tracking.voice.zerotts_tts import (
+    add_display_name_aliases,
     concat_wavs_gapless,
     load_phrase_files,
 )
@@ -49,6 +50,30 @@ def test_load_phrase_files_skips_missing_and_empty(tmp_path) -> None:
 
 def test_load_phrase_files_no_manifest(tmp_path) -> None:
     assert load_phrase_files(tmp_path) == {}
+
+
+def test_short_gallery_name_uses_full_name_wav(tmp_path) -> None:
+    wav = _sine(tmp_path / "LeHoAnhDuy.wav", 440.0, 0.2)
+    files = add_display_name_aliases(
+        {"Xin chào Lê Hồ Anh Duy": wav}, ["Anh Duy"]
+    )
+    assert files["Xin chào Anh Duy"] == wav
+
+
+def test_alias_matching_ignores_vietnamese_diacritics(tmp_path) -> None:
+    wav = _sine(tmp_path / "QuocNgoc.wav", 440.0, 0.2)
+    files = add_display_name_aliases(
+        {"Xin chào Bùi Hữu Quốc Ngọc": wav}, ["Quoc Ngoc"]
+    )
+    assert files["Xin chào Quoc Ngoc"] == wav
+
+
+def test_alias_matching_handles_vietnamese_d_stroke(tmp_path) -> None:
+    wav = _sine(tmp_path / "LeVanDai.wav", 440.0, 0.2)
+    files = add_display_name_aliases(
+        {"Xin chào Lê Văn Đại": wav}, ["Van Dai"]
+    )
+    assert files["Xin chào Van Dai"] == wav
 
 
 def test_concat_gapless_is_sample_exact(tmp_path) -> None:

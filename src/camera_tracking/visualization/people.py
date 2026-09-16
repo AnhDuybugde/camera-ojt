@@ -102,6 +102,7 @@ def draw_global_labels(
     status: dict[int, object] | None = None,
     names: dict[int, str] | None = None,
     employee_ids: dict[int, str] | None = None,
+    face_candidates: dict[int, list[tuple[str, float]]] | None = None,
 ) -> np.ndarray:
     """Ve label hien thi: `G{gid} [| Ten] [| Label EN]`.
 
@@ -115,6 +116,7 @@ def draw_global_labels(
     status = status or {}
     names = names or {}
     employee_ids = employee_ids or {}
+    face_candidates = face_candidates or {}
     for track in tracks:
         gid = track.track_id
         parts = [f"G{gid}"]
@@ -137,6 +139,15 @@ def draw_global_labels(
         x1, y1 = max(0, int(track.bbox.x1)), max(0, int(track.bbox.y1))
         cv2.putText(frame, text, (x1, max(20, y1 - 24)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
+        ranked = face_candidates.get(gid, [])[:2]
+        if ranked:
+            ranking = " | ".join(
+                f"{index}. {candidate}: {max(0.0, score) * 100:.0f}%"
+                for index, (candidate, score) in enumerate(ranked, start=1)
+            )
+            cv2.putText(frame, ranking, (x1, max(40, y1 - 5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 220, 80), 1,
+                        cv2.LINE_AA)
     return frame
 
 

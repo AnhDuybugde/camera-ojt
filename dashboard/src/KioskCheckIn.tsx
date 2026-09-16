@@ -13,6 +13,7 @@ export type KioskPerson = {
   camera?: string | null
   cameras?: string[]
   tracking_state?: string | null
+  face_candidates?: Array<{ name: string; score: number }>
 }
 
 export type KioskAttendance = {
@@ -318,6 +319,20 @@ export default function KioskCheckIn({
         <div className="recent-heading">
           <strong>Hoạt động</strong>
           <span>{liveOk ? 'Trực tiếp từ pipeline' : 'Ngoại tuyến'}</span>
+        </div>
+        <div className="identity-match-list" aria-label="Độ tương đồng khuôn mặt">
+          {cameraPeople.map((person) => (
+            <div className="identity-match" key={`match-${person.gid}`}>
+              <strong>G{person.gid}</strong>
+              <span>
+                {person.face_candidates?.length
+                  ? person.face_candidates.slice(0, 2).map((candidate, index) =>
+                    `${index + 1}. ${candidate.name} ${Math.round(Math.max(0, candidate.score) * 100)}%`,
+                  ).join(' · ')
+                  : 'Đang chờ khuôn mặt'}
+              </span>
+            </div>
+          ))}
         </div>
         <ul className="activity-list">
           {events.length === 0 && (

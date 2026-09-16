@@ -35,13 +35,29 @@ def test_need_face_once_per_track_with_recheck() -> None:
     assert worker.need_face(1, known=True, now_s=45.0, recheck_s=30.0) is True
 
 
-def test_submit_drops_oldest_when_full() -> None:
+def test_submit_keeps_accepted_jobs_when_full() -> None:
     worker = FaceWorker(_EmptyConsumer(), max_queue=2)
     assert worker.submit(_job(1)) is True
     assert worker.submit(_job(2)) is True
-    # Queue đầy -> drop cũ nhất, vẫn nhận job mới, không block.
-    assert worker.submit(_job(3)) is True
+    # Queue day -> tu choi job moi, khong lam mat hai job da chap nhan.
+    assert worker.submit(_job(3)) is False
     assert worker._jobs.qsize() == 2
+
+
+def test_submit_coalesces_same_camera_and_gid() -> None:
+    worker = FaceWorker(_EmptyConsumer(), max_queue=2)
+    assert worker.submit(_job(1)) is True
+    assert worker.submit(_job(1)) is False
+    assert worker._jobs.qsize() == 1
+
+
+def test_cooldown_is_independent_per_camera() -> None:
+    worker = FaceWorker(_EmptyConsumer(), max_queue=2)
+    worker.mark_attempt(1, 0.0, "A")
+    assert worker.need_face(1, known=False, now_s=0.1,
+                            unknown_cooldown_s=1.0, channel="A") is False
+    assert worker.need_face(1, known=False, now_s=0.1,
+                            unknown_cooldown_s=1.0, channel="B") is True
 
 
 def test_worker_drains_without_blocking_main() -> None:

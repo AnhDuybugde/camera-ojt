@@ -61,14 +61,16 @@ def test_p2p_output_calls_send(monkeypatch, tmp_path):
     def _fake_send(path, creds, **kwargs):
         seen["path"] = Path(path)
         seen["channel"] = kwargs.get("channel")
+        seen["volume"] = kwargs.get("volume")
 
     monkeypatch.setattr(p2p_talk, "send_audio_file", _fake_send)
     out = ImouP2PTalkOutput(
-        ImouP2PCredentials(serial="S", password="P"), channel=2
+        ImouP2PCredentials(serial="S", password="P"), channel=2, volume=0.5
     )
     out(audio)
     assert seen["path"] == audio
     assert seen["channel"] == 2
+    assert seen["volume"] == 0.5
 
 
 def test_convert_missing_file(tmp_path):
@@ -83,6 +85,7 @@ def test_voice_config_p2p_defaults():
     assert config.voice.backend == "imou_p2p"
     assert config.voice.p2p_channel == 1
     assert config.voice.p2p_sample_rate == 16000
+    assert 0.0 <= config.voice.p2p_volume <= 1.0
 
 
 def test_vendored_self_tests():

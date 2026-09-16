@@ -93,11 +93,13 @@ class MediaPipeHandDetector:
         min_detection_confidence: float = 0.5,
         static_image_mode: bool = False,
         model_path: str | Path | None = None,
+        min_input_height_px: int = 0,
     ) -> None:
         self.max_num_hands = max(1, max_num_hands)
         self.min_detection_confidence = min_detection_confidence
         self.static_image_mode = static_image_mode
         self.model_path = model_path
+        self.min_input_height_px = max(0, int(min_input_height_px))
         self._hands = None
         self._tasks_backend = False
         self._tick_ms = 0
@@ -137,8 +139,8 @@ class MediaPipeHandDetector:
             running_mode=mp_vision.RunningMode.VIDEO,
             num_hands=self.max_num_hands,
             min_hand_detection_confidence=self.min_detection_confidence,
-            min_hand_presence_confidence=0.5,
-            min_tracking_confidence=0.5,
+            min_hand_presence_confidence=self.min_detection_confidence,
+            min_tracking_confidence=self.min_detection_confidence,
         )
         return mp_vision.HandLandmarker.create_from_options(options)
 
@@ -201,7 +203,7 @@ class MediaPipeHandDetector:
     def landmarks(self, crop_bgr) -> list[list[tuple[float, float]]]:
         """Trả full 21 landmarks mỗi bàn tay (chuẩn hoá 0..1).
 
-        Dùng cho open-palm 5 ngón. Trả [] khi không thấy tay.
+        Dùng cho open-palm 4-5 ngón. Trả [] khi không thấy tay.
         """
         if crop_bgr is None or getattr(crop_bgr, "size", 0) == 0:
             return []
@@ -210,6 +212,13 @@ class MediaPipeHandDetector:
         except ImportError:
             return []
         hands = self._load()
+        crop_h = int(crop_bgr.shape[0])
+        if 0 < crop_h < self.min_input_height_px:
+            scale = self.min_input_height_px / max(1, crop_h)
+            crop_bgr = cv2.resize(
+                crop_bgr, None, fx=scale, fy=scale,
+                interpolation=cv2.INTER_CUBIC,
+            )
         rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
         if self._tasks_backend:
             import mediapipe as mp
@@ -312,7 +321,7 @@ def count_extended_fingers(landmarks: list[tuple[float, float]]) -> int:
     """Đếm ngón duỗi từ 21 landmarks MediaPipe (chuẩn hoá 0..1).
 
     Heuristic khoảng cách: đầu ngón xa cổ tay hơn khớp giữa -> duỗi.
-    Đơn giản, đủ cho case "giơ đủ bàn tay 5 ngón để chào".
+    Đơn giản, đủ cho case "giơ bàn tay mở 4-5 ngón để chào".
     Trả 0..5.
     """
     if landmarks is None or len(landmarks) < 21:
@@ -334,23 +343,90 @@ def count_extended_fingers(landmarks: list[tuple[float, float]]) -> int:
 
 
 def is_open_palm(landmarks: list[tuple[float, float]], required: int = 5) -> bool:
-    """True khi đủ `required` ngón duỗi (mặc định 5 = cả bàn tay)."""
-    return count_extended_fingers(landmarks) >= max(1, required)
+    """True khi thấy bàn tay dựng, xoè đủ ngón.
+
+    Ngoài khoảng cách tới cổ tay, yêu cầu bốn đầu ngón nằm phía trên khớp
+    PIP và ngón cái mở sang bên. Điều kiện hướng này loại phần lớn dương tính
+    giả từ mặt/quần áo trong person crop; cử chỉ chào của camera là tay dựng.
+    """
+    if landmarks is None or len(landmarks) < 21:
+        return False
+    try:
+        wrist = landmarks[0]
+        long_pairs = ((8, 6), (12, 10), (16, 14), (20, 18))
+        # Dem tung ngon dai theo ca khoang cach va huong. Khong bat buoc ca
+        # bon ngon dai khi cau hinh required=4: mot ngon bi che van hop le.
+        long_extended = sum(
+            _dist(landmarks[tip], wrist) > _dist(landmarks[pip], wrist) * 1.08
+            and landmarks[tip][1] < landmarks[pip][1] - 0.015
+            for tip, pip in long_pairs
+        )
+        thumb_extended = (
+            _dist(landmarks[4], wrist) > _dist(landmarks[3], wrist) * 1.03
+            and abs(landmarks[4][0] - landmarks[5][0]) >= 0.04
+        )
+        if long_extended + int(thumb_extended) < max(1, required):
+            return False
+        # Ít nhất ba ngón dài phải hướng lên để tránh nhầm cánh tay/vật thể.
+        if long_extended < min(3, max(1, required)):
+            return False
+        # Cổ tay phải thấp hơn các khớp gốc: bàn tay thực sự đang dựng lên.
+        wrist_y = landmarks[0][1]
+        if wrist_y <= max(landmarks[i][1] for i in (5, 9, 13, 17)) + 0.02:
+            return False
+        return True
+    except (IndexError, TypeError, ValueError):
+        return False
+
+
+def is_hand_near_face(
+    landmarks: list[tuple[float, float]],
+    face_bbox: tuple[float, float, float, float],
+    crop_shape: tuple[int, ...],
+    max_distance: float = 2.5,
+) -> bool:
+    """True khi tâm bàn tay ở gần mặt trong cùng một person crop.
+
+    ``landmarks`` là toạ độ chuẩn hoá của MediaPipe, còn ``face_bbox`` là
+    pixel tương đối theo crop người. Khoảng cách được chuẩn hoá theo kích
+    thước khuôn mặt để hoạt động giống nhau khi người đứng gần hoặc xa.
+    """
+    if len(landmarks) < 21 or len(crop_shape) < 2:
+        return False
+    try:
+        crop_h, crop_w = float(crop_shape[0]), float(crop_shape[1])
+        fx1, fy1, fx2, fy2 = (float(v) for v in face_bbox)
+        face_size = max(1.0, fx2 - fx1, fy2 - fy1)
+        face_cx, face_cy = (fx1 + fx2) / 2.0, (fy1 + fy2) / 2.0
+        hand_cx = sum(point[0] for point in landmarks) / len(landmarks) * crop_w
+        hand_cy = sum(point[1] for point in landmarks) / len(landmarks) * crop_h
+        distance = _dist((hand_cx, hand_cy), (face_cx, face_cy)) / face_size
+        # Tay chào có thể ở hai bên mặt, nhưng không được nằm sâu dưới thân.
+        return distance <= max(0.1, max_distance) and hand_cy <= fy2 + face_size
+    except (IndexError, TypeError, ValueError, ZeroDivisionError):
+        return False
 
 
 @dataclass
 class OpenPalmDetector:
-    """Greeting trigger đơn giản: giơ đủ bàn tay 5 ngón -> True 1 lần.
+    """Greeting trigger đơn giản: giơ bàn tay mở 4-5 ngón -> True 1 lần.
 
     Không cần vẫy qua lại như WaveDetector cũ. Event-driven + gated ở
     caller (chỉ gọi ~3-5 FPS trên candidate đủ lớn), bên trong chỉ check
-    1 frame + cooldown per-gid.
+    nhiều frame liên tiếp + cooldown per-gid. Sau khi fire, người dùng phải
+    hạ tay đủ số frame release rồi giơ lại; giữ nguyên bàn tay không lặp greet.
     """
 
     required_fingers: int = 5
     cooldown_s: float = 30.0
+    confirm_frames: int = 4
+    release_frames: int = 2
     hand_detector: HandDetector | None = None
+    max_hand_center_y: float = 0.60
     _last_fire_s: dict[int, float] = field(default_factory=dict, init=False)
+    _open_counts: dict[int, int] = field(default_factory=dict, init=False)
+    _closed_counts: dict[int, int] = field(default_factory=dict, init=False)
+    _latched: set[int] = field(default_factory=set, init=False)
 
     def observe(
         self,
@@ -358,10 +434,10 @@ class OpenPalmDetector:
         crop_bgr,
         now_s: float,
         detector: HandDetector | None = None,
+        face_bbox: tuple[float, float, float, float] | None = None,
+        face_max_distance: float = 2.5,
     ) -> bool:
-        """Trả True đúng 1 lần khi thấy bàn tay xoè đủ ngón."""
-        if now_s - self._last_fire_s.get(gid, float("-inf")) < self.cooldown_s:
-            return False
+        """True một lần cho mỗi động tác hạ tay rồi giơ bàn tay xoè."""
         detect = detector or self.hand_detector
         if detect is None:
             return False
@@ -372,11 +448,34 @@ class OpenPalmDetector:
                 return False
         except RuntimeError:
             return False
-        for hand in hands or []:
-            if is_open_palm(hand, self.required_fingers):
-                self._last_fire_s[gid] = now_s
-                return True
-        return False
+        palm_open = any(
+            is_open_palm(hand, self.required_fingers)
+            and (sum(point[1] for point in hand) / len(hand)
+                 <= max(0.1, min(1.0, self.max_hand_center_y)))
+            and (face_bbox is None or is_hand_near_face(
+                hand, face_bbox, getattr(crop_bgr, "shape", ()), face_max_distance))
+            for hand in (hands or [])
+        )
+        if not palm_open:
+            self._open_counts[gid] = 0
+            closed = self._closed_counts.get(gid, 0) + 1
+            self._closed_counts[gid] = closed
+            if closed >= max(1, self.release_frames):
+                self._latched.discard(gid)
+            return False
+
+        self._closed_counts[gid] = 0
+        opened = self._open_counts.get(gid, 0) + 1
+        self._open_counts[gid] = opened
+        if gid in self._latched or opened < max(1, self.confirm_frames):
+            return False
+        # Latched even during cooldown: holding a newly raised palm until the
+        # cooldown expires must not cause a delayed greeting.
+        self._latched.add(gid)
+        if now_s - self._last_fire_s.get(gid, float("-inf")) < self.cooldown_s:
+            return False
+        self._last_fire_s[gid] = now_s
+        return True
 
     def cooldown_remaining(self, gid: int, now_s: float) -> float:
         """So giay con lai truoc khi gid duoc fire tiep (0 = san sang)."""
@@ -385,6 +484,11 @@ class OpenPalmDetector:
     def forget_retired(self, alive_gids: set[int]) -> None:
         for gid in [g for g in self._last_fire_s if g not in alive_gids]:
             self._last_fire_s.pop(gid, None)
+        for gid in [g for g in self._open_counts if g not in alive_gids]:
+            self._open_counts.pop(gid, None)
+        for gid in [g for g in self._closed_counts if g not in alive_gids]:
+            self._closed_counts.pop(gid, None)
+        self._latched.intersection_update(alive_gids)
 
 
 __all__ = [
@@ -394,5 +498,6 @@ __all__ = [
     "WaveDetector",
     "count_extended_fingers",
     "count_reversals",
+    "is_hand_near_face",
     "is_open_palm",
 ]

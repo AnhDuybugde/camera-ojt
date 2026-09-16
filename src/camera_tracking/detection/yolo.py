@@ -81,7 +81,9 @@ class YoloPersonDetector:
             imgsz=self.image_size,
             iou=self.nms_iou_threshold,
             device=self.device,
-            half=self.device.startswith("cuda"),
+            # Ultralytics >=8.4 replaced the deprecated ``half`` argument
+            # with ``quantize=16`` for FP16 inference.
+            quantize=16 if self.device.startswith("cuda") else None,
             verbose=False,
         )
         return [

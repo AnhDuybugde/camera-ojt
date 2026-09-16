@@ -97,12 +97,18 @@ def find_ffmpeg() -> str:
     )
 
 
-def convert_file_to_aac_adts(input_path: str | Path, *, sample_rate: int = 16000) -> bytes:
+def convert_file_to_aac_adts(
+    input_path: str | Path,
+    *,
+    sample_rate: int = 16000,
+    volume: float = 1.0,
+) -> bytes:
     """Convert TTS mp3 / WAV bat ky sang AAC-LC/ADTS mono 16 kHz (bytes)."""
     src = Path(input_path)
     if not src.is_file():
         raise P2PTalkError(f"Speech audio does not exist: {src}")
     ffmpeg = find_ffmpeg()
+    volume = max(0.0, min(1.0, float(volume)))
     env = dict(os.environ)
     # Bao dam ffmpeg con cua imageio-ffmpeg chay duoc khi goi bang ten.
     env["Path"] = str(Path(ffmpeg).parent) + ";" + env.get("Path", "")
@@ -115,6 +121,8 @@ def convert_file_to_aac_adts(input_path: str | Path, *, sample_rate: int = 16000
             "-y",
             "-i",
             str(src),
+            "-filter:a",
+            f"volume={volume:.3f}",
             "-ar",
             str(int(sample_rate)),
             "-ac",
@@ -222,10 +230,13 @@ def send_audio_file(
     attempts: int = 3,
     retry_delay: float = 8.0,
     sample_rate: int = 16000,
+    volume: float = 1.0,
 ) -> None:
     """Convert + gui 1 file am thanh (mp3 TTS / wav) ra loa camera. Block."""
     creds = creds or ImouP2PCredentials.from_env()
-    aac = convert_file_to_aac_adts(audio_path, sample_rate=sample_rate)
+    aac = convert_file_to_aac_adts(
+        audio_path, sample_rate=sample_rate, volume=volume
+    )
     try:
         asyncio.run(
             _send_aac(
@@ -256,6 +267,7 @@ class ImouP2PTalkOutput:
         attempts: int = 2,
         retry_delay: float = 5.0,
         sample_rate: int = 16000,
+        volume: float = 1.0,
     ) -> None:
         self.creds = creds or ImouP2PCredentials.from_env()
         self.channel = int(channel)
@@ -263,6 +275,7 @@ class ImouP2PTalkOutput:
         self.attempts = int(attempts)
         self.retry_delay = float(retry_delay)
         self.sample_rate = int(sample_rate)
+        self.volume = max(0.0, min(1.0, float(volume)))
 
     def __call__(self, audio_path: Path) -> None:
         started = time.monotonic()
@@ -275,6 +288,7 @@ class ImouP2PTalkOutput:
                 attempts=self.attempts,
                 retry_delay=self.retry_delay,
                 sample_rate=self.sample_rate,
+                volume=self.volume,
             )
         except P2PTalkError as error:
             elapsed = time.monotonic() - started

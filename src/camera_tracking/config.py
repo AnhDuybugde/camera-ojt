@@ -244,6 +244,7 @@ class VoiceConfig(StrictModel):
     p2p_attempts: int = Field(default=2, ge=1)
     p2p_retry_delay_s: float = Field(default=5.0, ge=0)
     p2p_sample_rate: int = Field(default=16000, ge=8000)
+    p2p_volume: float = Field(default=0.5, ge=0.0, le=1.0)
     # WAV chao tao san bang ZeroTTS (scripts/build_greeting_wavs.py):
     # manifest.json anh xa nguyen van cau chao -> file wav.
     greeting_dir: Path = Path("output/voice_greetings")
@@ -255,6 +256,17 @@ class VoiceConfig(StrictModel):
     # Dùng chung VoiceGreeter queue/cooldown với wave để không spam.
     greet_on_face: bool = False
     greet_unknown_on_face: bool = False
+    # Override theo kenh (A=phong, B=cua). None = fallback ve global o tren.
+    # Mac dinh mong muon: A wave-only (khong chao mat), B face-trigger
+    # (thay mat la chao ngay, khong can tay).
+    greet_on_face_a: bool | None = None
+    greet_unknown_on_face_a: bool | None = None
+    greet_on_face_b: bool | None = None
+    greet_unknown_on_face_b: bool | None = None
+    # Gesture theo kenh: "wave" (vay tay, khuyen nghi cho A),
+    # "palm" (gio tay, legacy), "off" (tat, khuyen nghi cho B).
+    gesture_a: Literal["wave", "palm", "off"] = "wave"
+    gesture_b: Literal["wave", "palm", "off"] = "off"
     # Wave detector cadence + gioi han tai (MediaPipe chay CPU).
     # Toan cadence: process ~12.5 frame/s (fps/2) / every_k = tan so lay mau
     # co tay; can >= min_reversals+2 diem trong window moi fire duoc.
@@ -264,6 +276,8 @@ class VoiceConfig(StrictModel):
     wave_max_people: int = Field(default=2, ge=1)
     wave_window_s: float = Field(default=2.5, gt=0)
     wave_min_reversals: int = Field(default=4, ge=2)
+    wave_min_amplitude: float = Field(default=0.06, gt=0)
+    wave_min_gap_s: float = Field(default=0.08, gt=0)
     wave_cooldown_s: float = Field(default=30.0, ge=0)
     # Open-palm greeting: giơ đủ bàn tay 5 ngón -> chào (trigger duy nhat).
     # Event-driven + gated: chỉ chạy ~3-5 FPS trên candidate đủ lớn.
@@ -271,10 +285,36 @@ class VoiceConfig(StrictModel):
     palm_every_k: int = Field(default=4, ge=1)
     palm_max_people: int = Field(default=2, ge=1)
     palm_cooldown_s: float = Field(default=10.0, ge=0)
+    palm_confirm_frames: int = Field(default=1, ge=1)
+    palm_release_frames: int = Field(default=2, ge=1)
+    palm_min_detection_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
+    palm_required_fingers: int = Field(default=4, ge=3, le=5)
+    palm_min_input_height_px: int = Field(default=320, ge=0)
+    palm_head_region_max_y: float = Field(default=0.60, gt=0.0, le=1.0)
+    palm_allow_without_face: bool = True
+    palm_face_ttl_s: float = Field(default=3.0, gt=0.0)
+    palm_face_max_distance: float = Field(default=2.5, gt=0.0)
     palm_min_person_area_px: float = Field(default=8000.0, ge=0)
     # Face async worker: hàng đợi job, drop cũ khi quá tải để giữ realtime.
-    face_max_queue: int = Field(default=2, ge=1)
+    face_max_queue: int = Field(default=8, ge=1)
+    face_max_job_age_s: float = Field(default=5.0, ge=0.5)
     face_recheck_s: float = Field(default=30.0, ge=0)
+    # Voice-trigger (OR với palm): nghe mic camera, ai nói hello/xin chào
+    # thì greet người gần nhất (unknown + employee như nhau). Opt-in bằng
+    # --voice-trigger (cần --greet để có loa phát). STT mặc định
+    # faster-whisper medium/vi như repo test-sound đã chốt.
+    voice_trigger_enabled: bool = False
+    voice_trigger_words: list[str] = Field(default_factory=lambda: ["hello", "xin chào"])
+    voice_trigger_window_s: float = Field(default=5.0, ge=0)
+    voice_trigger_inhibit_s: float = Field(default=12.0, ge=0)
+    voice_stt_model: str = "medium"
+    voice_stt_lang: str = "vi"
+    voice_listen_channel: int = Field(default=1, ge=1)
+    voice_listen_subtype: int = Field(default=1, ge=0)
+    voice_vad_threshold: float = Field(default=0.03, ge=0)
+    voice_min_seg_rms: float = Field(default=0.025, ge=0)
+    voice_max_no_speech_prob: float = Field(default=0.55, ge=0.0, le=1.0)
+    voice_min_avg_logprob: float = Field(default=-0.85, le=0.0)
 
 
 class StoreConfig(StrictModel):

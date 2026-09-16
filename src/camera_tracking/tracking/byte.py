@@ -37,7 +37,9 @@ class ByteTrackTracker:
             match_thresh=match_threshold,
             fuse_score=True,
         )
-        self._tracker = BYTETracker(args, frame_rate=max(1, frame_rate))
+        # ultralytics>=8.4: BYTETracker chỉ nhận (args), không còn frame_rate.
+        # Giữ tham số frame_rate ở adapter để tương thích caller cũ.
+        self._tracker = BYTETracker(args)
         self._boxes_type = Boxes
         self.min_hits = min_hits
         self._ages: dict[int, int] = {}

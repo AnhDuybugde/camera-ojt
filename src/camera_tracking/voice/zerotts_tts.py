@@ -13,6 +13,8 @@ API goc (pip install zerotts):
 """
 from __future__ import annotations
 
+import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -127,10 +129,46 @@ def load_phrase_files(greeting_dir: str | Path) -> dict[str, Path]:
     return phrase_files
 
 
+def add_display_name_aliases(
+    phrase_files: dict[str, Path], display_names: list[str]
+) -> dict[str, Path]:
+    """Map ten rut gon cua gallery vao WAV ho-ten day du trong manifest.
+
+    Vi du gallery hien ``Anh Duy`` trong khi WAV da tao cho
+    ``Xin chào Lê Hồ Anh Duy``. So khop bo dau/case va theo hau to ten,
+    giup dung WAV offline thay vi roi sang Edge TTS can mang.
+    """
+    output = dict(phrase_files)
+
+    def normalized(value: str) -> str:
+        ascii_text = unicodedata.normalize("NFKD", value)
+        ascii_text = "".join(ch for ch in ascii_text if not unicodedata.combining(ch))
+        ascii_text = ascii_text.replace("Đ", "D").replace("đ", "d")
+        return " ".join(re.findall(r"[a-z0-9]+", ascii_text.casefold()))
+
+    normalized_sources = [
+        (normalized(phrase), path, len(normalized(phrase)))
+        for phrase, path in phrase_files.items()
+    ]
+    for display_name in display_names:
+        desired = f"Xin chào {display_name.strip()}"
+        if not display_name.strip() or desired in output:
+            continue
+        name_key = normalized(display_name)
+        matches = [
+            (length, path) for phrase_key, path, length in normalized_sources
+            if phrase_key.startswith("xin chao ") and phrase_key.endswith(name_key)
+        ]
+        if matches:
+            output[desired] = min(matches, key=lambda item: item[0])[1]
+    return output
+
+
 __all__ = [
     "DEFAULT_MODEL",
     "DEFAULT_VOICE",
     "ZeroTTSBackend",
     "concat_wavs_gapless",
+    "add_display_name_aliases",
     "load_phrase_files",
 ]

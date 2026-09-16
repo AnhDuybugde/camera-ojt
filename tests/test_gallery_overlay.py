@@ -78,6 +78,79 @@ def test_load_gallery_folder_per_person_multi_image(tmp_path) -> None:
     assert gallery.people[0].embedding is not None
 
 
+def test_embed_best_caps_seed_prototypes(tmp_path) -> None:
+    """29 frame/người -> 1 embedding chính + tối đa 9 seed prototypes."""
+    pytest_cv2 = pytest_import_cv2()
+    if pytest_cv2 is None:
+        return
+
+    class _VariedEmbedder:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def detect_embed(self, crop_bgr):
+            from camera_tracking.face.embeddings import FaceDetection
+
+            rng = np.random.default_rng(self.calls)
+            self.calls += 1
+            vec = rng.normal(size=8).astype(np.float32)
+            vec = vec / float(np.linalg.norm(vec))
+            return [FaceDetection(bbox=(0, 0, 10, 10), score=0.9,
+                                  embedding=vec)]
+
+    person_dir = tmp_path / "NV029"
+    person_dir.mkdir()
+    img = np.full((40, 40, 3), 128, dtype=np.uint8)
+    for i in range(12):
+        pytest_cv2.imwrite(str(person_dir / f"frame_{i:02d}.jpg"), img)
+    gallery = load_gallery(tmp_path, _VariedEmbedder(), max_seed_prototypes=10)
+    assert len(gallery) == 1
+    assert gallery.people[0].embedding is not None
+    assert len(gallery.people[0].prototypes) <= 9
+
+
+def test_embed_best_retries_padded_tight_crop(tmp_path) -> None:
+    """Crop khít mặt (detector rớt) -> thử lại bản pad viền."""
+    pytest_cv2 = pytest_import_cv2()
+    if pytest_cv2 is None:
+        return
+
+    class _PaddedOnlyEmbedder:
+        def detect_embed(self, crop_bgr):
+            from camera_tracking.face.embeddings import FaceDetection
+
+            # Chỉ thấy mặt khi có context xung quanh (ảnh đã pad).
+            if min(crop_bgr.shape[:2]) <= 150:
+                return []
+            vec = np.ones(8, dtype=np.float32)
+            vec = vec / float(np.linalg.norm(vec))
+            return [FaceDetection(bbox=(0, 0, 10, 10), score=0.8,
+                                  embedding=vec)]
+
+    person_dir = tmp_path / "TightCrop"
+    person_dir.mkdir()
+    img = np.full((100, 100, 3), 128, dtype=np.uint8)
+    pytest_cv2.imwrite(str(person_dir / "crop.jpg"), img)
+    gallery = load_gallery(tmp_path, _PaddedOnlyEmbedder())
+    assert len(gallery) == 1
+    assert gallery.people[0].embedding is not None
+
+
+def test_load_session_meta_prefers_quality(tmp_path) -> None:
+    from camera_tracking.face.gallery import _load_session_meta
+
+    (tmp_path / "session_abc.json").write_text(json.dumps({
+        "display_name": "Test Person",
+        "images": [
+            {"file": "a.jpg", "pose": "front", "quality_score": 0.9},
+            {"file": "b.jpg", "pose": "left", "quality_score": 0.5},
+        ],
+    }), encoding="utf-8")
+    meta = _load_session_meta([tmp_path / "a.jpg"])
+    assert meta["a.jpg"]["quality"] == 0.9
+    assert meta["b.jpg"]["pose"] == "left"
+
+
 def test_save_prototype_never_overwrites(tmp_path) -> None:
     import numpy as np
 

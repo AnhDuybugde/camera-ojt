@@ -1,6 +1,10 @@
 """Face embedder: wrap InsightFace, lazy-load, co fallback offline."""
 from __future__ import annotations
 
+import contextlib
+import io
+import os
+import sys
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -25,9 +29,6 @@ def ensure_cuda_dlls() -> list[str]:
     wheels (nvidia-cuda-runtime-cu12, nvidia-cudnn-cu12, ...). Goi truoc
     khi tao InsightFace/onnxruntime session. Idempotent.
     """
-    import os
-    import sys
-
     added: list[str] = []
     roots: set[str] = set()
     try:
@@ -126,14 +127,26 @@ class InsightFaceEmbedder:
             )
         providers: list[str] | None = ["CUDAExecutionProvider", "CPUExecutionProvider"] \
             if use_cuda else None
-        app = FaceAnalysis(name=self.model_pack, providers=providers)
-        # ctx_id=-1 => CPU; 0 => GPU dau tien (can onnxruntime-gpu).
-        ctx_id = 0 if use_cuda else -1
-        self.resolved_device = "cuda" if use_cuda else "cpu"
-        try:
-            app.prepare(ctx_id=ctx_id, det_size=(self.det_size, self.det_size))
-        except TypeError:
-            app.prepare(ctx_id=ctx_id)
+        # InsightFace/ONNX in mot dong providers cho tung model va danh sach
+        # model ra stdout. Day chi la log khoi tao, khong phai canh bao.
+        quiet = io.StringIO()
+        with contextlib.redirect_stdout(quiet), contextlib.redirect_stderr(quiet):
+            # Pipeline chi can detector + embedding. Buffalo packs con co
+            # landmark 68/106 va gender/age; FaceAnalysis mac dinh chay tat
+            # ca cac model do cho moi khuon mat, lam worker cham ro ret ma
+            # khong tao them gia tri cho matching/diem danh.
+            app = FaceAnalysis(
+                name=self.model_pack,
+                providers=providers,
+                allowed_modules=["detection", "recognition"],
+            )
+            # ctx_id=-1 => CPU; 0 => GPU dau tien (can onnxruntime-gpu).
+            ctx_id = 0 if use_cuda else -1
+            self.resolved_device = "cuda" if use_cuda else "cpu"
+            try:
+                app.prepare(ctx_id=ctx_id, det_size=(self.det_size, self.det_size))
+            except TypeError:
+                app.prepare(ctx_id=ctx_id)
         self._app = app
         return app
 

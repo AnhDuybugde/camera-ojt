@@ -96,9 +96,13 @@ def test_face_consumer_requires_consensus_before_emitting() -> None:
         unknown_cooldown_s=0, consensus_hits=3, consensus_window_s=3,
     )
     event = _event("A")
-    assert consumer.consume(event, now_s=0.0) == []
-    assert consumer.consume(event, now_s=1.0) == []
-    assert len(consumer.consume(event, now_s=2.0)) == 1
+    first = consumer.consume(event, now_s=0.0)
+    second = consumer.consume(event, now_s=1.0)
+    third = consumer.consume(event, now_s=2.0)
+    # UI nhan embedding/top-2 ngay; bind/attendance doi du consensus.
+    assert len(first) == 1 and first[0].identity_confirmed is False
+    assert len(second) == 1 and second[0].identity_confirmed is False
+    assert len(third) == 1 and third[0].identity_confirmed is True
 
 
 def test_one_face_is_assigned_to_only_one_overlapping_track() -> None:
@@ -124,3 +128,16 @@ def test_face_consumer_filters_low_detector_score() -> None:
         min_face_px=20, min_blur_variance=1, min_face_score=0.5,
     )
     assert consumer.consume(_event("A"), now_s=0.0) == []
+
+
+def test_blurry_face_emits_similarity_without_confirming_identity() -> None:
+    image = np.zeros((200, 200, 3), dtype=np.uint8)
+    event = TrackEvent("A", Frame(1, 0.0, image), (_track(),))
+    consumer = FaceTrackConsumer(
+        FakeEmbedder(), FakeMatcher(), min_person_area_px=1,
+        min_face_px=20, min_blur_variance=40,
+    )
+    observations = consumer.consume(event, now_s=0.0)
+    assert len(observations) == 1
+    assert observations[0].identity_confirmed is False
+    assert observations[0].match.score == 0.9

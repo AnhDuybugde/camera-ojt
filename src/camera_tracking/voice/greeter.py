@@ -37,6 +37,9 @@ class VoiceGreeter:
     unknown_phrase: str = "Xin chào quý khách"
     max_queue_age_s: float = 5.0
     output: Callable[[Path], None] | None = None
+    # Goi sau khi backend phat xong, dung de inhibit mic camera khoi nghe
+    # lai chinh cau chao vua phat.
+    on_spoken: Callable[[str], None] | None = None
     # WAV tao san (ZeroTTS): {cau chao dung nguyen van: duong dan file}.
     # Khop thi dung ngay, khong goi edge-tts (offline hoan toan).
     phrase_files: dict[str, str | Path] = field(default_factory=dict)
@@ -178,6 +181,14 @@ class VoiceGreeter:
                         self.output(path)
                     else:
                         self._play(path)
+                    if self.on_spoken is not None:
+                        try:
+                            self.on_spoken(text)
+                        except Exception as callback_error:  # noqa: BLE001
+                            print(f"[Voice] callback sau phát lỗi: {callback_error}")
+                    # Chi bao thanh cong sau khi backend (P2P/local) da tra
+                    # ve, khong nham voi log trigger moi chi xep hang.
+                    print(f"[Voice] Đã phát: {text}")
                 except Exception:
                     # P2P/loa loi: tra cooldown, main loop se log o lan toi.
                     self._rollback(day, identity_key, enqueued_now_s)

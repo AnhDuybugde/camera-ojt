@@ -130,14 +130,18 @@ def load_gallery(
     embedder: FaceEmbedder | None,
     name_map: dict[str, str] | None = None,
     employee_map: dict[str, str] | None = None,
+    max_seed_prototypes: int = 10,
 ) -> FaceGallery:
     """Load enrolled faces with multi-image support.
 
-    Hỗ trợ 2 layout (tương thích ngược):
+    Hỗ trợ 3 layout (tương thích ngược):
     - Legacy: ``data/images/<person_id>.jpg`` (1 ảnh/người).
-    - Thực tế: ``data/images/<person_id>/*.jpg`` (3-5 góc/người).
-      Embedding chính = khuôn mặt nét nhất trong các ảnh; các ảnh còn lại
-      thành prototypes để matching đa góc ngay từ đầu (không chờ live adapt).
+    - Folder: ``data/images/<person_id>/*.jpg`` (3-5 góc/người).
+    - Raw session: ``data/images/<person_id>/`` với 29 frame + file
+      ``session_*.json`` (chất lượng + pose từng frame, xem
+      ``scripts/import_raw_gallery.py``). Embedding chính = frame tốt nhất;
+      các frame còn lại được chọn đa dạng (pose/góc khác nhau) thành seed
+      prototypes để matching đa góc ngay từ đầu (không chờ live adapt).
     """
     root = Path(gallery_dir)
     gallery = FaceGallery()
@@ -171,11 +175,17 @@ def load_gallery(
         paths = buckets[person_id]
         display_name = name_map.get(person_id, person_id)
         employee_id = employee_map.get(person_id)
-        embedding, extra = _embed_best(paths, embedder)
+        session_meta = _load_session_meta(paths)
+        embedding, extra = _embed_best(
+            paths, embedder,
+            max_extra=max(0, max_seed_prototypes - 1),
+            session_meta=session_meta,
+        )
         prototypes = _load_prototypes(root, person_id)
         # Ảnh enroll phụ (ngoài ảnh tốt nhất) thành seed prototypes ngay.
         for vector in extra:
-            _append_seed_prototype(prototypes, vector, max_prototypes=10)
+            _append_seed_prototype(
+                prototypes, vector, max_prototypes=max_seed_prototypes)
         gallery.people.append(
             EnrolledPerson(
                 person_id=person_id,
@@ -189,14 +199,84 @@ def load_gallery(
     return gallery
 
 
+def _load_session_meta(paths: list[Path]) -> dict[str, dict]:
+    """Đọc session_*.json cạnh các frame (nếu có) -> {filename: meta}.
+
+    Mỗi meta có ``quality`` (0..1) và ``pose`` (front/left/right/up/down...).
+    Không có file session -> {} (chấm điểm thuần bằng detector).
+    """
+    for path in paths:
+        if path.name.startswith("session_") and path.suffix == ".json":
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                return {}
+            meta: dict[str, dict] = {}
+            images = payload.get("images")
+            if not isinstance(images, list):
+                return {}
+            for item in images:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("file")
+                if not isinstance(name, str):
+                    continue
+                try:
+                    quality = float(item.get("quality_score", 0.0))
+                except (TypeError, ValueError):
+                    quality = 0.0
+                pose = item.get("pose")
+                meta[name] = {
+                    "quality": max(0.0, min(1.0, quality)),
+                    "pose": pose if isinstance(pose, str) else "",
+                }
+            return meta
+    # Session nằm cùng folder nhưng không có trong bucket (đã lọc ảnh):
+    # thử tìm cạnh frame đầu tiên.
+    if paths:
+        for candidate in sorted(paths[0].parent.glob("session_*.json")):
+            return _load_session_meta([candidate, *paths])
+    return {}
+
+
+def _padded_copy(img: np.ndarray, ratio: float = 0.35) -> np.ndarray | None:
+    """Pad viền replicate cho face-crop quá chặt (detector cần context).
+
+    Crop 224x224 khít mặt thường rớt detection; pad 35% thì detect được
+    (đã đo 8/8, score ~0.75). Trả None khi thiếu cv2.
+    """
+    try:
+        import cv2
+    except ImportError:
+        return None
+    height, width = img.shape[:2]
+    pad = max(1, int(min(height, width) * ratio))
+    return cv2.copyMakeBorder(
+        img, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
+
+
 def _embed_best(
-    paths: list[Path], embedder: FaceEmbedder | None
+    paths: list[Path],
+    embedder: FaceEmbedder | None,
+    *,
+    max_extra: int = 9,
+    session_meta: dict[str, dict] | None = None,
 ) -> tuple[np.ndarray | None, list[np.ndarray]]:
-    """Chọn embedding nét nhất làm chính, các góc khác làm seed prototypes."""
+    """Chọn embedding tốt nhất làm chính, các frame đa dạng làm seed.
+
+    - Mỗi ảnh thử detect trực tiếp trước; rớt mới thử bản pad (giữ hành vi
+      cũ cho ảnh full-scene, sửa crop chặt 224px).
+    - Xếp hạng bằng detector score + kích thước mặt + quality session.
+    - Extra được chọn tham lam theo pose luân phiên + khoảng cách cosine
+      (>=0.03 so với vector đã chọn) để phủ nhiều góc, tối đa ``max_extra``.
+    """
     if embedder is None:
         return None, []
-    scored: list[tuple[float, np.ndarray]] = []
+    session_meta = session_meta or {}
+    scored: list[tuple[float, str, np.ndarray]] = []
     for path in paths:
+        if path.name.startswith("session_") and path.suffix == ".json":
+            continue
         img = _read_image(path)
         if img is None:
             continue
@@ -204,19 +284,60 @@ def _embed_best(
             dets = embedder.detect_embed(img)
         except RuntimeError:
             dets = []  # insightface chua cai -> enroll chay che do ten-only
+        if not dets:
+            padded = _padded_copy(img)
+            if padded is not None:
+                try:
+                    dets = embedder.detect_embed(padded)
+                except RuntimeError:
+                    dets = []
         for det in dets:
             width = det.bbox[2] - det.bbox[0]
             height = det.bbox[3] - det.bbox[1]
             size = min(width, height)
             if size <= 0:
                 continue
-            scored.append((float(det.score) + min(size, 200.0) / 1000.0,
-                           np.asarray(det.embedding, dtype=np.float32)))
+            meta = session_meta.get(path.name, {})
+            quality = float(meta.get("quality", 0.0))
+            pose = str(meta.get("pose", ""))
+            score = (
+                float(det.score)
+                + min(size, 200.0) / 1000.0
+                + quality * 0.5
+            )
+            scored.append((
+                score,
+                pose,
+                np.asarray(det.embedding, dtype=np.float32),
+            ))
     if not scored:
         return None, []
     scored.sort(key=lambda item: item[0], reverse=True)
-    best = scored[0][1]
-    extra = [vec for _, vec in scored[1:4]]
+    best = scored[0][2]
+    # Round-robin theo pose để prototypes phủ nhiều góc nhìn.
+    by_pose: dict[str, list[np.ndarray]] = {}
+    for _, pose, vec in scored[1:]:
+        by_pose.setdefault(pose or "", []).append(vec)
+    ordered: list[np.ndarray] = []
+    while any(by_pose.values()):
+        for pose in sorted(by_pose):
+            if by_pose[pose]:
+                ordered.append(by_pose[pose].pop(0))
+    extra: list[np.ndarray] = []
+    chosen: list[np.ndarray] = [best]
+    for vec in ordered:
+        if len(extra) >= max(0, max_extra):
+            break
+        norm = float(np.linalg.norm(vec))
+        if norm <= 1e-12:
+            continue
+        unit = np.asarray(vec, dtype=np.float32).ravel() / norm
+        if any(
+            1.0 - cosine_similarity(unit, sample) < 0.03 for sample in chosen
+        ):
+            continue
+        extra.append(unit)
+        chosen.append(unit)
     return best, extra
 
 
