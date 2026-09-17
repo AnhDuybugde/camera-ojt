@@ -1,6 +1,17 @@
 {
   "phrases": {
-    "Xin chào quý khách": "unknown.wav"
+    "Xin chào quý khách": "unknown.wav",
+    "Xin chào Anh Duy": "Anh Duy.wav",
+    "Xin chào Anh Hưng": "Anh Hưng.wav",
+    "Xin chào Anh Khoa sáu một bảy": "Anh Khoa sáu một bảy.wav",
+    "Xin chào Anh Lê Văn Đại": "Anh Lê Văn Đại.wav",
+    "Xin chào Anh Nguyễn Chế Định": "Anh Nguyễn Chế Định.wav",
+    "Xin chào Anh Ngọc": "Anh Ngọc.wav",
+    "Xin chào Anh Trần Bá Lê Hoàng": "Anh Trần Bá Lê Hoàng.wav",
+    "Xin chào Anh Tuấn Anh Gymer": "Anh Tuấn Anh Gymer.wav",
+    "Xin chào Bé Nhi": "Bé Nhi.wav",
+    "Xin chào Bé Thỏ Ngây Ngô": "Bé Thỏ Ngây Ngô.wav",
+    "Xin chào Sếp Phúc": "Sếp Phúc.wav"
   },
   "model": "zeroweight-ai/ZeroTTS",
   "voice": "maichi"
