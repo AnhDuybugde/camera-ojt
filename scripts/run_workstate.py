@@ -830,6 +830,10 @@ def _snapshot_new_gids(
 
 
 def main() -> None:
+    # Dìm log decode ffmpeg của OpenCV (hevc "Could not find ref" / "Error
+    # constructing the frame RPS" do substream camera, frame vẫn chảy bình
+    # thường). Đặt env của user thắng nếu đã export trước.
+    os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "fatal")
     args = parse_args()
     config = load_config(args.config)
 
@@ -1711,29 +1715,73 @@ def main() -> None:
     )
     if trigger_on:
         try:
-            from camera_tracking.voice.voice_trigger import VoiceTrigger
+            from camera_tracking.voice.voice_trigger import (
+                VoiceTrigger,
+                load_wake_phrases,
+            )
             from camera_tracking.voice.rtsp_voice_listener import build_listener_from_env
 
+            # Cụm gọi lập trình sẵn (config/voice_triggers/*.yaml) + cụm bổ
+            # sung trong config. Thêm file yaml là có cụm mới, khỏi sửa code.
+            _wake_phrases, _wake_fillers, _wake_max_fill = load_wake_phrases(
+                getattr(voice_cfg, "trigger_phrase_dir", "config/voice_triggers"),
+                extra_words=tuple(getattr(voice_cfg, "voice_trigger_words", []) or ()),
+            )
+            # P6: inhibit phủ đuôi vang thật = câu chào dài nhất + đuôi dội.
+            _longest_greet = 0.0
+            try:
+                import wave as _wave_mod
+
+                for _wav in (phrase_files or {}).values():
+                    _p = Path(_wav)
+                    if _p.suffix.lower() != ".wav":
+                        continue
+                    try:
+                        with _wave_mod.open(str(_p), "rb") as _w:
+                            _longest_greet = max(
+                                _longest_greet,
+                                _w.getnframes() / max(1, _w.getframerate()),
+                            )
+                    except (OSError, EOFError, _wave_mod.Error):
+                        continue
+            except (ImportError, AttributeError, TypeError, ValueError):
+                _longest_greet = 0.0
+            _inhibit_s = max(
+                float(getattr(voice_cfg, "voice_trigger_inhibit_s", 4.0)),
+                _longest_greet + float(getattr(
+                    voice_cfg, "voice_trigger_echo_tail_s", 2.0)),
+            )
             voice_trigger = VoiceTrigger(
-                trigger_words=tuple(getattr(
-                    voice_cfg, "voice_trigger_words", ["hello", "xin chào"])),
+                trigger_words=_wake_phrases,
                 window_s=float(getattr(voice_cfg, "voice_trigger_window_s", 5.0)),
-                inhibit_s=float(getattr(voice_cfg, "voice_trigger_inhibit_s", 4.0)),
+                inhibit_s=_inhibit_s,
+                fillers=_wake_fillers,
+                max_fillers=_wake_max_fill,
             )
             voice_stop = _voice_th.Event()
             voice_listener = build_listener_from_env(
                 voice_trigger,
                 channel=int(getattr(voice_cfg, "voice_listen_channel", 1)),
                 subtype=int(getattr(voice_cfg, "voice_listen_subtype", 1)),
-                fw_model_name=str(getattr(voice_cfg, "voice_stt_model", "medium")),
+                fw_model_name=str(getattr(voice_cfg, "voice_stt_model", "small")),
                 fw_lang=str(getattr(voice_cfg, "voice_stt_lang", "vi")),
-                vad_threshold=float(getattr(voice_cfg, "voice_vad_threshold", 0.03)),
-                min_seg_rms=float(getattr(voice_cfg, "voice_min_seg_rms", 0.025)),
+                vad_threshold=float(getattr(voice_cfg, "voice_vad_threshold", 0.012)),
+                min_seg_rms=float(getattr(voice_cfg, "voice_min_seg_rms", 0.008)),
                 max_no_speech_prob=float(getattr(
-                    voice_cfg, "voice_max_no_speech_prob", 0.55)),
+                    voice_cfg, "voice_max_no_speech_prob", 0.40)),
                 min_avg_logprob=float(getattr(
-                    voice_cfg, "voice_min_avg_logprob", -0.85)),
+                    voice_cfg, "voice_min_avg_logprob", -0.70)),
+                vad_floor_factor=float(getattr(
+                    voice_cfg, "voice_vad_floor_factor", 3.0)),
+                vad_floor_min=float(getattr(
+                    voice_cfg, "voice_vad_floor_min", 0.02)),
+                vad_ceiling=float(getattr(
+                    voice_cfg, "voice_vad_ceiling", 0.15)),
+                snr_min_db=float(getattr(
+                    voice_cfg, "voice_snr_min_db", 10.0)),
                 stop_event=voice_stop,
+                dump_dir=str(getattr(
+                    voice_cfg, "voice_dump_dir", "") or "") or None,
             )
             if voice_listener is None:
                 voice_trigger = None
@@ -1743,8 +1791,8 @@ def main() -> None:
                 # sau khi am thanh da phat xong de mic khong nghe chinh loa.
                 greeter.on_spoken = lambda _text: voice_trigger.set_inhibit()
                 voice_listener.start()
-                print(f"VoiceTrigger: OR giơ tay | hello/xin chào "
-                      f"(window {voice_trigger.window_s:.0f}s, "
+                print(f"VoiceTrigger: OR vẫy tay | cụm gọi {sorted(_wake_phrases)} "
+                      f"(window {voice_trigger.window_s:.0f}s, inhibit {_inhibit_s:.0f}s, "
                       f"STT {voice_cfg.voice_stt_model}/{voice_cfg.voice_stt_lang}).")
         except (ImportError, OSError, RuntimeError, ValueError) as error:
             print(f"VoiceTrigger disabled ({error}); giu palm-only.")
@@ -1784,7 +1832,7 @@ def main() -> None:
     face_greet_on = bool(any(face_greet_on_by_channel.values()))
     if voice_on and not face_greet_on:
         if trigger_on:
-            print("Voice: A vay tay HOẶC nói hello/xin chào (wave OR voice).")
+            print("Voice: A vẫy tay HOẶC nói cụm gọi (wave OR voice).")
         else:
             print("Voice: A chi chao khi vay tay (wave-only).")
     elif face_greet_on:
@@ -2858,15 +2906,38 @@ def main() -> None:
                                                 )
                                             except RuntimeError:
                                                 gestured = False
-                                    # OR: tay HOẶC voice-hello. Voice dùng chung
+                                    # OR: tay HOẶC cụm gọi. Voice dùng chung
                                     # identity + cooldown loa với gesture.
-                                    _via_voice = bool(not gestured and _voice_avail)
+                                    # P5: voice chỉ hiệu lực khi có mặt tươi
+                                    # trong TTL và người đủ lớn (mic toàn cục
+                                    # nên đây là cửa chống nhầm chính: loại
+                                    # tiếng gọi từ xa ngoài khung hình).
+                                    _voice_face_ttl = float(getattr(
+                                        voice_cfg, "voice_face_ttl_s", 3.0))
+                                    _voice_min_area = float(getattr(
+                                        voice_cfg, "voice_min_person_area_px",
+                                        getattr(voice_cfg, "palm_min_person_area_px",
+                                                8000.0)))
+                                    _fresh_voice_face = bool(
+                                        _face_state is not None
+                                        and now_s - _face_state[0] <= _voice_face_ttl
+                                    )
+                                    _voice_big_enough = bool(
+                                        _track.bbox.area >= _voice_min_area)
+                                    _via_voice = bool(
+                                        not gestured and _voice_avail
+                                        and _fresh_voice_face and _voice_big_enough)
                                     if not gestured and not _via_voice:
                                         # Log chan doan throttle theo GID.
                                         if now_s - palm_dbg_at.get(
                                                 _gid, float("-inf")) > 15.0:
                                             palm_dbg_at[_gid] = now_s
-                                            if _mode == "wave":
+                                            if _voice_avail and not (
+                                                    _fresh_voice_face
+                                                    and _voice_big_enough):
+                                                print(f"[Voice][{_ch}] G{_gid} nghe cụm gọi "
+                                                      f"nhưng chờ mặt tươi+đủ lớn")
+                                            elif _mode == "wave":
                                                 try:
                                                     _rev = _det.current_reversals(_gid)
                                                 except (AttributeError, TypeError, ValueError):

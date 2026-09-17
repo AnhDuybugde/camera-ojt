@@ -1,0 +1,24 @@
+# Cụm gọi camera (wake phrases) — mic chỉ greet khi nghe các cụm này.
+#
+# Thêm cụm mới sau này: tạo thêm file *.yaml trong folder này (hoặc thêm
+# vào list `phrases` bên dưới) rồi restart pipeline, không cần sửa code.
+# Ví dụ sau này: "ok imou", "chào camera phòng khách"...
+#
+# So khớp không phân biệt hoa/thường và bỏ dấu tiếng Việt
+# ("xin chào imou" == "xin chao imou" == "XIN CHAO IMOU").
+phrases:
+  - hello imou
+  - xin chào imou
+
+# Tiếng đệm cho phép đứng kèm cụm gọi (tối đa `max_fillers` tiếng).
+# Đã bỏ "camera"/"cam" theo plan chống nhầm (TV/phòng ồn hay lẫn từ này).
+fillers:
+  - a
+  - da
+  - oi
+  - hey
+  - hi
+
+# Cụm gọi đứng gần như một mình: tối đa 1 tiếng đệm.
+# "a hello imou" -> greet; "dạ xin chào imou ạ" (2 đệm) -> bỏ.
+max_fillers: 1

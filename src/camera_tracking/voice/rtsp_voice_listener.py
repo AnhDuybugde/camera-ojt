@@ -29,6 +29,60 @@ FRAME_MS = 30
 FRAME_BYTES = 960
 
 DEFAULT_AUDIO_FILTER = "highpass=f=80,afftdn=nr=12:nf=-25"
+# Bias decoder ve dung chinh ta cum goi (STT ep language='vi' hay be
+# "hello imou" thanh "xin gao emu"). Re hon fuzzy-match ma khong cham.
+DEFAULT_STT_PROMPT = "Hello imou. Xin chào imou."
+
+
+def db_to_amplitude_ratio(db: float) -> float:
+    """Đổi SNR dB sang tỉ số biên độ (P3: 10 dB ~= 3.16 lần)."""
+    import math as _math
+
+    return 10.0 ** (max(0.0, float(db)) / 20.0)
+
+
+class NoiseFloorTracker:
+    """P1 — ngưỡng VAD động bám nền ồn (trị ồn đều, không cần đo phòng).
+
+    Chỉ học từ các frame yên (dưới ngưỡng hiện tại) bằng trung bình trượt;
+    ngưỡng hiệu lực = min(max(nền × factor, sàn tuyệt đối), trần).
+    factor <= 0 -> hành vi cũ (ngưỡng tĩnh).
+    """
+
+    def __init__(
+        self,
+        static_threshold: float = 0.03,
+        factor: float = 3.0,
+        abs_min: float = 0.02,
+        ceiling: float = 0.15,
+        adapt_rate: float = 0.03,
+    ) -> None:
+        self.static_threshold = max(0.0, float(static_threshold))
+        self.factor = float(factor)
+        self.abs_min = max(1e-4, float(abs_min))
+        self.ceiling = max(self.abs_min, float(ceiling))
+        self.adapt_rate = min(1.0, max(0.0, float(adapt_rate)))
+        self.floor = self.abs_min
+
+    @property
+    def threshold(self) -> float:
+        """Ngưỡng VAD hiệu lực cho frame kế tiếp."""
+        if self.factor <= 0.0:
+            return self.static_threshold
+        dynamic = max(self.floor * self.factor, self.abs_min)
+        return min(dynamic, self.ceiling)
+
+    def update(self, rms: float) -> float:
+        """Cập nhật nền từ 1 frame; trả ngưỡng hiệu lực mới."""
+        level = max(0.0, float(rms))
+        if level < self.threshold:
+            self.floor += self.adapt_rate * (level - self.floor)
+        else:
+            # Ồn to kéo dài (điều hòa/TV mở to) vẫn phải nâng nền theo,
+            # nhưng rất chậm để tiếng nói ngắn không kịp kéo nền lên.
+            self.floor += (self.adapt_rate / 20.0) * (level - self.floor)
+        self.floor = max(1e-4, self.floor)
+        return self.threshold
 
 
 def find_ffmpeg() -> str | None:
@@ -59,11 +113,36 @@ def rms_level(pcm: bytes) -> float:
 
 def transcribe_segment_fw(
     fw_model, pcm: bytes, lang: str = "vi", *,
-    max_no_speech_prob: float = 0.55,
-    min_avg_logprob: float = -0.85,
+    max_no_speech_prob: float = 0.40,
+    min_avg_logprob: float = -0.70,
+    agc_peak: float = 0.6,
+    agc_max_gain: float = 50.0,
+    initial_prompt: str = DEFAULT_STT_PROMPT,
 ) -> str:
-    """Chạy 1 speech segment qua faster-whisper (qua file wav tạm)."""
+    """Chạy 1 speech segment qua faster-whisper (qua file wav tạm).
+
+    Mic camera thường thu rất nhỏ (rms ~0.005): chuẩn hóa đỉnh lên
+    `agc_peak` trước khi STT để Whisper không loại vì "im lặng".
+    """
+    import array
     import tempfile
+
+    samples = array.array("h")
+    try:
+        samples.frombytes(pcm)
+    except (ValueError, OverflowError):
+        return ""
+    if not samples:
+        return ""
+    peak = max(abs(s) for s in samples)
+    if peak <= 0:
+        return ""
+    gain = min((agc_peak * 32768.0) / peak, agc_max_gain)
+    if gain > 1.0:
+        for i, s in enumerate(samples):
+            v = int(s * gain)
+            samples[i] = 32767 if v > 32767 else (-32768 if v < -32768 else v)
+        pcm = samples.tobytes()
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_f:
         tmp = tmp_f.name
@@ -80,6 +159,7 @@ def transcribe_segment_fw(
             beam_size=1,
             vad_filter=False,
             condition_on_previous_text=False,
+            initial_prompt=initial_prompt or None,
         )
         accepted: list[str] = []
         for segment in segments:
@@ -117,8 +197,17 @@ class RtspVoiceListener(threading.Thread):
         audio_filter: str = DEFAULT_AUDIO_FILTER,
         stop_event: threading.Event | None = None,
         verbose: bool = False,
-        max_no_speech_prob: float = 0.55,
-        min_avg_logprob: float = -0.85,
+        max_no_speech_prob: float = 0.40,
+        min_avg_logprob: float = -0.70,
+        # P1: ngưỡng động bám nền (factor<=0 -> ngưỡng tĩnh như cũ).
+        vad_floor_factor: float = 3.0,
+        vad_floor_min: float = 0.02,
+        vad_ceiling: float = 0.15,
+        # P3: đoạn cắt ra chỉ đi STT khi to hơn nền >= snr_min_db.
+        snr_min_db: float = 10.0,
+        # Dump mọi đoạn đi STT ra WAV để nghe lại/debug (None/"" = tắt).
+        dump_dir: str | Path | None = None,
+        dump_keep: int = 500,
     ) -> None:
         super().__init__(name="rtsp-voice-listen", daemon=True)
         self.trigger = trigger
@@ -136,7 +225,50 @@ class RtspVoiceListener(threading.Thread):
         self.verbose = verbose
         self.max_no_speech_prob = float(max_no_speech_prob)
         self.min_avg_logprob = float(min_avg_logprob)
+        self.noise_floor = NoiseFloorTracker(
+            static_threshold=vad_threshold,
+            factor=vad_floor_factor,
+            abs_min=vad_floor_min,
+            ceiling=vad_ceiling,
+        )
+        self.snr_ratio = db_to_amplitude_ratio(snr_min_db)
+        self.stats = {"segments": 0, "stt": 0, "dropped_snr": 0, "dropped_rms": 0}
         self.disabled_reason: str | None = None
+        # Mức frame mới nhất (cho đồng hồ đo live); -1 = chưa có frame nào.
+        self.last_level: float = -1.0
+        # Đỉnh mức kể từ lần đọc meter trước (meter 1Hz dễ chộp trúng
+        # khoảng ngắt giữa âm tiết nên phải giữ đỉnh, không đọc tức thời).
+        self.level_peak: float = 0.0
+        self.dump_dir = Path(dump_dir) if dump_dir else None
+        self.dump_keep = max(0, int(dump_keep))
+        if self.dump_dir is not None:
+            try:
+                self.dump_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                self.dump_dir = None
+
+    def _dump_segment(self, seg: bytes, seg_rms: float) -> Path | None:
+        """Lưu 1 đoạn đi STT ra WAV; tỉa file cũ khi quá dump_keep."""
+        if self.dump_dir is None:
+            return None
+        try:
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            path = self.dump_dir / f"seg_{stamp}_{self.stats['stt']:04d}_rms{seg_rms:.3f}.wav"
+            with wave.open(str(path), "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(TARGET_RATE)
+                w.writeframes(seg)
+            if self.dump_keep > 0:
+                files = sorted(self.dump_dir.glob("seg_*.wav"))
+                for old in files[:-self.dump_keep]:
+                    try:
+                        old.unlink()
+                    except OSError:
+                        pass
+            return path
+        except OSError:
+            return None
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -179,8 +311,10 @@ class RtspVoiceListener(threading.Thread):
             return
         assert proc.stdout is not None
         print(
-            f"[VoiceTrigger] listening mic camera (hello/xin chào), "
-            f"VAD={self.vad_threshold:.3f}/{self.min_seg_rms:.3f} ...",
+            f"[VoiceTrigger] listening mic camera (hello imou/xin chào imou), "
+            f"VAD dyn~{self.noise_floor.threshold:.3f} "
+            f"(static={self.vad_threshold:.3f}, x{self.noise_floor.factor:g}, "
+            f"snr>={self.snr_ratio:.1f}x) ...",
             flush=True,
         )
 
@@ -206,7 +340,12 @@ class RtspVoiceListener(threading.Thread):
                 del leftover[:FRAME_BYTES]
                 now = time.monotonic()
                 level = rms_level(frame)
-                is_speech = level >= self.vad_threshold and not self.trigger.inhibited(now)
+                self.last_level = level
+                if level > self.level_peak:
+                    self.level_peak = level
+                # P1: ngưỡng động bám nền ồn; frame yên nuôi lại nền.
+                vad_now = self.noise_floor.update(level)
+                is_speech = level >= vad_now and not self.trigger.inhibited(now)
                 if not speaking:
                     pre_roll.append(frame)
                     if is_speech:
@@ -238,12 +377,37 @@ class RtspVoiceListener(threading.Thread):
                         segment = bytearray()
                         silence_ms = 0
                         pre_roll.clear()
-                        if len(seg) < min_bytes or rms_level(seg) < self.min_seg_rms:
-                            continue
+                        self.stats["segments"] += 1
                         seg_rms = rms_level(seg)
+                        if len(seg) < min_bytes or seg_rms < self.min_seg_rms:
+                            self.stats["dropped_rms"] += 1
+                            continue
+                        # P3: đoạn phải to hơn nền đang theo dõi (loại ồn to
+                        # đều + tiếng nói xa nhỏ, khỏi tốn lượt STT).
+                        if seg_rms < self.noise_floor.floor * self.snr_ratio:
+                            self.stats["dropped_snr"] += 1
+                            if self.verbose:
+                                print(
+                                    f"[VoiceTrigger] drop SNR "
+                                    f"rms={seg_rms:.3f} floor={self.noise_floor.floor:.3f}",
+                                    flush=True,
+                                )
+                            continue
+                        self.stats["stt"] += 1
+                        dumped = self._dump_segment(seg, seg_rms)
+                        if self.stats["segments"] % 100 == 0:
+                            print(
+                                f"[VoiceTrigger] stats seg={self.stats['segments']} "
+                                f"stt={self.stats['stt']} "
+                                f"drop_rms={self.stats['dropped_rms']} "
+                                f"drop_snr={self.stats['dropped_snr']} "
+                                f"floor={self.noise_floor.floor:.3f}",
+                                flush=True,
+                            )
                         print(
                             f"[VoiceTrigger] speech {len(seg) * 1000 // (TARGET_RATE * 2)}ms "
-                            f"rms={seg_rms:.3f} -> STT",
+                            f"rms={seg_rms:.3f} -> STT"
+                            + (f" [{dumped.name}]" if dumped is not None else ""),
                             flush=True,
                         )
                         text = transcribe_segment_fw(
@@ -274,9 +438,15 @@ def build_listener_from_env(
     fw_lang: str = "vi",
     vad_threshold: float = 0.03,
     min_seg_rms: float = 0.025,
-    max_no_speech_prob: float = 0.55,
-    min_avg_logprob: float = -0.85,
+    max_no_speech_prob: float = 0.40,
+    min_avg_logprob: float = -0.70,
+    vad_floor_factor: float = 3.0,
+    vad_floor_min: float = 0.02,
+    vad_ceiling: float = 0.15,
+    snr_min_db: float = 10.0,
     stop_event: threading.Event | None = None,
+    dump_dir: str | Path | None = None,
+    dump_keep: int = 500,
 ) -> RtspVoiceListener | None:
     """Dựng listener từ IMOU_IP/USER/PASSWORD; None khi thiếu env."""
     from camera_tracking.camera.camera_imou import imou_url
@@ -291,14 +461,23 @@ def build_listener_from_env(
         vad_threshold=vad_threshold, min_seg_rms=min_seg_rms,
         max_no_speech_prob=max_no_speech_prob,
         min_avg_logprob=min_avg_logprob,
+        vad_floor_factor=vad_floor_factor,
+        vad_floor_min=vad_floor_min,
+        vad_ceiling=vad_ceiling,
+        snr_min_db=snr_min_db,
         stop_event=stop_event,
+        dump_dir=dump_dir,
+        dump_keep=dump_keep,
     )
 
 
 __all__ = [
     "DEFAULT_AUDIO_FILTER",
+    "DEFAULT_STT_PROMPT",
+    "NoiseFloorTracker",
     "RtspVoiceListener",
     "build_listener_from_env",
+    "db_to_amplitude_ratio",
     "find_ffmpeg",
     "rms_level",
     "transcribe_segment_fw",

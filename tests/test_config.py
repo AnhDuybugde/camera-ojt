@@ -74,4 +74,11 @@ class ConfigTest(TestCase):
         self.assertEqual(config.voice.unknown_greet_delay_s, 2.0)
         self.assertEqual(config.voice.face_max_queue, 8)
         self.assertEqual(config.voice.face_max_job_age_s, 5.0)
+        # Hearing chong nhiem phong on: cum goi tu folder, VAD dong, SNR, STT siet.
+        self.assertEqual(config.voice.voice_trigger_words, [])
+        self.assertEqual(config.voice.voice_face_ttl_s, 3.0)
+        self.assertEqual(config.voice.voice_vad_floor_factor, 3.0)
+        self.assertEqual(config.voice.voice_snr_min_db, 10.0)
+        self.assertEqual(config.voice.voice_max_no_speech_prob, 0.40)
+        self.assertEqual(config.voice.voice_min_avg_logprob, -0.90)
         self.assertEqual(len(config.analytics.calibration.image_points), 4)

@@ -243,8 +243,8 @@ voice:
   p2p_attempts: 2
   p2p_retry_delay_s: 5.0
   p2p_sample_rate: 16000
-  # 0.0=im lang, 0.5=nua am luong, 1.0=giu nguyen file TTS.
-  p2p_volume: 0.5
+  # 0.0=im lang, 0.2=nho, 0.5=nua am luong, 1.0=giu nguyen file TTS.
+  p2p_volume: 0.1
   # WAV chao tao san (scripts/build_greeting_wavs.py, ZeroTTS).
   greeting_dir: output/voice_greetings
   zerotts_voice: maichi
@@ -300,25 +300,46 @@ voice:
   face_max_queue: 8
   face_max_job_age_s: 5.0
   face_recheck_s: 30.0
-  # Voice-trigger (OR với palm): mic camera nghe "hello/xin chào" thì greet
-  # người gần nhất (unknown + employee như nhau, còn lại không tự greet).
+  # Voice-trigger (OR với wave): mic camera nghe cụm gọi lập trình sẵn
+  # (config/voice_triggers/: "hello imou", "xin chào imou", thêm sau chỉ
+  # cần thêm file yaml) thì greet người gần nhất. Cụm dài + gắn mặt nên
+  # TV/phòng ồn khó gây nhầm hơn "hello" trần.
   # Bật bằng --voice-trigger (cần kèm --greet để có loa). STT faster-whisper
-  # medium/vi như repo test-sound đã chốt; inhibit_s chặn mic tự nghe loa TTS.
+  # small/vi: model nhỏ ít bịa chữ từ ồn, nhẹ CPU.
   voice_trigger_enabled: false
-  voice_trigger_words: ["hello", "xin chào"]
+  trigger_phrase_dir: config/voice_triggers
+  # Cụm bổ sung ngoài folder (nối thêm, ít dùng).
+  voice_trigger_words: []
   voice_trigger_window_s: 5.0
-  # Loa P2P co the phat tre; chan mic du lau de khong nghe lai cau chao.
+  # P6: inhibit hiệu lực = max(cấu hình, câu chào dài nhất + đuôi vang dưới).
   voice_trigger_inhibit_s: 12.0
+  voice_trigger_echo_tail_s: 2.0
+  # P5: voice chỉ hiệu lực khi có mặt tươi trong 3s và người đủ lớn
+  # (chống tiếng gọi từ xa ngoài khung hình — mic toàn cục).
+  voice_face_ttl_s: 3.0
+  voice_min_person_area_px: 2500.0
+  # P1: ngưỡng VAD động bám nền ồn (trị ồn đều, không cần đo phòng).
+  voice_vad_floor_factor: 3.0
+  # Mic camera nay nen on rat thap (~0.0005) -> san thap de bat tieng nho.
+  voice_vad_floor_min: 0.004
+  voice_vad_ceiling: 0.15
+  # P3: đoạn chỉ đi STT khi to hơn nền >= 10dB (bỏ ồn to đều/tiếng xa nhỏ).
+  voice_snr_min_db: 10.0
   # small da cache tren may, nhanh hon medium CPU cho keyword ngan.
   voice_stt_model: small
   voice_stt_lang: vi
   voice_listen_channel: 1
   voice_listen_subtype: 1
   # Do thuc te mic sau filter: noise p50~0.0014, speech p90~0.035.
-  voice_vad_threshold: 0.012
-  voice_min_seg_rms: 0.008
-  voice_max_no_speech_prob: 0.55
-  voice_min_avg_logprob: -0.85
+  voice_vad_threshold: 0.004
+  voice_min_seg_rms: 0.003
+  # P4: cửa chất lượng STT siết (model nhỏ vốn đã ít bịa chữ từ ồn).
+  voice_max_no_speech_prob: 0.40
+  # Nguong -0.90: tha giong that noi nho (vd -0.84) nhung van chan
+  # chu bia kieu "Tat nhien." (-1.05).
+  voice_min_avg_logprob: -0.90
+  # Luu moi doan voice di STT ra WAV de nghe lai ("" = tat).
+  voice_dump_dir: output/voice_dumps
 
 store:
   local_faces_dir: data/faces

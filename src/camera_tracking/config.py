@@ -261,7 +261,7 @@ class VoiceConfig(StrictModel):
     p2p_attempts: int = Field(default=2, ge=1)
     p2p_retry_delay_s: float = Field(default=5.0, ge=0)
     p2p_sample_rate: int = Field(default=16000, ge=8000)
-    p2p_volume: float = Field(default=0.5, ge=0.0, le=1.0)
+    p2p_volume: float = Field(default=0.1, ge=0.0, le=1.0)
     # WAV chao tao san bang ZeroTTS (scripts/build_greeting_wavs.py):
     # manifest.json anh xa nguyen van cau chao -> file wav.
     greeting_dir: Path = Path("output/voice_greetings")
@@ -336,22 +336,41 @@ class VoiceConfig(StrictModel):
     face_max_queue: int = Field(default=8, ge=1)
     face_max_job_age_s: float = Field(default=5.0, ge=0.5)
     face_recheck_s: float = Field(default=30.0, ge=0)
-    # Voice-trigger (OR với palm): nghe mic camera, ai nói hello/xin chào
-    # thì greet người gần nhất (unknown + employee như nhau). Opt-in bằng
-    # --voice-trigger (cần --greet để có loa phát). STT mặc định
-    # faster-whisper medium/vi như repo test-sound đã chốt.
+    # Voice-trigger (OR với wave): mic camera nghe cụm gọi trong
+    # config/voice_triggers/ thì greet người gần nhất (unknown + employee
+    # như nhau). Opt-in bằng --voice-trigger (cần --greet để có loa phát).
+    # STT faster-whisper small/vi: model nhỏ ít bịa chữ từ ồn, nhẹ CPU.
     voice_trigger_enabled: bool = False
-    voice_trigger_words: list[str] = Field(default_factory=lambda: ["hello", "xin chào"])
+    # Folder cụm gọi (mỗi *.yaml: phrases/fillers/max_fillers). Thêm cụm
+    # mới ("ok imou", ...) chỉ cần thêm file + restart, không sửa code.
+    trigger_phrase_dir: Path = Path("config/voice_triggers")
+    # Cụm bổ sung ngoài folder (nối thêm, ít dùng).
+    voice_trigger_words: list[str] = Field(default_factory=list)
     voice_trigger_window_s: float = Field(default=5.0, ge=0)
     voice_trigger_inhibit_s: float = Field(default=12.0, ge=0)
-    voice_stt_model: str = "medium"
+    # P6: inhibit hiệu lực = max(cấu hình, câu chào dài nhất + đuôi vang).
+    voice_trigger_echo_tail_s: float = Field(default=2.0, ge=0)
+    # P5: voice chỉ hiệu lực khi có mặt tươi trong TTL này.
+    voice_face_ttl_s: float = Field(default=3.0, gt=0.0)
+    # P5: người được voice-greet phải đủ lớn (cùng đơn vị palm_min_person_area_px).
+    voice_min_person_area_px: float = Field(default=2500.0, ge=0)
+    # P1: ngưỡng VAD động bám nền (factor<=0 -> ngưỡng tĩnh như cũ).
+    voice_vad_floor_factor: float = Field(default=3.0, ge=0)
+    voice_vad_floor_min: float = Field(default=0.004, gt=0.0)
+    voice_vad_ceiling: float = Field(default=0.15, gt=0.0)
+    # P3: đoạn chỉ đi STT khi to hơn nền >= số dB này.
+    voice_snr_min_db: float = Field(default=10.0, ge=0)
+    voice_stt_model: str = "small"
     voice_stt_lang: str = "vi"
     voice_listen_channel: int = Field(default=1, ge=1)
     voice_listen_subtype: int = Field(default=1, ge=0)
-    voice_vad_threshold: float = Field(default=0.03, ge=0)
-    voice_min_seg_rms: float = Field(default=0.025, ge=0)
-    voice_max_no_speech_prob: float = Field(default=0.55, ge=0.0, le=1.0)
-    voice_min_avg_logprob: float = Field(default=-0.85, le=0.0)
+    voice_vad_threshold: float = Field(default=0.004, ge=0)
+    voice_min_seg_rms: float = Field(default=0.003, ge=0)
+    # P4: model nhỏ + cửa chất lượng siết (ít bịa chữ từ ồn).
+    voice_max_no_speech_prob: float = Field(default=0.40, ge=0.0, le=1.0)
+    voice_min_avg_logprob: float = Field(default=-0.90, le=0.0)
+    # Dump mọi đoạn voice đi STT ra WAV ("" = tắt).
+    voice_dump_dir: str = "output/voice_dumps"
 
 
 class StoreConfig(StrictModel):
