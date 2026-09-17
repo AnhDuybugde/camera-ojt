@@ -43,7 +43,7 @@ class YoloPersonDetector:
         person_class_id: int = 0,
         image_size: int = 800,
         device: str = "auto",
-        nms_iou_threshold: float = 0.50,
+        nms_iou_threshold: float = 0.85,
         nested_box_containment_threshold: float = 0.85,
     ) -> None:
         self.model_path = model_path

@@ -53,6 +53,7 @@ type LivePerson = {
   camera?: string | null
   tracking_state?: string | null
   face_candidates?: Array<{ name: string; score: number }>
+  foreground_cameras?: string[]
 }
 
 type PendingAttendance = {

@@ -17,6 +17,13 @@ STATUS_COLORS: dict[str, tuple[int, int, int]] = {
     "Unknown": (60, 60, 220),       # red
 }
 _DEFAULT_TRACK_COLOR = (200, 200, 200)
+_HAND_CONNECTIONS = (
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (17, 18), (18, 19), (19, 20), (0, 17),
+)
 
 
 def status_color(label: str | None) -> tuple[int, int, int] | None:
@@ -34,6 +41,7 @@ def draw_person_tracks(
     title: str = "People",
     display_count: int | None = None,
     status: dict[int, object] | None = None,
+    focus_gid: int | None = None,
 ) -> np.ndarray:
     """Draw person boxes, stable IDs, confidence, and a visible person count.
 
@@ -47,10 +55,24 @@ def draw_person_tracks(
         track_color = color or _status_track_color(track.track_id, status) \
             or _track_color(track.track_id)
         x1, y1, x2, y2 = map(round, (box.x1, box.y1, box.x2, box.y2))
-        cv2.rectangle(frame, (x1, y1), (x2, y2), track_color, 2)
+        focused = focus_gid is None or track.track_id == focus_gid
+        thickness = 3 if focus_gid is not None and focused else (2 if focused else 1)
+        if not focused:
+            track_color = tuple(int(value * 0.55) for value in track_color)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), track_color, thickness)
 
         # track_id is the shared Global ID after identity association.
-        label = f"G{track.track_id}  {track.confidence:.2f}"
+        if focus_gid is not None and not focused:
+            entry = (status or {}).get(track.track_id)
+            short_status = getattr(entry, "label", None)
+            if isinstance(entry, str):
+                short_status = entry
+            label = f"G{track.track_id}" + (
+                f"  {short_status}" if short_status else "")
+        else:
+            label = (f"FOCUS G{track.track_id}  {track.confidence:.2f}"
+                     if focus_gid is not None
+                     else f"G{track.track_id}  {track.confidence:.2f}")
         (label_width, label_height), baseline = cv2.getTextSize(
             label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1
         )
@@ -103,6 +125,7 @@ def draw_global_labels(
     names: dict[int, str] | None = None,
     employee_ids: dict[int, str] | None = None,
     face_candidates: dict[int, list[tuple[str, float]]] | None = None,
+    focus_gid: int | None = None,
 ) -> np.ndarray:
     """Ve label hien thi: `G{gid} [| Ten] [| Label EN]`.
 
@@ -119,6 +142,10 @@ def draw_global_labels(
     face_candidates = face_candidates or {}
     for track in tracks:
         gid = track.track_id
+        if focus_gid is not None and gid != focus_gid:
+            # Background recognition continues, but its result must not steal
+            # the primary UI. The thin track box/GID remains for diagnostics.
+            continue
         parts = [f"G{gid}"]
         name = names.get(gid)
         label = getattr(status.get(gid), "label", None) if status.get(gid) else None
@@ -149,6 +176,76 @@ def draw_global_labels(
                         cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 220, 80), 1,
                         cv2.LINE_AA)
     return frame
+
+
+def draw_hand_landmarks(
+    frame: np.ndarray,
+    person_bbox,
+    hands: list[list[tuple[float, float]]],
+    valid: list[bool] | None = None,
+    *,
+    reversals: int = 0,
+    required_reversals: int = 0,
+) -> np.ndarray:
+    """Draw MediaPipe hand skeletons mapped from a person crop to the frame.
+
+    Green means the hand passed the open-palm activation gate; orange means
+    MediaPipe saw a hand but it has not satisfied all gesture conditions.
+    """
+    height, width = frame.shape[:2]
+    x1 = max(0, min(width, round(person_bbox.x1)))
+    y1 = max(0, min(height, round(person_bbox.y1)))
+    x2 = max(0, min(width, round(person_bbox.x2)))
+    y2 = max(0, min(height, round(person_bbox.y2)))
+    crop_w, crop_h = x2 - x1, y2 - y1
+    if crop_w <= 0 or crop_h <= 0:
+        return frame
+    accepted = valid or []
+    for hand_index, hand in enumerate(hands):
+        if len(hand) < 21:
+            continue
+        color = ((40, 220, 40)
+                 if hand_index < len(accepted) and accepted[hand_index]
+                 else (0, 165, 255))
+        points = [
+            (int(x1 + max(0.0, min(1.0, px)) * crop_w),
+             int(y1 + max(0.0, min(1.0, py)) * crop_h))
+            for px, py in hand
+        ]
+        for start, end in _HAND_CONNECTIONS:
+            cv2.line(frame, points[start], points[end], color, 2, cv2.LINE_AA)
+        for index, point in enumerate(points):
+            radius = 4 if index in (0, 4, 8, 12, 16, 20) else 3
+            cv2.circle(frame, point, radius, color, -1, cv2.LINE_AA)
+        fingers = _visible_extended_fingers(hand)
+        state = "OPEN" if hand_index < len(accepted) and accepted[hand_index] else "HAND"
+        cv2.putText(
+            frame,
+            f"{state} {fingers}/5 | WAVE {reversals}/{required_reversals}",
+            (points[0][0], min(height - 5, points[0][1] + 22)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.46, color, 2, cv2.LINE_AA,
+        )
+    return frame
+
+
+def _visible_extended_fingers(hand: list[tuple[float, float]]) -> int:
+    """Small local diagnostic equivalent of the gesture finger counter."""
+    if len(hand) < 21:
+        return 0
+    wrist = hand[0]
+
+    def distance(a, b) -> float:
+        return float(((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5)
+
+    count = sum(
+        distance(hand[tip], wrist) > distance(hand[pip], wrist) * 1.08
+        for tip, pip in ((8, 6), (12, 10), (16, 14), (20, 18))
+    )
+    count += int(
+        distance(hand[4], wrist) > distance(hand[3], wrist) * 1.03
+        and abs(hand[4][0] - hand[5][0]) >= 0.04
+    )
+    return count
 
 
 def _status_track_color(

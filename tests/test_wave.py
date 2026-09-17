@@ -11,6 +11,7 @@ from camera_tracking.gesture.wave import (
     WaveDetector,
     count_extended_fingers,
     count_reversals,
+    is_front_facing_hand,
     is_hand_near_face,
     is_open_palm,
 )
@@ -34,6 +35,14 @@ def test_count_reversals_ignores_jitter() -> None:
 def test_count_reversals_ignores_slow_drift() -> None:
     drift = [(i * 0.5, 0.3 + i * 0.02) for i in range(6)]
     assert count_reversals(drift) == 0
+
+
+def test_count_reversals_detects_smooth_multi_frame_wave() -> None:
+    # Each frame moves less than min_amplitude, but each full sweep is large.
+    xs = (0.30, 0.34, 0.39, 0.44, 0.40, 0.35, 0.30,
+          0.34, 0.39, 0.44, 0.40, 0.35, 0.30)
+    points = [(index * 0.1, x) for index, x in enumerate(xs)]
+    assert count_reversals(points, min_amplitude=0.10) == 3
 
 
 def _stub_hands(frames: list):
@@ -83,6 +92,14 @@ def test_forget_retired() -> None:
     assert 7 in detector._history
     detector.forget_retired(set())
     assert 7 not in detector._history
+
+
+def test_wave_state_follows_canonical_gid() -> None:
+    detector = WaveDetector(min_reversals=100)
+    detector.observe(7, None, 0.0, detector=_stub_hands([[0.4]]))
+    detector.remap_gid(7, 3)
+    assert 7 not in detector._history
+    assert 3 in detector._history
 
 
 def _stub_mediapipe_tasks(monkeypatch, tmp_path, hands_per_call):
@@ -178,6 +195,8 @@ def _palm_landmarks(open_hand: bool = True) -> list:
     """21 landmarks giả: xoè (tips xa wrist) vs nắm (tips gần wrist)."""
     pts = [(0.5, 0.5)] * 21
     pts[0] = (0.5, 0.9)  # wrist
+    pts[5], pts[9], pts[13], pts[17] = (
+        (0.32, 0.62), (0.44, 0.58), (0.56, 0.58), (0.68, 0.62))
     if open_hand:
         tips_y, pips_y = 0.15, 0.5
         pts[3] = (0.35, 0.6)
@@ -219,6 +238,101 @@ def test_open_palm_required_four_allows_occluded_thumb() -> None:
     hand[4] = hand[3]
     assert is_open_palm(hand, required=4) is True
     assert is_open_palm(hand, required=5) is False
+
+
+def test_front_facing_hand_rejects_edge_on_palm() -> None:
+    hand = _palm_landmarks(True)
+    assert is_front_facing_hand(hand) is True
+    hand[17] = (hand[5][0] + 0.01, hand[5][1])
+    assert is_front_facing_hand(hand) is False
+
+
+def test_wave_requires_open_palm_before_counting_reversals() -> None:
+    detector = WaveDetector(
+        min_reversals=2, min_amplitude=0.10, min_gap_s=0.01,
+        palm_confirm_frames=2, cooldown_s=0.0,
+    )
+    fist = _StubLandmarkDetector([_palm_landmarks(False)])
+    for i in range(5):
+        assert detector.observe_open_palm_wave(4, None, i * 0.1,
+                                               detector=fist) is False
+    assert detector.current_reversals(4) == 0
+
+    xs = (0.30, 0.55, 0.30, 0.55, 0.30)
+    fired = False
+    for i, x in enumerate(xs, start=5):
+        hand = _palm_landmarks(True)
+        dx = x - hand[0][0]
+        hand = [(px + dx, py) for px, py in hand]
+        fired = detector.observe_open_palm_wave(
+            4, None, i * 0.1, detector=_StubLandmarkDetector([hand])) or fired
+    assert fired is True
+
+
+def test_wave_detects_palm_swing_around_stationary_wrist() -> None:
+    """A natural wrist-led wave must not require wrist translation."""
+    detector = WaveDetector(
+        min_reversals=2, min_amplitude=0.06, min_gap_s=0.01,
+        palm_confirm_frames=1, cooldown_s=0.0,
+    )
+    fired = False
+    for index, tip_offset in enumerate((0.0, 0.10, -0.10, 0.10)):
+        hand = _palm_landmarks(True)
+        # Wrist stays fixed while the open hand rotates around it.
+        for point in range(1, 21):
+            x, y = hand[point]
+            hand[point] = (x + tip_offset, y)
+        fired = detector.observe_open_palm_wave(
+            11, None, index * 0.1,
+            detector=_StubLandmarkDetector([hand]),
+        ) or fired
+    assert fired is True
+
+
+def test_wave_keeps_motion_across_brief_landmark_dropout() -> None:
+    detector = WaveDetector(
+        min_reversals=2, min_amplitude=0.06, min_gap_s=0.01,
+        palm_confirm_frames=1, palm_release_frames=5, cooldown_s=0.0,
+    )
+    frames = []
+    for x in (0.30, 0.50):
+        hand = _palm_landmarks(True)
+        dx = x - hand[0][0]
+        frames.append([(px + dx, py) for px, py in hand])
+    for index, hand in enumerate(frames):
+        assert detector.observe_open_palm_wave(
+            12, None, index * 0.1,
+            detector=_StubLandmarkDetector([hand]),
+        ) is False
+    # Two missed detections used to erase the whole gesture.
+    for index in range(2, 4):
+        assert detector.observe_open_palm_wave(
+            12, None, index * 0.1,
+            detector=_StubLandmarkDetector([]),
+        ) is False
+    fired = False
+    for index, x in enumerate((0.30, 0.50), start=4):
+        hand = _palm_landmarks(True)
+        dx = x - hand[0][0]
+        moved = [(px + dx, py) for px, py in hand]
+        fired = detector.observe_open_palm_wave(
+            12, None, index * 0.1,
+            detector=_StubLandmarkDetector([moved]),
+        ) or fired
+    assert fired is True
+
+
+def test_wave_exposes_recent_landmarks_for_overlay() -> None:
+    detector = WaveDetector(cooldown_s=0.0, palm_confirm_frames=1)
+    hand = _palm_landmarks(True)
+    detector.observe_open_palm_wave(
+        4, None, 1.0, detector=_StubLandmarkDetector([hand]),
+    )
+    snapshot = detector.debug_snapshot(4, 1.5)
+    assert snapshot is not None
+    assert snapshot[0] == [hand]
+    assert snapshot[1] == [True]
+    assert detector.debug_snapshot(4, 2.1) is None
 
 
 def test_hand_must_be_near_face_in_same_person_crop() -> None:

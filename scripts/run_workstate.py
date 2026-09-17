@@ -69,6 +69,7 @@ try:  # CUDA/cuDNN tu pip wheels (khong can CUDA Toolkit he thong).
 except (ImportError, OSError) as error:
     print(f"CUDA runtime discovery skipped: {error}", file=sys.stderr)
 from camera_tracking.domain import Frame, Track, TrackEvent
+from camera_tracking.gesture.focus import ForegroundSelector
 from camera_tracking.runtime import StageMetrics
 from camera_tracking.tracking import (
     ByteTrackTracker,
@@ -77,7 +78,11 @@ from camera_tracking.tracking import (
     GlobalIdentityManager,
     StablePersonCount,
 )
-from camera_tracking.visualization import draw_global_labels, draw_person_tracks
+from camera_tracking.visualization import (
+    draw_global_labels,
+    draw_hand_landmarks,
+    draw_person_tracks,
+)
 from camera_tracking.workstate import (
     LABEL_UNKNOWN,
     ChannelBusinessTracker,
@@ -313,7 +318,8 @@ def source_label(source: int | str) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Tracking ID 2 camera (YOLO + ByteTrack + Re-ID).")
-    parser.add_argument("--config", type=Path, default=Path("config/default.yaml"))
+    parser.add_argument("--config", type=Path, default=_PROJECT_ROOT / "config/default.yaml",
+                        help="Duong dan config (mac dinh: config/default.yaml cua repo, khoi can truyen).")
     parser.add_argument("--source-a", default=None, help="Override camera A.")
     parser.add_argument("--source-b", default=None, help="Override camera B.")
     parser.add_argument(
@@ -1059,15 +1065,27 @@ def main() -> None:
     gid_to_display: dict[int, str] = {}
     gid_to_score: dict[int, float] = {}
     gid_to_face_candidates: dict[int, list[tuple[str, float]]] = {}
+    # Full candidate objects are kept separately from the serializable UI
+    # labels so identities can be assigned jointly across all visible GIDs.
+    gid_to_face_rankings: dict[int, list[tuple[object, float]]] = {}
+    gid_face_ranking_at: dict[int, float] = {}
+    face_assignment_streaks: dict[int, list] = {}
+    # Most recent recognition quality, used only to schedule background
+    # attendance. It never changes the foreground shown on screen.
+    face_quality_by_track: dict[tuple[str, int], tuple[float, float]] = {}
     # Streak face-provisional: gid -> [employee_id, hits, first_s, last_s].
     # Gop GID unknown lap lai cung employee da bind (fix split-brain
     # cross-cam) ma khong can doi consensus, khong ha nguong ReID.
     face_candidate_streaks: dict[int, list] = {}
-    # (channel, gid) -> (thoi diem frame, face bbox tuong doi person crop).
-    # Palm chi duoc phep chao khi co mat moi cua dung nguoi tren dung camera.
+    # (channel, gid) -> (frame time, normalized face bbox in person crop).
+    # Any recent detected face is accepted; looking straight is not required.
     recent_face_by_track: dict[
         tuple[str, int], tuple[float, tuple[float, float, float, float]]
     ] = {}
+    # Hen chao khach la: gid -> (han phat, day, kenh, at_iso, loa).
+    # Cho dinh danh unknown_greet_delay_s truoc khi chao "quy khach";
+    # mat xac nhan kip thi nhanh known huy hen (chi chao ten).
+    pending_unknown_greet: dict[int, tuple[float, str, str, str, int]] = {}
     unknown_of_gid: dict[int, str] = {}
     unknown_counter = 0
     if use_face and face_embedder is None:
@@ -1079,7 +1097,9 @@ def main() -> None:
                 EnrolledPerson,
                 FaceAttendanceService,
                 FaceMatcher,
+                MatchResult,
                 load_gallery,
+                unique_face_assignments,
             )
             from camera_tracking.face.gallery import load_registry, save_prototype
             face_gallery = load_gallery(
@@ -1094,6 +1114,7 @@ def main() -> None:
                 min_margin=face_cfg.min_margin,
             )
             from camera_tracking.face import FaceTrackConsumer
+            _base_known_cd = float(getattr(face_cfg, "known_cooldown_s", 30.0))
             face_consumer = FaceTrackConsumer(
                 face_embedder,
                 face_matcher,
@@ -1101,7 +1122,12 @@ def main() -> None:
                 min_face_px=face_cfg.min_face_px,
                 min_face_score=face_cfg.min_face_score,
                 min_blur_variance=face_cfg.min_blur_variance,
-                known_cooldown_s=(2.0 if (args.greet or config.voice.enabled) else 30.0),
+                # Until the frame-level unique-name resolver confirms the
+                # winner, a local Top-1 must be observed again promptly. Once
+                # bound, FaceWorker applies the normal long recheck cadence.
+                known_cooldown_s=min(2.0, _base_known_cd),
+                unknown_cooldown_s=float(getattr(
+                    face_cfg, "unknown_cooldown_s", 0.6)),
                 channels=tuple(face_cfg.channels),
                 consensus_hits=face_cfg.consensus_hits,
                 consensus_window_s=face_cfg.consensus_window_s,
@@ -1147,7 +1173,9 @@ def main() -> None:
             )
             face_worker.start()
             print(f"Face worker: async, once-per-track, "
-                  f"recheck={float(getattr(config.voice, 'face_recheck_s', 30.0)):.0f}s, "
+                  f"recheck={min(float(getattr(config.voice, 'face_recheck_s', 30.0)), float(getattr(face_cfg, 'known_cooldown_s', 30.0))):.1f}s, "
+                  f"unknown={float(getattr(face_consumer, 'unknown_cooldown_s', 0.6)):.1f}s"
+                  f" (x2 khi queue day, tuy may), "
                   f"queue={face_worker.max_queue} (main loop không chờ Face).")
         except ImportError as error:
             print(f"Face worker disabled ({error}), fallback sync (lag).")
@@ -1491,6 +1519,18 @@ def main() -> None:
     # backend mac dinh moi imou_p2p (P2P VisualTalk, khong browser);
     # imou_web giu lai legacy, local = ffplay tai may chay pipeline.
     voice_cfg = config.voice
+    foreground_selectors = {
+        channel: ForegroundSelector(
+            switch_area_ratio=float(getattr(
+                voice_cfg, "focus_switch_area_ratio", 1.20)),
+            switch_hold_s=float(getattr(
+                voice_cfg, "focus_switch_hold_s", 0.50)),
+            lost_grace_s=float(getattr(
+                voice_cfg, "focus_lost_grace_s", 1.00)),
+        )
+        for channel in ("A", "B")
+    }
+    foreground_by_channel: dict[str, int | None] = {"A": None, "B": None}
     voice_on = bool(args.greet or voice_cfg.enabled)
     wave_detector = palm_detector = greeter = None
     gesture_detectors: dict[str, object] = {}
@@ -1539,12 +1579,18 @@ def main() -> None:
                     gesture_detectors[_ch] = WaveDetector(
                         window_s=float(getattr(voice_cfg, "wave_window_s", 2.5)),
                         min_reversals=int(getattr(
-                            voice_cfg, "wave_min_reversals", 4)),
+                            voice_cfg, "wave_min_reversals", 2)),
                         min_amplitude=float(getattr(
                             voice_cfg, "wave_min_amplitude", 0.06)),
                         min_gap_s=float(getattr(
                             voice_cfg, "wave_min_gap_s", 0.08)),
                         cooldown_s=min(_wave_cooldown, _unknown_cooldown),
+                        required_fingers=int(getattr(
+                            voice_cfg, "wave_required_fingers", 5)),
+                        palm_confirm_frames=int(getattr(
+                            voice_cfg, "wave_palm_confirm_frames", 2)),
+                        palm_release_frames=int(getattr(
+                            voice_cfg, "wave_palm_release_frames", 5)),
                         hand_detector=hand_detector,
                     )
                 elif _mode == "palm" and hand_detector is not None:
@@ -1601,17 +1647,12 @@ def main() -> None:
                 voice_output = ImouAudioTalkOutput(voice_bridge)
             # WAV tao san (ZeroTTS, 1 cau = 1 file): khop nguyen van cau
             # chao thi dung ngay, khong can mang/TTS runtime.
-            from camera_tracking.voice.zerotts_tts import (
-                add_display_name_aliases,
-                load_phrase_files,
-            )
+            # Moi cau chao la 1 ban thu hoan chinh theo dung ten hien thi
+            # ("Xin chào Anh Duy", khong ghep noi): khop manifest thi dung
+            # file san, khong thi tong hop edge-tts luc chay (co cache).
+            from camera_tracking.voice.zerotts_tts import load_phrase_files
 
             phrase_files = load_phrase_files(voice_cfg.greeting_dir)
-            if face_gallery is not None:
-                phrase_files = add_display_name_aliases(
-                    phrase_files,
-                    [person.display_name for person in face_gallery.people],
-                )
             if not phrase_files:
                 print("Voice greetings manifest trong; "
                       "chay scripts/build_greeting_wavs.py de tao san.")
@@ -1623,10 +1664,21 @@ def main() -> None:
                     voice_cfg, "unknown_cooldown_s", 10.0)),
                 unknown_phrase=voice_cfg.unknown_phrase,
                 max_queue_age_s=voice_cfg.command_ttl_s,
+                proactive_quiet_s=float(getattr(
+                    voice_cfg, "proactive_quiet_s", 5.0)),
                 output=voice_output,
                 phrase_files=phrase_files,
             )
             greeter.start()
+            # Mo san duong truyen loa o nen: lan chao dau khong mat tien
+            # bat tay cloud (tu ~10s xuong con vai giay).
+            try:
+                _warm = getattr(voice_output, "warmup", None)
+                if callable(_warm):
+                    threading.Thread(
+                        target=_warm, name="p2p-warmup", daemon=True).start()
+            except (AttributeError, RuntimeError):
+                pass
             phrases = [voice_cfg.unknown_phrase]
             if face_gallery is not None:
                 phrases.extend(
@@ -1714,6 +1766,17 @@ def main() -> None:
         _base = voice_cfg.greet_unknown_on_face if _per is None else bool(_per)
         return bool(_base)
 
+    def _speaker_channel(_ch: str) -> int:
+        """Loa P2P theo camera phat hien: A (phong) -> p2p_channel,
+        B (cua) -> p2p_channel_b."""
+        if str(_ch).upper() == "B":
+            try:
+                return int(getattr(voice_cfg, "p2p_channel_b",
+                                   voice_cfg.p2p_channel))
+            except (AttributeError, TypeError, ValueError):
+                return int(voice_cfg.p2p_channel)
+        return int(voice_cfg.p2p_channel)
+
     face_greet_on_by_channel: dict[str, bool] = {
         _ch: _face_greet_enabled(_ch) for _ch in ("A", "B")
     }
@@ -1774,41 +1837,100 @@ def main() -> None:
         except (AttributeError, IndexError):
             _ch = fy1 + 1
         fy2 = min(_ch, int(det.bbox[3]))
-        # Live feedback: face box + score (green = known, red = unknown).
-        face_marks.append(
-            (_ox + fx1, _oy + fy1, _ox + fx2, _oy + fy2,
-             match.score, match.is_known))
         raw_gid = track.track_id
         face_box = (float(fx1), float(fy1), float(fx2), float(fy2))
-        recent_face_by_track[(channel, raw_gid)] = (now_s, face_box)
+        # Store normalized coordinates so the gate follows the same person
+        # while their tracking bbox changes size or position. Pose is not a
+        # gate: a clearly detected side-looking face remains eligible.
+        _crop_w = max(1.0, float(_cw))
+        _crop_h = max(1.0, float(_ch))
+        _norm_face = (
+            face_box[0] / _crop_w, face_box[1] / _crop_h,
+            face_box[2] / _crop_w, face_box[3] / _crop_h,
+        )
+        recent_face_by_track[(channel, raw_gid)] = (now_s, _norm_face)
+        face_quality_by_track[(channel, raw_gid)] = (float(quality), now_s)
         if face_gallery is not None:
             ranked = face_gallery.ranked_matches(det.embedding)[:2]
             gid_to_face_candidates[raw_gid] = [
                 (person.display_name, float(score)) for person, score in ranked
             ]
-        # Lan quan sat dau tien van cap nhat box + top-2 len man hinh. Cac
-        # side effect nhay cam (bind employee, diem danh, greet, save crop)
-        # chi chay sau khi dat consensus. Ngoai le: face-provisional lap lai
-        # cung employee da bind o GID khac thi gop GID (khong diem danh).
-        if not identity_confirmed:
-            if match.is_known and match.person is not None:
-                _vote_employee = (
-                    match.person.employee_id or match.person.person_id
+            # Only a ranking whose own Top-1 passed threshold + ambiguity
+            # margin may participate. Top-2 is a fallback solely when Top-1
+            # was taken by another, higher-scoring visible face.
+            if match.is_known:
+                gid_to_face_rankings[raw_gid] = list(ranked)
+                gid_face_ranking_at[raw_gid] = now_s
+
+            _ranking_ttl = max(
+                3.0, float(getattr(face_cfg, "consensus_window_s", 3.0)) + 2.0)
+            _alive = set(manager.identities)
+            _fresh_rankings = {
+                gid: candidates
+                for gid, candidates in gid_to_face_rankings.items()
+                if gid in _alive
+                and now_s - gid_face_ranking_at.get(gid, float("-inf"))
+                <= _ranking_ttl
+            }
+            _assignments = unique_face_assignments(
+                _fresh_rankings, threshold=float(face_threshold), limit=2)
+
+            # A live GID that lost a score conflict must immediately lose the
+            # stale bbox name. Never merge two simultaneously visible people
+            # merely because their Top-1 gallery candidate was identical.
+            for _ranked_gid in _fresh_rankings:
+                _chosen = _assignments.get(_ranked_gid)
+                _chosen_employee = (
+                    _chosen.employee_id if _chosen is not None else None)
+                _old_employee = gid_to_person.get(_ranked_gid)
+                if _old_employee and _old_employee != _chosen_employee:
+                    manager.unbind_employee(_ranked_gid)
+                    gid_to_person.pop(_ranked_gid, None)
+                    gid_to_display.pop(_ranked_gid, None)
+                    gid_to_score.pop(_ranked_gid, None)
+
+            _assigned = _assignments.get(raw_gid)
+            if _assigned is None:
+                match = MatchResult(
+                    person=None,
+                    score=float(ranked[0][1]) if ranked else 0.0,
+                    is_known=False,
+                    second_score=(float(ranked[1][1]) if len(ranked) > 1 else 0.0),
+                    margin=(float(ranked[0][1] - ranked[1][1])
+                            if len(ranked) > 1 else 0.0),
                 )
-                _voted = _candidate_vote_reached(
-                    face_candidate_streaks, raw_gid, _vote_employee,
-                    float(match.score), now_s,
-                    required_hits=max(2, int(face_cfg.consensus_hits) + 1),
-                    window_s=float(face_cfg.consensus_window_s) + 7.0,
+            else:
+                match = MatchResult(
+                    person=_assigned.person,
+                    score=float(_assigned.score),
+                    is_known=True,
+                    second_score=(float(ranked[1][1]) if len(ranked) > 1 else 0.0),
+                    margin=(float(ranked[0][1] - ranked[1][1])
+                            if len(ranked) > 1 else 0.0),
+                )
+                # Confirm the *resolved* candidate, not the independent local
+                # Top-1. Requiring a repeated resolved result gives other
+                # visible faces time to enter the same score competition
+                # before attendance/greeting side effects are allowed.
+                _assignment_vote = _candidate_vote_reached(
+                    face_assignment_streaks, raw_gid,
+                    _assigned.employee_id, float(_assigned.score), now_s,
+                    required_hits=max(2, int(face_cfg.consensus_hits)),
+                    window_s=max(
+                        3.0, float(face_cfg.consensus_window_s) + 2.0),
                     min_score=float(face_threshold),
                 )
-                if _voted is not None:
-                    _merge_unknown_gid_by_face(
-                        manager, gid_alias, gid_to_person, gid_to_display,
-                        gid_to_face_candidates, day_cache, write_queue,
-                        supabase, (business_a, business_b), day_str,
-                        raw_gid, _voted, match.person.display_name,
-                    )
+                identity_confirmed = _assignment_vote is not None
+
+        # Live feedback uses the collision-resolved match, not the independent
+        # per-face Top-1 result.
+        face_marks.append(
+            (_ox + fx1, _oy + fy1, _ox + fx2, _oy + fy2,
+             match.score, match.is_known, track.track_id))
+        # Lan quan sat dau tien van cap nhat box + top-2 len man hinh. Cac
+        # side effect nhay cam (bind employee, diem danh, greet, save crop)
+        # chi chay sau khi dat consensus.
+        if not identity_confirmed:
             return
         if match.is_known and match.person is not None:
             employee_id = (
@@ -1816,9 +1938,9 @@ def main() -> None:
                 or match.person.person_id
             )
             identity_gid = track.track_id
-            # A confirmed employee is an immutable anchor. A second GID
-            # with the same consensus is merged into the existing entity;
-            # it never steals the employee because of one higher score.
+            # The joint score resolver is authoritative. If an older GID was
+            # provisionally holding this name, release it; do not merge two
+            # people who are simultaneously visible in the same room.
             conflict_gid = next(
                 (gid for gid, record in manager.identities.items()
                  if gid != identity_gid
@@ -1827,18 +1949,21 @@ def main() -> None:
                 None,
             )
             if conflict_gid is not None:
-                if not manager.merge_identity(identity_gid, conflict_gid):
-                    print(f"[Identity conflict] {employee_id}: keep "
-                          f"G{conflict_gid}; G{identity_gid} stays UNKNOWN")
-                    return
-                gid_alias[identity_gid] = conflict_gid
-                if raw_gid in gid_to_face_candidates:
-                    gid_to_face_candidates[conflict_gid] = \
-                        gid_to_face_candidates[raw_gid]
-                identity_gid = conflict_gid
+                manager.unbind_employee(conflict_gid)
+                gid_to_person.pop(conflict_gid, None)
+                gid_to_display.pop(conflict_gid, None)
+                gid_to_score.pop(conflict_gid, None)
+            _current_employee = manager.employee_id_of(identity_gid)
+            if _current_employee not in (None, employee_id):
+                manager.unbind_employee(identity_gid)
+                gid_to_person.pop(identity_gid, None)
+                gid_to_display.pop(identity_gid, None)
+                gid_to_score.pop(identity_gid, None)
             if not manager.bind_employee(identity_gid, employee_id):
                 print(f"[Identity conflict] refused {employee_id} -> G{identity_gid}")
                 return
+            if face_worker is not None:
+                face_worker.mark_known(identity_gid, now_s, channel)
             gid_to_score[identity_gid] = max(
                 match.score, gid_to_score.get(identity_gid, 0.0)
             )
@@ -1847,17 +1972,57 @@ def main() -> None:
             # (DB tick stays debounced below).
             gid_to_display[identity_gid] = \
                 match.person.display_name
+            recent_face_by_track[(channel, identity_gid)] = (now_s, _norm_face)
+            face_quality_by_track[(channel, identity_gid)] = (
+                float(quality), now_s)
             # Da bind chinh thuc: xoa streak provisional (tranh merge lap).
             face_candidate_streaks.pop(identity_gid, None)
             # Face-triggered greeting per-channel: B=cua thay mat la chao
             # ngay (khong can tay); A=phong wave-only nen tat.
             # Chung cooldown/queue voi gesture de dung lau khong spam.
-            if face_greet_on_by_channel.get(channel, face_greet_on) and greeter is not None:
+            # Da dinh danh: huy hen/luot cho "quy khach" cua GID de chi
+            # chao ten, khong noi 2 cau lien tiep.
+            try:
+                pending_unknown_greet.pop(track.track_id, None)
+                pending_unknown_greet.pop(identity_gid, None)
+                if greeter is not None:
+                    greeter.cancel_pending_unknown(global_id=track.track_id)
+                    if identity_gid != track.track_id:
+                        greeter.cancel_pending_unknown(global_id=identity_gid)
+            except Exception:  # noqa: BLE001 - voice khong chet pipeline
+                pass
+            _focus_gid = foreground_by_channel.get(channel)
+            _is_foreground = _focus_gid in (raw_gid, identity_gid)
+            if (face_greet_on_by_channel.get(channel, face_greet_on)
+                    and greeter is not None and _is_foreground):
                 try:
-                    if greeter.face_greet(
+                    _spk = _speaker_channel(channel)
+                    _guest_age: float | None = None
+                    try:
+                        _guest_age = greeter.unknown_spoken_age(
+                            day=day_str, global_id=track.track_id,
+                            channel=_spk, now_s=now_s)
+                        if identity_gid != track.track_id:
+                            _age2 = greeter.unknown_spoken_age(
+                                day=day_str, global_id=identity_gid,
+                                channel=_spk, now_s=now_s)
+                            if _age2 is not None and (
+                                _guest_age is None or _age2 < _guest_age
+                            ):
+                                _guest_age = _age2
+                    except (AttributeError, TypeError, ValueError):
+                        _guest_age = None
+                    _guest_window = float(getattr(
+                        greeter, "unknown_cooldown_s", 10.0))
+                    if _guest_age is not None and _guest_age < _guest_window:
+                        print(f"[Voice][{channel}] "
+                              f"{match.person.display_name} vua duoc chao khach "
+                              f"{_guest_age:.0f}s truoc, bo chao ten")
+                    elif greeter.face_greet(
                         day=day_str, person_id=employee_id,
                         display_name=match.person.display_name,
                         now_s=now_s, global_id=identity_gid,
+                        channel=_spk,
                     ):
                         _note_event(
                             event="FACE_GREET", global_id=identity_gid,
@@ -1866,7 +2031,8 @@ def main() -> None:
                             person_name=match.person.display_name,
                         )
                         print(f"[Voice][{channel}] Chao "
-                              f"{match.person.display_name} (G{identity_gid})")
+                              f"{match.person.display_name} (G{identity_gid}, "
+                              f"loa ch{_spk})")
                 except Exception as error:  # noqa: BLE001 - voice khong chet pipeline
                     print(f"[Voice] Bo loi chao mat: {error}")
             # Chỉ grow gallery từ quan sát chất lượng cao để chống
@@ -1973,19 +2139,26 @@ def main() -> None:
                 face_greet_on_by_channel.get(channel, face_greet_on)
                 and greeter is not None
                 and _unknown_face_greet_enabled(channel)
+                and foreground_by_channel.get(channel) == track.track_id
             ):
+                # Chao khach la HOAN: cho dinh danh unknown_greet_delay_s
+                # truoc khi chao "quy khach". Mat xac nhan kip thi nhanh
+                # known o tren da huy hen -> chi chao ten, khong 2 cau.
                 try:
-                    if greeter.face_greet(
-                        day=day_str, person_id=None,
-                        display_name=None,
-                        now_s=now_s, global_id=track.track_id,
+                    _ug_delay = max(0.0, float(getattr(
+                        voice_cfg, "unknown_greet_delay_s", 2.0)))
+                    _ug_gid = track.track_id
+                    if (
+                        gid_to_person.get(_ug_gid) is None
+                        and _ug_gid not in gid_alias
+                        and _ug_gid not in pending_unknown_greet
                     ):
-                        _note_event(
-                            event="FACE_GREET", global_id=track.track_id,
-                            channel=channel, at_iso=wall_iso,
+                        pending_unknown_greet[_ug_gid] = (
+                            now_s + _ug_delay, day_str, channel,
+                            wall_iso, _speaker_channel(channel),
                         )
                 except Exception as error:  # noqa: BLE001
-                    print(f"[Voice] Bo loi chao khach: {error}")
+                    print(f"[Voice] Bo loi hen chao khach: {error}")
             local = crop_saver.save_best_crop(
                 day=day_str, owner=uid, known=False,
                 global_id=track.track_id, image_bgr=crop,
@@ -2017,11 +2190,6 @@ def main() -> None:
         with metrics.measure("face"), face_model_lock:
             observations = face_consumer.consume(event, now_s)
         for observation in observations:
-            if face_worker is not None:
-                if observation.identity_confirmed and observation.match.is_known:
-                    face_worker.mark_known(
-                        observation.track.track_id, now_s, channel
-                    )
             _handle_one_face(
                 channel=channel, frame=frame, track=observation.track,
                 crop=observation.crop_bgr, det=observation.detection,
@@ -2037,29 +2205,67 @@ def main() -> None:
                             now_s: float) -> None:
         """Event-driven once-per-track: chỉ enqueue khi thật sự cần.
 
-        - Đã biết tên -> recheck sau face_recheck_s (mặc định 30s).
-        - Chưa biết -> thử lại sau unknown cooldown (~1s) khi góc đẹp hơn.
+        - Đã biết tên -> recheck sau face.known_cooldown_s (mặc định 30s).
+        - Chưa biết -> thử lại sau face.unknown_cooldown_s (~0.6s) khi góc đẹp hơn.
+        - Backpressure theo khả năng máy: queue càng đầy thì cooldown unknown
+          càng giãn (x1.0 khi rảnh -> x2.0 khi đầy) để máy yếu không bị dí GPU.
         - Bỏ qua track nhỏ (không đủ pixel mặt) ngay ở main loop (rẻ).
         Main loop không bao giờ chờ inference ở đây.
+        Production vẫn vẽ box mặt mỗi khi có FaceResult tươi (xem vis bên dưới).
         """
         if not (use_face and face_worker is not None
                 and attendance is not None and face_consumer is not None):
             return
         if channel not in face_consumer.channels:
             return
-        recheck_s = float(getattr(config.voice, "face_recheck_s", 30.0))
+        if not face_worker.ensure_alive():
+            print("[FaceWorker] worker không chạy; bỏ enqueue để tránh treo ngầm")
+            return
+        try:
+            _load = float(face_worker.load_ratio)
+        except (AttributeError, TypeError, ValueError):
+            _load = 0.0
+        if _load >= 1.0:
+            # Máy đang quá tải: bỏ lượt này, frame sau queue vơi sẽ thử lại.
+            return
+        _base_recheck = min(
+            float(getattr(config.voice, "face_recheck_s", 30.0)),
+            float(getattr(face_cfg, "known_cooldown_s", 30.0)),
+        )
+        recheck_s = _base_recheck
         if voice_on:
             # Greeting can face+hand cung luc, nen can mot face observation moi.
             recheck_s = min(recheck_s, 2.0)
-        for track in confirmed_tracks:
+        _base_unknown = float(getattr(
+            face_consumer, "unknown_cooldown_s", 0.6))
+        # May khoe (queue ranh): giu 0.6s. May yeu (queue day): gian toi 1.2s.
+        _eff_unknown = _base_unknown * (1.0 + max(0.0, min(1.0, _load)))
+        focus_gid = foreground_by_channel.get(channel)
+        aging_s = float(getattr(config.voice, "face_background_aging_s", 5.0))
+
+        def _face_priority(track) -> tuple[float, float, float]:
+            known = track.track_id in gid_to_person
+            if track.track_id == focus_gid and not known:
+                tier = 0.0
+            elif not known:
+                tier = 1.0
+            else:
+                tier = 2.0
+            cached = face_quality_by_track.get((channel, track.track_id))
+            quality = float(cached[0]) if cached is not None else 0.0
+            age_bonus = (max(0.0, now_s - cached[1]) / max(0.1, aging_s)
+                         if cached is not None else 0.0)
+            return (tier, -(quality + min(1.0, age_bonus)),
+                    -float(track.bbox.area))
+
+        for track in sorted(confirmed_tracks, key=_face_priority):
             gid = track.track_id
             if track.bbox.area < face_cfg.min_person_area_px:
                 continue
             known = gid in gid_to_person
             if not face_worker.need_face(
                 gid, known=known, now_s=now_s, recheck_s=recheck_s,
-                unknown_cooldown_s=float(
-                    getattr(face_consumer, "unknown_cooldown_s", 1.0)),
+                unknown_cooldown_s=_eff_unknown,
                 channel=channel,
             ):
                 continue
@@ -2072,10 +2278,12 @@ def main() -> None:
                     channel=channel, gid=gid, crop_bgr=crop.copy(),
                     track=track, day_str=day_str, wall_iso=wall_iso,
                     time_tag=time_tag, now_s=now_s,
+                    priority=_face_priority(track),
                 ))
                 if accepted:
                     face_worker.mark_attempt(gid, now_s, channel)
-            except Exception:
+            except Exception as error:
+                print(f"[FaceWorker] enqueue {channel}/G{gid} lỗi: {error}")
                 continue
 
     def _drain_face_results(*, frame_a, frame_b, face_marks_a: list,
@@ -2085,7 +2293,8 @@ def main() -> None:
             return
         try:
             results = face_worker.poll_results()
-        except Exception:
+        except Exception as error:
+            print(f"[FaceWorker] poll result lỗi: {error}")
             return
         if not results:
             return
@@ -2097,8 +2306,6 @@ def main() -> None:
                 marks = marks_by_channel.get(res.channel)
                 if marks is None:
                     continue
-                if res.identity_confirmed and res.match.is_known:
-                    face_worker.mark_known(res.gid, res.now_s, res.channel)
                 try:
                     _handle_one_face(
                         channel=res.channel, frame=frame, track=res.track,
@@ -2133,11 +2340,18 @@ def main() -> None:
                 gid_to_display.clear()
                 gid_to_score.clear()
                 gid_to_face_candidates.clear()
+                gid_to_face_rankings.clear()
+                gid_face_ranking_at.clear()
+                face_assignment_streaks.clear()
                 face_candidate_streaks.clear()
+                face_quality_by_track.clear()
                 recent_face_by_track.clear()
                 gid_alias.clear()
                 unknown_of_gid.clear()
                 unknown_counter = 0
+                for _selector in foreground_selectors.values():
+                    _selector.reset()
+                foreground_by_channel.update({"A": None, "B": None})
                 if face_worker is not None:
                     face_worker.forget_retired(set())
                 for _det in list(gesture_detectors.values()):
@@ -2219,6 +2433,10 @@ def main() -> None:
                 global_tracks = manager.update_batch(identity_inputs, now_s=now_s)
                 confirmed_a = global_tracks.get("A", [])
                 confirmed_b = global_tracks.get("B", [])
+                foreground_by_channel["A"] = foreground_selectors["A"].update(
+                    confirmed_a, now_s)
+                foreground_by_channel["B"] = foreground_selectors["B"].update(
+                    confirmed_b, now_s)
                 if ret_a and frame_a is not None:
                     last_tracks_a = confirmed_a
                     count_a.update(len(confirmed_a))
@@ -2325,6 +2543,31 @@ def main() -> None:
             # older canonical GID. Rewrite live tracks before fusion/render.
             last_tracks_a = _remap_tracks(last_tracks_a, gid_alias, manager)
             last_tracks_b = _remap_tracks(last_tracks_b, gid_alias, manager)
+            # Move transient face/gesture state to the canonical identity so
+            # an ID reconciliation cannot break focus halfway through a wave.
+            for _old_gid, _canonical_gid in list(gid_alias.items()):
+                for _cache, _fresh_index in (
+                    (recent_face_by_track, 0), (face_quality_by_track, 1)
+                ):
+                    for _channel in ("A", "B"):
+                        _old_key = (_channel, _old_gid)
+                        _new_key = (_channel, _canonical_gid)
+                        if _old_key in _cache:
+                            _old_value = _cache.pop(_old_key)
+                            _current = _cache.get(_new_key)
+                            if (_current is None
+                                    or _old_value[_fresh_index]
+                                    >= _current[_fresh_index]):
+                                _cache[_new_key] = _old_value
+                for _gesture_detector in list(gesture_detectors.values()):
+                    try:
+                        _gesture_detector.remap_gid(_old_gid, _canonical_gid)
+                    except AttributeError:
+                        pass
+            for _channel, _tracks in (("A", last_tracks_a), ("B", last_tracks_b)):
+                foreground_selectors[_channel].remap(gid_alias)
+                foreground_by_channel[_channel] = foreground_selectors[_channel].update(
+                    _tracks, now_s)
             if process_frame:
                 identity_trace.write(frame_idx, "A", last_tracks_a, gid_to_person)
                 identity_trace.write(frame_idx, "B", last_tracks_b, gid_to_person)
@@ -2427,13 +2670,51 @@ def main() -> None:
                                 pass
                         for gid in [g for g in gid_to_face_candidates if g not in _alive]:
                             gid_to_face_candidates.pop(gid, None)
+                        for gid in [g for g in gid_to_face_rankings if g not in _alive]:
+                            gid_to_face_rankings.pop(gid, None)
+                            gid_face_ranking_at.pop(gid, None)
+                            face_assignment_streaks.pop(gid, None)
                         for gid in [g for g in face_candidate_streaks if g not in _alive]:
                             face_candidate_streaks.pop(gid, None)
                         for key in [k for k in recent_face_by_track if k[1] not in _alive]:
                             recent_face_by_track.pop(key, None)
+                        for key in [k for k in face_quality_by_track if k[1] not in _alive]:
+                            face_quality_by_track.pop(key, None)
                     except Exception:
                         pass
                     identity_store.save(day_str, manager)
+                # --- Chao khach la tre: den han ma van chua dinh danh thi
+                # moi chao "quy khach"; dinh danh kip thi nhanh known da huy
+                # hen (chi chao ten). Chay moi frame, re nhu dict nho.
+                if voice_on and greeter is not None and pending_unknown_greet:
+                    try:
+                        for _ug_gid in list(pending_unknown_greet):
+                            _due, _day, _ch, _iso, _spk = \
+                                pending_unknown_greet[_ug_gid]
+                            if (
+                                _day != day_str
+                                or _ug_gid not in manager.identities
+                                or gid_to_person.get(_ug_gid) is not None
+                                or _ug_gid in gid_alias
+                                or foreground_by_channel.get(_ch) != _ug_gid
+                            ):
+                                pending_unknown_greet.pop(_ug_gid, None)
+                                continue
+                            if now_s < _due:
+                                continue
+                            pending_unknown_greet.pop(_ug_gid, None)
+                            if greeter.face_greet(
+                                day=_day, person_id=None,
+                                display_name=None,
+                                now_s=now_s, global_id=_ug_gid,
+                                channel=_spk,
+                            ):
+                                _note_event(
+                                    event="FACE_GREET", global_id=_ug_gid,
+                                    channel=_ch, at_iso=_iso,
+                                )
+                    except Exception as error:  # noqa: BLE001
+                        print(f"[Voice] Bo loi chao khach tre: {error}")
                 # --- Gesture theo kenh OR voice-hello -> greet ---
                 # A=phong: vay tay (WaveDetector); B=cua: off (face-trigger o
                 # _handle_one_face, khong ton MediaPipe). Voice-hello toan cuc.
@@ -2476,20 +2757,16 @@ def main() -> None:
                                 # B=off: bo qua MediaPipe, chi xet voice-hello.
                                 if _det is None and not _voice_avail:
                                     continue
-                                if _mode == "wave":
-                                    _max_p = max(1, int(getattr(
-                                        voice_cfg, "wave_max_people", 2)))
-                                elif _mode == "palm":
-                                    _max_p = max(1, int(getattr(
-                                        voice_cfg, "palm_max_people",
-                                        getattr(voice_cfg, "wave_max_people", 2))))
-                                else:
-                                    _max_p = 2
-                                biggest = sorted(
-                                    _tracks, key=lambda t: t.bbox.area,
-                                    reverse=True,
-                                )[:_max_p]
-                                for _track in biggest:
+                                # Gesture and voice target only the stable
+                                # foreground subject (largest bbox + hysteresis).
+                                # Background people remain face-attendance only.
+                                _focus_gid = foreground_by_channel.get(_ch)
+                                _focus_track = next(
+                                    (t for t in _tracks
+                                     if t.track_id == _focus_gid), None)
+                                if _focus_track is None:
+                                    continue
+                                for _track in (_focus_track,):
                                     _gid = _track.track_id
                                     # Gate: bbox quá nhỏ thì tay không đủ pixel.
                                     # Voice-hello van cho qua de cua van chao duoc.
@@ -2516,49 +2793,55 @@ def main() -> None:
                                             print(f"[Gesture][{_ch}] G{_gid} thay tay "
                                                   f"nhung chua nhan dien mat")
                                         continue
-                                    # Peek loa truoc: dang cooldown thi bo qua luon,
-                                    # detector giu nguyen trang thai ready.
-                                    try:
-                                        _loa_remain = float(greeter.cooldown_remaining(
-                                            day=day_str, person_id=_pid,
-                                            now_s=now_s, global_id=_gid))
-                                    except (AttributeError, TypeError, ValueError):
-                                        _loa_remain = 0.0
+                                    # Loa phat theo kenh camera (A->ch1, B->ch2).
+                                    # Gesture/voice la yeu cau chu dong, nen khong
+                                    # bi cooldown cua face-greet tu dong chan.
+                                    # VoiceGreeter tu gop queue va ap quiet-window
+                                    # 5s/nguoi de chong spam sau khi phat.
+                                    _spk = _speaker_channel(_ch)
                                     _gesture_label = (
                                         "Wave" if _mode == "wave"
                                         else "Palm" if _mode == "palm" else "Voice"
                                     )
-                                    if _loa_remain > 0:
-                                        if now_s - palm_dbg_at.get(_gid, float("-inf")) > 5.0:
-                                            palm_dbg_at[_gid] = now_s
-                                            _cooldown_source = (
-                                                "Voice" if _voice_avail else _gesture_label
-                                            )
-                                            print(f"[{_cooldown_source}][{_ch}] G{_gid} cooldown loa "
-                                                  f"con {_loa_remain:.0f}s")
-                                        continue
                                     _crop = _person_crop(_frame, _track.bbox)
                                     if _crop is None:
                                         continue
+                                    # Nếu vừa thấy mặt thì dùng vị trí mặt để
+                                    # kiểm tra tay cùng người. Không ép phải có
+                                    # face mới: người nghiêng mặt vẫn có thể chủ
+                                    # động xòe đủ 5 ngón và vẫy để chào.
+                                    _face_state = recent_face_by_track.get((_ch, _gid))
+                                    _face_ttl = float(getattr(
+                                        voice_cfg, "wave_face_ttl_s",
+                                        getattr(voice_cfg, "palm_face_ttl_s", 3.0)))
+                                    _fresh_face = bool(
+                                        _face_state is not None
+                                        and now_s - _face_state[0] <= _face_ttl
+                                    )
+                                    _face_box_px = None
+                                    if _fresh_face and _face_state is not None:
+                                        _nh = _crop.shape[0]
+                                        _nw = _crop.shape[1]
+                                        _nb = _face_state[1]
+                                        _face_box_px = (
+                                            _nb[0] * _nw, _nb[1] * _nh,
+                                            _nb[2] * _nw, _nb[3] * _nh,
+                                        )
                                     gestured = False
-                                    _fresh_face = False
                                     if _det is not None and _mode == "wave":
                                         try:
-                                            gestured = _det.observe(
+                                            gestured = _det.observe_open_palm_wave(
                                                 _track.track_id, _crop, now_s,
+                                                face_bbox=_face_box_px,
+                                                face_max_distance=float(getattr(
+                                                    voice_cfg,
+                                                    "wave_face_max_distance", 3.5)),
                                             )
                                         except RuntimeError:
                                             gestured = False
                                         except (AttributeError, TypeError, ValueError):
                                             gestured = False
                                     elif _det is not None and _mode == "palm":
-                                        _face_state = recent_face_by_track.get((_ch, _gid))
-                                        _face_ttl = float(getattr(
-                                            voice_cfg, "palm_face_ttl_s", 3.0))
-                                        _fresh_face = bool(
-                                            _face_state is not None
-                                            and now_s - _face_state[0] <= _face_ttl
-                                        )
                                         _allow_no_face = bool(getattr(
                                             voice_cfg, "palm_allow_without_face", False))
                                         if ((_fresh_face and _face_state is not None)
@@ -2597,10 +2880,13 @@ def main() -> None:
                                                 print(f"[Palm][{_ch}] G{_gid} khong thay "
                                                       f"{_reason}")
                                         continue
+                                    # Yeu cau chu dong (vay/voice): phat ngay khi
+                                    # loa ranh, khong cooldown, chong spam 5s.
                                     if greeter.face_greet(
                                         day=day_str, person_id=_pid,
                                         display_name=_name, now_s=now_s,
-                                        global_id=_gid,
+                                        global_id=_gid, channel=_spk,
+                                        proactive=True,
                                     ):
                                         if _via_voice:
                                             # 1 câu hello chỉ greet 1 lần.
@@ -2630,7 +2916,8 @@ def main() -> None:
                                                 else ("vẫy tay" if _mode == "wave"
                                                       else "giơ tay"))
                                         print(f"[{_tag}][{_ch}] "
-                                              f"{_name or 'Unknown'} (G{_gid}, {_why})")
+                                              f"{_name or 'Unknown'} (G{_gid}, {_why}, "
+                                              f"loa ch{_spk})")
                                     elif now_s - palm_dbg_at.get(_gid, float("-inf")) > 5.0:
                                         # Hiem (don thread): dat cho that bai do race
                                         # voi worker hoan reservation.
@@ -2649,13 +2936,30 @@ def main() -> None:
                     vis_a, last_tracks_a, room_status_now, gid_to_display,
                     gid_to_person, gid_to_face_candidates
                 )
-                for x1m, y1m, x2m, y2m, fscore, fknown in face_marks_a:
+                for x1m, y1m, x2m, y2m, fscore, fknown, fgid in face_marks_a:
                     fcolor = (40, 180, 40) if fknown else (60, 60, 220)
                     cv2.rectangle(vis_a, (int(x1m), int(y1m)),
                                   (int(x2m), int(y2m)), fcolor, 2)
                     cv2.putText(vis_a, f"{fscore:.2f}",
                                 (int(x1m), max(0, int(y1m) - 6)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, fcolor, 2)
+                _wave_a = gesture_detectors.get("A")
+                _focus_a = foreground_by_channel.get("A")
+                _focus_track_a = next(
+                    (t for t in last_tracks_a if t.track_id == _focus_a), None)
+                if _wave_a is not None and _focus_track_a is not None:
+                    try:
+                        _hand_debug = _wave_a.debug_snapshot(_focus_a, now_s)
+                    except (AttributeError, TypeError, ValueError):
+                        _hand_debug = None
+                    if _hand_debug is not None:
+                        draw_hand_landmarks(
+                            vis_a, _focus_track_a.bbox,
+                            _hand_debug[0], _hand_debug[1],
+                            reversals=_wave_a.current_reversals(_focus_a),
+                            required_reversals=int(getattr(
+                                voice_cfg, "wave_min_reversals", 2)),
+                        )
             if ret_b and frame_b is not None and need_vis:
                 vis_b = frame_b.copy()
                 draw_person_tracks(vis_b, last_tracks_b, display_count=count_b.value,
@@ -2664,13 +2968,30 @@ def main() -> None:
                     vis_b, last_tracks_b, room_status_now, gid_to_display,
                     gid_to_person, gid_to_face_candidates
                 )
-                for x1m, y1m, x2m, y2m, fscore, fknown in face_marks_b:
+                for x1m, y1m, x2m, y2m, fscore, fknown, fgid in face_marks_b:
                     fcolor = (40, 180, 40) if fknown else (60, 60, 220)
                     cv2.rectangle(vis_b, (int(x1m), int(y1m)),
                                   (int(x2m), int(y2m)), fcolor, 2)
                     cv2.putText(vis_b, f"{fscore:.2f}",
                                 (int(x1m), max(0, int(y1m) - 6)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, fcolor, 2)
+                _wave_b = gesture_detectors.get("B")
+                _focus_b = foreground_by_channel.get("B")
+                _focus_track_b = next(
+                    (t for t in last_tracks_b if t.track_id == _focus_b), None)
+                if _wave_b is not None and _focus_track_b is not None:
+                    try:
+                        _hand_debug = _wave_b.debug_snapshot(_focus_b, now_s)
+                    except (AttributeError, TypeError, ValueError):
+                        _hand_debug = None
+                    if _hand_debug is not None:
+                        draw_hand_landmarks(
+                            vis_b, _focus_track_b.bbox,
+                            _hand_debug[0], _hand_debug[1],
+                            reversals=_wave_b.current_reversals(_focus_b),
+                            required_reversals=int(getattr(
+                                voice_cfg, "wave_min_reversals", 2)),
+                        )
             if args.display:
                 if vis_a is not None:
                     cv2.imshow("Channel A - tracking", vis_a)
@@ -2714,6 +3035,10 @@ def main() -> None:
                             "tracking_state": (
                                 identity.state.value if identity else None
                             ),
+                            "foreground_cameras": [
+                                channel for channel in ("A", "B")
+                                if foreground_by_channel.get(channel) == gid
+                            ],
                         })
                     attendance_today = [] if attendance is None else [
                         {

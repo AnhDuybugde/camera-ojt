@@ -16,7 +16,7 @@ detection:
   # Recall-first nhưng bớt ghost: 0.25 đủ cho ByteTrack low-conf nối lại.
   # 0.10 cũ đẻ quá nhiều box yếu -> ghost GID.
   confidence_threshold: 0.25
-  nms_iou_threshold: 0.50
+  nms_iou_threshold: 0.85
   # Loại thêm bbox nhỏ nằm gần như hoàn toàn trong bbox lớn.
   nested_box_containment_threshold: 0.85
   person_class_id: 0
@@ -42,14 +42,18 @@ tracking:
 # xuyên mat dau dai va xuyên channel (xem tracking/global_identity.py).
 identity:
   gallery_size: 8
-  appearance_weight: 0.60
-  spatial_weight: 0.15
+  # Chong swap ID khi 2 nguoi di qua nhau: appearance (body ReID) quyet
+  # dinh chinh, spatial chi phu (0.05). Tong 4 trong so van = 1.0.
+  appearance_weight: 0.70
+  spatial_weight: 0.05
   time_weight: 0.15
   channel_weight: 0.10
   # Precision-first: thà bỏ sót còn hơn tái sử dụng nhầm Global ID.
   match_threshold: 0.70
   max_center_distance_ratio: 0.35
-  same_camera_reconnect_distance_ratio: 0.08
+  # Reconnect thuan vi tri (khong co embedding) chi cho phep dich rat
+  # nho: tranh noi nham tracklet sang GID nguoi ben canh khi che nhau.
+  same_camera_reconnect_distance_ratio: 0.06
   same_camera_reconnect_s: 2.0
   min_appearance_similarity: 0.70
   named_appearance_floor: 0.70
@@ -135,6 +139,11 @@ face:
   process_every_k: 2
   # Substream chỉ 640x480; dùng 640 để giữ recall với mặt 30-40 px.
   det_size: 640
+  # Retry Face async: unknown 0.6s (~7 processed frame) nhanh hon cu 1.0s;
+  # pipeline tu gian x2 khi worker queue day (may yeu). known 30s; voice lay min(...,2s).
+  unknown_cooldown_s: 0.6
+  known_cooldown_s: 30.0
+  # Production van ve box mat (xanh=known, do=unknown) moi khi co FaceResult tuoi.
   name_map:
     AnhDuy: Anh Duy
     VanDai: Van Dai
@@ -203,7 +212,11 @@ voice:
   unknown_cooldown_s: 10.0
   palm_unknown_immediate: true
   unknown_phrase: Xin chào quý khách
-  command_ttl_s: 5.0
+  # Luot cho qua 10s thi bo (du cho nguoi den sau choi 1-2 luot phat).
+  command_ttl_s: 10.0
+  # Sau moi lan phat cho 1 nguoi, bo qua yeu cau chu dong cua chinh nguoi
+  # do trong 5s (chong vay lien tuc spam loa).
+  proactive_quiet_s: 5.0
   bridge_host: 127.0.0.1
   # 8765=stream, 8766=supervisor -> voice legacy dùng 8767 để khỏi đụng port.
   bridge_port: 8767
@@ -223,7 +236,9 @@ voice:
   gesture_b: "off"
   # P2P VisualTalk (vendor tu test-sound-camera-imou): chi can
   # IMOU_DEVICE_ID (serial) + IMOU_CAMERA_PASSWORD (safety code).
+  # Loa theo kenh phat hien: A (phong) -> p2p_channel, B (cua) -> p2p_channel_b.
   p2p_channel: 1
+  p2p_channel_b: 2
   p2p_timeout_s: 20.0
   p2p_attempts: 2
   p2p_retry_delay_s: 5.0
@@ -234,16 +249,37 @@ voice:
   greeting_dir: output/voice_greetings
   zerotts_voice: maichi
   zerotts_model: zeroweight-ai/ZeroTTS
-  # every_k=3, window=2.5s -> ~10 mau co tay/window, du cho min_reversals=4.
-  # (every_k cu =6 chi ~3 mau/1.5s -> khong bao gio du 4 dao chieu.)
+  # every_k=3, window=2.5s -> ~10 mau co tay/window, du cho min_reversals=2.
+  # (every_k cu =6 chi ~3 mau/1.5s -> khong bao gio du dao chieu.)
   # Wave la gesture chinh cho A=phong (vay tay de chao).
   wave_every_k: 3
   wave_max_people: 2
   wave_window_s: 2.5
-  wave_min_reversals: 4
+  wave_min_reversals: 2
   wave_min_amplitude: 0.06
   wave_min_gap_s: 0.08
   wave_cooldown_s: 10.0
+  # Chi focus nguoi co bbox lon nhat; hysteresis ngan focus/ID nhay lien tuc.
+  focus_switch_area_ratio: 1.20
+  focus_switch_hold_s: 0.50
+  focus_lost_grace_s: 1.00
+  # Wave bat buoc: 5 ngon xoe -> giu palm activation -> lac qua lai.
+  wave_required_fingers: 5
+  wave_palm_confirm_frames: 2
+  # Cho phep MediaPipe hut ngan khi ban tay dao huong/cheo canh; chi mau OPEN
+  # moi duoc dem, nhung khong xoa ngay lich su cua mot cai vay dang dien ra.
+  wave_palm_release_frames: 5
+  wave_face_ttl_s: 8.0
+  wave_face_max_distance: 3.5
+  # Unknown ro mat duoc uu tien, nhung aging dam bao moi nguoi deu co luot.
+  face_background_aging_s: 5.0
+  # Legacy pose thresholds: van doc config cu, khong con chan wave.
+  face_frontal_nose_tol: 0.18
+  face_frontal_roll_tol: 0.18
+  face_frontal_min_eye_ratio: 0.20
+  # Chao khach la cho doi dinh danh 2s: neu mat xac nhan kip thi chi chao
+  # ten, khong chao "quy khach" nua (chong noi 2 cau lien tiep o cua B).
+  unknown_greet_delay_s: 2.0
   # Open-palm: 4-5 ngon o vung dau/vai -> chao. Gated tren CPU.
   palm_every_k: 2
   palm_max_people: 6

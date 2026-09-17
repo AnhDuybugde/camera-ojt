@@ -16,6 +16,53 @@ class FaceDetection:
     bbox: tuple[float, float, float, float]  # x1, y1, x2, y2 trong crop person
     score: float
     embedding: np.ndarray  # 512D L2-normalized (buffalo_s)
+    # 5 diem detector (mat trai, mat phai, mui, mieng trai, mieng
+    # phai) trong cung he toa do voi bbox; None khi detector khong tra.
+    # Dung de kiem tra mat nhin thang (frontal) truoc khi nhan trigger
+    # vay tay, khong ton them model (detector da tinh san).
+    kps: tuple[tuple[float, float], ...] | None = None
+
+
+def is_frontal_face(
+    kps: tuple[tuple[float, float], ...] | None,
+    face_width: float,
+    *,
+    nose_tol: float = 0.18,
+    roll_tol: float = 0.18,
+    min_eye_ratio: float = 0.20,
+) -> bool:
+    """True khi mat nhin thang vao camera (khong nhin xeo).
+
+    Doi xung 5 diem: mui phai nam giua 2 mat (yaw), 2 mat ngang nhau
+    (roll), mui nam giua mat va mieng (sanity). Scale-invariant (ti le
+    theo khoang cach 2 mat) nen dung duoc tren crop moi kich co.
+    """
+    try:
+        if kps is None or len(kps) < 5:
+            return False
+        (lex, ley), (rex, rey), (nx, ny), (_lmx, _lmy), (_rmx, _rmy) = (
+            (float(p[0]), float(p[1])) for p in kps[:5]
+        )
+    except (TypeError, ValueError, IndexError):
+        return False
+    eye_dist = ((rex - lex) ** 2 + (rey - ley) ** 2) ** 0.5
+    if eye_dist <= 1e-6:
+        return False
+    if face_width > 0 and eye_dist / face_width < min_eye_ratio:
+        return False
+    eye_mid_x = (lex + rex) / 2.0
+    eye_mid_y = (ley + rey) / 2.0
+    # Yaw: mui lech khoi truc giua 2 mat.
+    if abs(nx - eye_mid_x) / eye_dist > nose_tol:
+        return False
+    # Roll: 2 mat lech cao do.
+    if abs(ley - rey) / eye_dist > roll_tol:
+        return False
+    # Sanity doc: mat -> mui -> mieng.
+    mouth_mid_y = (_lmy + _rmy) / 2.0
+    if not (eye_mid_y < ny < mouth_mid_y):
+        return False
+    return True
 
 
 class FaceEmbedder(Protocol):
@@ -177,7 +224,19 @@ class InsightFaceEmbedder:
                 emb = emb / norm
             bbox = tuple(float(v) for v in getattr(face, "bbox", [0, 0, 0, 0]))
             score = float(getattr(face, "det_score", 1.0))
-            out.append(FaceDetection(bbox=bbox, score=score, embedding=np.asarray(emb)))
+            raw_kps = getattr(face, "kps", None)
+            kps = None
+            if raw_kps is not None:
+                try:
+                    kps = tuple(
+                        (float(p[0]), float(p[1])) for p in raw_kps[:5]
+                    )
+                    if len(kps) < 5:
+                        kps = None
+                except (TypeError, ValueError, IndexError):
+                    kps = None
+            out.append(FaceDetection(bbox=bbox, score=score,
+                                     embedding=np.asarray(emb), kps=kps))
         # Uu tien mat ro nhat / diem cao nhat truoc.
         out.sort(key=lambda d: d.score, reverse=True)
         return out

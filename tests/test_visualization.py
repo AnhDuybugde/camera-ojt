@@ -5,7 +5,7 @@ from unittest import TestCase
 import numpy as np
 
 from camera_tracking.domain import BoundingBox, Track
-from camera_tracking.visualization import draw_person_tracks
+from camera_tracking.visualization import draw_hand_landmarks, draw_person_tracks
 
 
 class PersonOverlayTest(TestCase):
@@ -26,3 +26,15 @@ class PersonOverlayTest(TestCase):
         self.assertEqual(rendered.shape, (240, 320, 3))
         self.assertGreater(np.count_nonzero(rendered), 0)
         self.assertTrue(np.any(rendered[70, 80] != 0))
+
+    def test_draw_hand_landmarks_maps_person_crop_to_frame(self) -> None:
+        frame = np.zeros((120, 160, 3), dtype=np.uint8)
+        bbox = BoundingBox(20, 10, 120, 110)
+        hand = [(0.5, 0.5)] * 21
+
+        rendered = draw_hand_landmarks(
+            frame, bbox, [hand], [True], reversals=2, required_reversals=3,
+        )
+
+        # Crop-relative (0.5, 0.5) maps to full-frame (70, 60).
+        self.assertGreater(int(rendered[60, 70, 1]), 0)

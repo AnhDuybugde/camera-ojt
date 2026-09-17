@@ -24,7 +24,7 @@ class CameraConfig(StrictModel):
 class DetectionConfig(StrictModel):
     model_path: str = "yolo26s.pt"
     confidence_threshold: float = Field(default=0.25, ge=0, le=1)
-    nms_iou_threshold: float = Field(default=0.50, ge=0, le=1)
+    nms_iou_threshold: float = Field(default=0.85, ge=0, le=1)
     nested_box_containment_threshold: float = Field(default=0.85, ge=0, le=1)
     person_class_id: int = 0
     image_size: int = 640
@@ -151,6 +151,15 @@ class FaceConfig(StrictModel):
     min_person_area_px: float = Field(default=8000.0, ge=0)
     process_every_k: int = Field(default=3, ge=1)
     det_size: int = Field(default=320, ge=160)
+    # Retry cadence cho Face async worker (event-driven once-per-track).
+    # unknown: GID chua biet ten -> thu lai sau X giay de bat goc mat dep.
+    # 0.6s (~7 processed frame @12fps) nhanh hon default cu 1.0s mot chut
+    # nhung van nhe GPU; may yeu se tu tang len nho backpressure theo
+    # queue occupancy trong run_workstate._enqueue_face_async.
+    unknown_cooldown_s: float = Field(default=0.6, ge=0)
+    # known: GID da biet ten -> recheck sau X giay. Voice/greet se lay
+    # min(known, 2.0s) de co observation moi cho trigger tay+mat.
+    known_cooldown_s: float = Field(default=30.0, ge=0)
     # Ten hien thi: {"LeHoAnhDuy": "Le Ho Anh Duy"}; mac dinh dung stem file.
     name_map: dict[str, str] = Field(default_factory=dict)
     # Employee ID trong database: {"LeHoAnhDuy": "1"}.
@@ -233,13 +242,21 @@ class VoiceConfig(StrictModel):
     # khong can doi FaceWorker. False = hanh vi cu (bo qua + log hint).
     palm_unknown_immediate: bool = True
     unknown_phrase: str = "Xin chào quý khách"
-    command_ttl_s: float = Field(default=5.0, gt=0)
+    # TTL hang doi loi chao: luot cho qua han thi bo. Phat 1 cau mat vai
+    # giay nen de 10s de nguoi den sau choi 1-2 luot van duoc chao.
+    command_ttl_s: float = Field(default=10.0, gt=0)
+    # Khoang lang chong spam sau moi lan phat cho 1 nguoi: trong khoang
+    # nay yeu cau chu dong (vay tay / voice) cua chinh nguoi do bi bo qua.
+    proactive_quiet_s: float = Field(default=5.0, ge=0)
     bridge_host: str = "127.0.0.1"
     bridge_port: int = Field(default=8767, ge=0, le=65535)
     talk_tail_s: float = Field(default=0.3, ge=0)
     launch_browser: bool = True
     # P2P VisualTalk (vendor tu test-sound-camera-imou).
+    # p2p_channel = loa kenh A (phong), p2p_channel_b = loa kenh B (cua).
+    # Pipeline route loi chao theo camera phat hien (A->1, B->2).
     p2p_channel: int = Field(default=1, ge=1)
+    p2p_channel_b: int = Field(default=2, ge=1)
     p2p_timeout_s: float = Field(default=20.0, gt=0)
     p2p_attempts: int = Field(default=2, ge=1)
     p2p_retry_delay_s: float = Field(default=5.0, ge=0)
@@ -270,15 +287,35 @@ class VoiceConfig(StrictModel):
     # Wave detector cadence + gioi han tai (MediaPipe chay CPU).
     # Toan cadence: process ~12.5 frame/s (fps/2) / every_k = tan so lay mau
     # co tay; can >= min_reversals+2 diem trong window moi fire duoc.
-    # every_k=3, window=2.5s -> ~10 diem/window (du cho min_reversals=4).
+    # every_k=3, window=2.5s -> ~10 diem/window (du cho min_reversals=2).
     # Legacy wave (giữ để tương thích test cũ).
     wave_every_k: int = Field(default=3, ge=1)
     wave_max_people: int = Field(default=2, ge=1)
     wave_window_s: float = Field(default=2.5, gt=0)
-    wave_min_reversals: int = Field(default=4, ge=2)
+    wave_min_reversals: int = Field(default=2, ge=2)
     wave_min_amplitude: float = Field(default=0.06, gt=0)
     wave_min_gap_s: float = Field(default=0.08, gt=0)
     wave_cooldown_s: float = Field(default=30.0, ge=0)
+    # Stable foreground: gesture + primary overlay only follow this subject.
+    focus_switch_area_ratio: float = Field(default=1.20, ge=1.0)
+    focus_switch_hold_s: float = Field(default=0.50, ge=0.0)
+    focus_lost_grace_s: float = Field(default=1.00, ge=0.0)
+    # A wave is intentional only after a full open-palm activation.
+    wave_required_fingers: int = Field(default=5, ge=5, le=5)
+    wave_palm_confirm_frames: int = Field(default=2, ge=1)
+    wave_palm_release_frames: int = Field(default=5, ge=1)
+    wave_face_ttl_s: float = Field(default=8.0, gt=0.0)
+    wave_face_max_distance: float = Field(default=3.5, gt=0.0)
+    face_background_aging_s: float = Field(default=5.0, gt=0.0)
+    # Trigger hinh anh: mat phai nhin thang vao camera TRUOC roi moi toi
+    # tay. Danh gia doi xung 5 diem detector (mui giua 2 mat = yaw,
+    # 2 mat ngang nhau = roll), ti le theo khoang cach 2 mat.
+    face_frontal_nose_tol: float = Field(default=0.18, gt=0.0, le=1.0)
+    face_frontal_roll_tol: float = Field(default=0.18, gt=0.0, le=1.0)
+    face_frontal_min_eye_ratio: float = Field(default=0.20, gt=0.0, le=1.0)
+    # Chao khach la (unknown) cho doi dinh danh: neu trong khoang nay mat
+    # duoc xac nhan thi chi chao ten, khong chao "quy khach" nua.
+    unknown_greet_delay_s: float = Field(default=2.0, ge=0.0)
     # Open-palm greeting: giơ đủ bàn tay 5 ngón -> chào (trigger duy nhat).
     # Event-driven + gated: chỉ chạy ~3-5 FPS trên candidate đủ lớn.
     # Thong nhat 10s nhu cooldown loa.

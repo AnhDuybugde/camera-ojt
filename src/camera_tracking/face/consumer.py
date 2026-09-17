@@ -126,8 +126,13 @@ class FaceTrackConsumer:
                     )
                 )
                 continue
-            if quality < gate.best_quality and gate.employee_id:
-                continue
+            # Do not suppress later observations using the lifetime best
+            # quality.  A single unusually sharp frame would otherwise make
+            # almost every scheduled recheck disappear forever, which looks
+            # like face recognition ran exactly once.  Quality is still used
+            # by the caller to decide whether a prototype may be grown; the
+            # detector/sharpness gates above remain the safety boundary for
+            # identity and attendance.
             gate.best_quality = max(gate.best_quality, quality)
             employee_id = (
                 match.person.employee_id or match.person.person_id
@@ -229,11 +234,21 @@ def _associate_faces(
 
 def _relative_detection(detection: FaceDetection, person_box: BoundingBox) -> FaceDetection:
     x1, y1, x2, y2 = detection.bbox
+    kps = None
+    if detection.kps is not None:
+        try:
+            kps = tuple(
+                (float(px) - person_box.x1, float(py) - person_box.y1)
+                for px, py in detection.kps[:5]
+            )
+        except (TypeError, ValueError):
+            kps = None
     return FaceDetection(
         bbox=(x1 - person_box.x1, y1 - person_box.y1,
               x2 - person_box.x1, y2 - person_box.y1),
         score=detection.score,
         embedding=detection.embedding,
+        kps=kps,
     )
 
 

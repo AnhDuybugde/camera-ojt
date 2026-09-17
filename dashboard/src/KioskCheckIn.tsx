@@ -14,6 +14,7 @@ export type KioskPerson = {
   cameras?: string[]
   tracking_state?: string | null
   face_candidates?: Array<{ name: string; score: number }>
+  foreground_cameras?: string[]
 }
 
 export type KioskAttendance = {
@@ -157,10 +158,20 @@ export default function KioskCheckIn({
     [people],
   )
 
-  const subject = useMemo(
-    () => cameraPeople.find((person) => person.name) ?? cameraPeople[0] ?? null,
-    [cameraPeople],
-  )
+  const subject = useMemo(() => {
+    const hasFocusMetadata = people.some((person) =>
+      Array.isArray(person.foreground_cameras),
+    )
+    if (hasFocusMetadata) {
+      // The backend applies bbox-area hysteresis, so the recognition panel
+      // follows the largest person without jumping to a named bystander.
+      return cameraPeople.find((person) =>
+        person.foreground_cameras?.includes(cameraChannel),
+      ) ?? null
+    }
+    // Compatibility with an older pipeline that does not publish focus yet.
+    return cameraPeople[0] ?? null
+  }, [cameraChannel, cameraPeople, people])
 
   useEffect(() => {
     if (subject && !subject.name) setUnknownSince(Date.now())
@@ -182,7 +193,17 @@ export default function KioskCheckIn({
       ))
     : undefined
 
-  const successActive = recentSuccess && now.getTime() - recentSuccess.seenAt < 8000
+  const successMatchesSubject = Boolean(
+    subject && recentSuccess && (
+      recentSuccess.record.global_id === subject.gid
+      || (!!subject.person_id && recentSuccess.record.person_id === subject.person_id)
+    ),
+  )
+  const successActive = Boolean(
+    recentSuccess
+    && successMatchesSubject
+    && now.getTime() - recentSuccess.seenAt < 8000,
+  )
   let state: RecognitionState = 'idle'
   if (!liveOk) state = 'offline'
   else if (successActive) state = 'success'
@@ -192,7 +213,7 @@ export default function KioskCheckIn({
     state = 'not-recognized'
   } else if (subject) state = 'recognizing'
 
-  const record = successActive ? recentSuccess.record : matchedAttendance
+  const record = successActive && recentSuccess ? recentSuccess.record : matchedAttendance
   const displayName = record?.person_name ?? subject?.name ?? null
   const employeeId = record?.person_id ?? subject?.person_id ?? null
   const confidence = record?.face_score ?? subject?.face_score ?? null

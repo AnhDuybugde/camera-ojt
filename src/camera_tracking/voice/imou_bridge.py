@@ -566,7 +566,9 @@ class ImouAudioTalkOutput:
     def __init__(self, bridge: ImouAudioTalkBridge) -> None:
         self.bridge = bridge
 
-    def __call__(self, audio_path: Path) -> None:
+    def __call__(self, audio_path: Path, channel: int | None = None) -> None:
+        # Bridge legacy chi co 1 loa: nhan kenh de dong protocol voi P2P.
+        _ = channel
         self.bridge.play(audio_path)
 
 

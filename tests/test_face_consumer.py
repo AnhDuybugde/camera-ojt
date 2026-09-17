@@ -47,6 +47,28 @@ def test_face_consumer_applies_track_cooldown() -> None:
     assert len(third) == 1
 
 
+def test_known_face_recheck_is_not_blocked_by_lifetime_best_quality() -> None:
+    """A perfect first frame must not suppress every later recheck."""
+    sharp = _image()
+    less_sharp = sharp.copy()
+    # Preserve enough texture to pass the blur gate while lowering quality.
+    less_sharp[40:140, 60:120] = (
+        less_sharp[40:140, 60:120] // 2
+    )
+    consumer = FaceTrackConsumer(
+        FakeEmbedder(), FakeMatcher(), min_person_area_px=1,
+        min_face_px=20, min_blur_variance=1, known_cooldown_s=30,
+    )
+
+    first = consumer.consume(
+        TrackEvent("A", Frame(1, 0.0, sharp), (_track(),)), now_s=0.0)
+    recheck = consumer.consume(
+        TrackEvent("A", Frame(2, 31.0, less_sharp), (_track(),)), now_s=31.0)
+
+    assert len(first) == 1
+    assert len(recheck) == 1
+
+
 def _event(channel: str) -> TrackEvent:
     return TrackEvent(channel, Frame(1, 0.0, _image()), (_track(),))
 

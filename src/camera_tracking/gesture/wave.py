@@ -11,7 +11,6 @@ from __future__ import annotations
 import shutil
 from collections import deque
 from dataclasses import dataclass, field
-from itertools import pairwise
 from pathlib import Path
 from typing import Protocol
 
@@ -71,16 +70,35 @@ def count_reversals(
             sampled[-1] = (stamp, x)
         else:
             sampled.append((stamp, x))
+    if not sampled:
+        return 0
+    # Follow turning points, not individual frame deltas. A real wave normally
+    # moves through several small per-frame steps; requiring one step to cross
+    # min_amplitude made ordinary, smooth waving almost impossible to trigger.
     reversals = 0
     direction = 0
-    for (_, prev_x), (_, curr_x) in pairwise(sampled):
-        delta = curr_x - prev_x
-        if abs(delta) < min_amplitude:
+    anchor = extreme = sampled[0][1]
+    for _, curr_x in sampled[1:]:
+        if direction == 0:
+            delta = curr_x - anchor
+            if abs(delta) >= min_amplitude:
+                direction = 1 if delta > 0 else -1
+                extreme = curr_x
             continue
-        sign = 1 if delta > 0 else -1
-        if direction != 0 and sign != direction:
-            reversals += 1
-        direction = sign
+        if direction > 0:
+            if curr_x > extreme:
+                extreme = curr_x
+            elif extreme - curr_x >= min_amplitude:
+                reversals += 1
+                direction = -1
+                extreme = curr_x
+        else:
+            if curr_x < extreme:
+                extreme = curr_x
+            elif curr_x - extreme >= min_amplitude:
+                reversals += 1
+                direction = 1
+                extreme = curr_x
     return reversals
 
 
@@ -239,20 +257,30 @@ class MediaPipeHandDetector:
 
 @dataclass
 class WaveDetector:
-    """Nhan wave moi Global ID tu chuoi wrist-x theo thoi gian.
+    """Nhan wave moi Global ID tu chuoi vi tri ngang cua ban tay.
 
     Tra True dung 1 lan khi du dao chieu, roi cooldown per-gid de
     khong spam voice khi vay lien tuc.
     """
 
     window_s: float = 1.5
-    min_reversals: int = 4
+    min_reversals: int = 2
     min_amplitude: float = 0.06
     min_gap_s: float = 0.08
     cooldown_s: float = 30.0
+    required_fingers: int = 5
+    palm_confirm_frames: int = 2
+    palm_release_frames: int = 5
+    max_hand_center_y: float = 0.65
     hand_detector: HandDetector | None = None
     _history: dict[int, deque] = field(default_factory=dict, init=False)
     _last_wave_s: dict[int, float] = field(default_factory=dict, init=False)
+    _palm_open_counts: dict[int, int] = field(default_factory=dict, init=False)
+    _palm_missing_counts: dict[int, int] = field(default_factory=dict, init=False)
+    _debug_hands: dict[int, list[list[tuple[float, float]]]] = field(
+        default_factory=dict, init=False)
+    _debug_valid: dict[int, list[bool]] = field(default_factory=dict, init=False)
+    _debug_at: dict[int, float] = field(default_factory=dict, init=False)
 
     def observe(
         self,
@@ -295,6 +323,91 @@ class WaveDetector:
             return True
         return False
 
+    def observe_open_palm_wave(
+        self,
+        gid: int,
+        crop_bgr,
+        now_s: float,
+        *,
+        detector=None,
+        face_bbox: tuple[float, float, float, float] | None = None,
+        face_max_distance: float = 3.5,
+    ) -> bool:
+        """Trigger only while a five-finger, camera-facing palm is waving.
+
+        Unlike :meth:`observe`, this path consumes all hand landmarks and is
+        the production greeting gate. Ordinary arm/wrist motion never enters
+        the reversal history unless the open-palm activation is already valid.
+        """
+        detect = detector or self.hand_detector
+        if detect is None or not hasattr(detect, "landmarks"):
+            return False
+        try:
+            hands = detect.landmarks(crop_bgr)
+        except RuntimeError:
+            hands = []
+        hands = list(hands or [])
+        validity = [
+            bool(
+                is_open_palm(hand, required=self.required_fingers)
+                and is_front_facing_hand(hand)
+                and (sum(point[1] for point in hand) / len(hand)
+                     <= max(0.1, min(1.0, self.max_hand_center_y)))
+                and (face_bbox is None or is_hand_near_face(
+                    hand, face_bbox, getattr(crop_bgr, "shape", ()),
+                    face_max_distance))
+            )
+            for hand in hands
+        ]
+        self._debug_hands[gid] = hands
+        self._debug_valid[gid] = validity
+        self._debug_at[gid] = now_s
+        valid = [hand for hand, accepted in zip(hands, validity) if accepted]
+        if now_s - self._last_wave_s.get(gid, float("-inf")) < self.cooldown_s:
+            return False
+        if not valid:
+            missing = self._palm_missing_counts.get(gid, 0) + 1
+            self._palm_missing_counts[gid] = missing
+            if missing >= max(1, self.palm_release_frames):
+                # Tay ha xuong that su: xoa quy dao + reset confirm de lan
+                # gio tay ke tiep phai kich hoat lai tu dau.
+                self._history.pop(gid, None)
+                self._palm_open_counts[gid] = 0
+            # Miss ngan (motion blur / xoay tay giua nhịp vay): giu nguyen
+            # history + opened de nhịp vay khong bi cat vun.
+            return False
+
+        self._palm_missing_counts[gid] = 0
+        opened = self._palm_open_counts.get(gid, 0) + 1
+        self._palm_open_counts[gid] = opened
+
+        history = self._history.setdefault(gid, deque())
+        cutoff = now_s - self.window_s
+        while history and history[0][0] < cutoff:
+            history.popleft()
+        # A natural greeting often rotates the open hand around a nearly
+        # stationary wrist. Tracking wrist.x alone therefore missed a visible
+        # wave. The five-tip mean follows both wrist-led and whole-arm waves,
+        # while averaging out one noisy landmark.
+        motion_xs = [_wave_motion_x(hand) for hand in valid]
+        motion_x = (min(motion_xs, key=lambda x: abs(x - history[-1][1]))
+                    if history else max(motion_xs))
+        history.append((now_s, motion_x))
+        # Confirm chi gate viec fire, khong gate viec tich luy quy dao:
+        # frame valid dau tien sau 1 miss ngan van phai vao history, neu
+        # khong moi nhịp vay bi mat 1 mau va WAVE mai o 0/1.
+        if opened < max(1, self.palm_confirm_frames):
+            return False
+        if count_reversals(
+            list(history), min_gap_s=self.min_gap_s,
+            min_amplitude=self.min_amplitude,
+        ) < self.min_reversals:
+            return False
+        self._last_wave_s[gid] = now_s
+        history.clear()
+        self._palm_open_counts[gid] = 0
+        return True
+
     def current_reversals(self, gid: int) -> int:
         """So dao chieu hien tai trong window (debug, khong tac dung phu)."""
         points = list(self._history.get(gid, ()))
@@ -304,17 +417,58 @@ class WaveDetector:
             min_amplitude=self.min_amplitude,
         )
 
+    def debug_snapshot(
+        self, gid: int, now_s: float, max_age_s: float = 1.0,
+    ) -> tuple[list[list[tuple[float, float]]], list[bool]] | None:
+        """Return recent MediaPipe points for a read-only live overlay."""
+        if now_s - self._debug_at.get(gid, float("-inf")) > max_age_s:
+            return None
+        return (self._debug_hands.get(gid, []),
+                self._debug_valid.get(gid, []))
+
     def forget_retired(self, alive_gids: set[int]) -> None:
         for gid in [g for g in self._history if g not in alive_gids]:
             self._history.pop(gid, None)
         for gid in [g for g in self._last_wave_s if g not in alive_gids]:
             self._last_wave_s.pop(gid, None)
+        for state in (
+            self._palm_open_counts, self._palm_missing_counts,
+            self._debug_hands, self._debug_valid, self._debug_at,
+        ):
+            for gid in [g for g in state if g not in alive_gids]:
+                state.pop(gid, None)
+
+    def remap_gid(self, old_gid: int, new_gid: int) -> None:
+        if old_gid == new_gid:
+            return
+        old_history = self._history.pop(old_gid, None)
+        if old_history:
+            merged = list(self._history.get(new_gid, ())) + list(old_history)
+            self._history[new_gid] = deque(sorted(merged, key=lambda row: row[0]))
+        for state in (
+            self._last_wave_s, self._palm_open_counts,
+            self._palm_missing_counts, self._debug_at,
+        ):
+            if old_gid in state:
+                state[new_gid] = max(state.get(new_gid, state[old_gid]),
+                                     state.pop(old_gid))
+        for state in (self._debug_hands, self._debug_valid):
+            if old_gid in state:
+                state[new_gid] = state.pop(old_gid)
 
 
 def _dist(a: tuple[float, float], b: tuple[float, float]) -> float:
     dx = a[0] - b[0]
     dy = a[1] - b[1]
     return (dx * dx + dy * dy) ** 0.5
+
+
+def _wave_motion_x(landmarks: list[tuple[float, float]]) -> float:
+    """Horizontal open-hand position used for wave direction changes."""
+    if len(landmarks) < 21:
+        return float(landmarks[0][0]) if landmarks else 0.0
+    return sum(float(landmarks[index][0])
+               for index in (4, 8, 12, 16, 20)) / 5.0
 
 
 def count_extended_fingers(landmarks: list[tuple[float, float]]) -> int:
@@ -345,20 +499,17 @@ def count_extended_fingers(landmarks: list[tuple[float, float]]) -> int:
 def is_open_palm(landmarks: list[tuple[float, float]], required: int = 5) -> bool:
     """True khi thấy bàn tay dựng, xoè đủ ngón.
 
-    Ngoài khoảng cách tới cổ tay, yêu cầu bốn đầu ngón nằm phía trên khớp
-    PIP và ngón cái mở sang bên. Điều kiện hướng này loại phần lớn dương tính
-    giả từ mặt/quần áo trong person crop; cử chỉ chào của camera là tay dựng.
+    Dùng hình học tương đối với cổ tay nên bàn tay vẫn hợp lệ khi người dùng
+    nghiêng tay trong lúc vẫy; không ép các ngón phải thẳng đứng trên ảnh.
     """
     if landmarks is None or len(landmarks) < 21:
         return False
     try:
         wrist = landmarks[0]
         long_pairs = ((8, 6), (12, 10), (16, 14), (20, 18))
-        # Dem tung ngon dai theo ca khoang cach va huong. Khong bat buoc ca
-        # bon ngon dai khi cau hinh required=4: mot ngon bi che van hop le.
+        # Đếm theo khoảng cách tương đối, bất biến với góc xoay của bàn tay.
         long_extended = sum(
             _dist(landmarks[tip], wrist) > _dist(landmarks[pip], wrist) * 1.08
-            and landmarks[tip][1] < landmarks[pip][1] - 0.015
             for tip, pip in long_pairs
         )
         thumb_extended = (
@@ -367,15 +518,29 @@ def is_open_palm(landmarks: list[tuple[float, float]], required: int = 5) -> boo
         )
         if long_extended + int(thumb_extended) < max(1, required):
             return False
-        # Ít nhất ba ngón dài phải hướng lên để tránh nhầm cánh tay/vật thể.
-        if long_extended < min(3, max(1, required)):
-            return False
-        # Cổ tay phải thấp hơn các khớp gốc: bàn tay thực sự đang dựng lên.
-        wrist_y = landmarks[0][1]
-        if wrist_y <= max(landmarks[i][1] for i in (5, 9, 13, 17)) + 0.02:
-            return False
         return True
     except (IndexError, TypeError, ValueError):
+        return False
+
+
+def is_front_facing_hand(
+    landmarks: list[tuple[float, float]],
+    min_palm_width_ratio: float = 0.20,
+) -> bool:
+    """Reject an edge-on/foreshortened hand using visible palm geometry.
+
+    MediaPipe's 2-D points cannot reliably distinguish palm from the back of
+    the hand, but palm width versus wrist-to-middle-finger length robustly
+    rejects the side-on poses that commonly produce accidental activation.
+    """
+    if landmarks is None or len(landmarks) < 21:
+        return False
+    try:
+        palm_width = _dist(landmarks[5], landmarks[17])
+        hand_length = _dist(landmarks[0], landmarks[12])
+        return hand_length > 1e-6 and palm_width / hand_length >= max(
+            0.05, min_palm_width_ratio)
+    except (IndexError, TypeError, ValueError, ZeroDivisionError):
         return False
 
 
@@ -490,6 +655,17 @@ class OpenPalmDetector:
             self._closed_counts.pop(gid, None)
         self._latched.intersection_update(alive_gids)
 
+    def remap_gid(self, old_gid: int, new_gid: int) -> None:
+        if old_gid == new_gid:
+            return
+        for state in (self._last_fire_s, self._open_counts, self._closed_counts):
+            if old_gid in state:
+                state[new_gid] = max(state.get(new_gid, state[old_gid]),
+                                     state.pop(old_gid))
+        if old_gid in self._latched:
+            self._latched.discard(old_gid)
+            self._latched.add(new_gid)
+
 
 __all__ = [
     "HandDetector",
@@ -498,6 +674,7 @@ __all__ = [
     "WaveDetector",
     "count_extended_fingers",
     "count_reversals",
+    "is_front_facing_hand",
     "is_hand_near_face",
     "is_open_palm",
 ]

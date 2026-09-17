@@ -25,6 +25,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+import traceback
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -42,7 +43,16 @@ class FaceJob:
     wall_iso: str
     time_tag: str
     now_s: float
+    # Lower sorts first: foreground unknown, background unknown, known recheck.
+    priority: tuple[float, ...] = (2.0, 0.0, 0.0)
     enqueued_at: float = field(default_factory=time.monotonic)
+
+
+@dataclass(order=True, slots=True)
+class _PrioritizedJob:
+    priority: tuple[float, ...]
+    sequence: int
+    job: FaceJob = field(compare=False)
 
 
 @dataclass(slots=True)
@@ -77,7 +87,9 @@ class FaceWorker:
         self.max_queue = max(1, int(max_queue))
         self.model_lock = model_lock or threading.Lock()
         self.max_job_age_s = max(0.5, float(max_job_age_s))
-        self._jobs: queue.Queue[FaceJob] = queue.Queue(maxsize=self.max_queue)
+        self._jobs: queue.PriorityQueue[_PrioritizedJob] = queue.PriorityQueue(
+            maxsize=self.max_queue)
+        self._job_sequence = 0
         self._results: queue.Queue[FaceResult] = queue.Queue()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -87,6 +99,11 @@ class FaceWorker:
         self._last_attempt: dict[tuple[str, int], float] = {}
         self._pending: set[tuple[str, int]] = set()
         self._lock = threading.Lock()
+        self.jobs_processed = 0
+        self.jobs_failed = 0
+        self.jobs_expired = 0
+        self.last_error: str | None = None
+        self._last_error_log_at = float("-inf")
 
     # -- lifecycle --
     def start(self) -> None:
@@ -102,6 +119,32 @@ class FaceWorker:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=timeout)
+
+    def ensure_alive(self) -> bool:
+        """Keep the worker available and expose its health to the main loop."""
+        if self._thread is None or not self._thread.is_alive():
+            self.start()
+        return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def queue_size(self) -> int:
+        """So job dang cho trong queue (backpressure cho main loop)."""
+        try:
+            return int(self._jobs.qsize())
+        except (AttributeError, ValueError):
+            return 0
+
+    @property
+    def pending_count(self) -> int:
+        with self._lock:
+            return len(self._pending)
+
+    @property
+    def load_ratio(self) -> float:
+        """0.0 = ranh, 1.0 = day queue. May yeu tu tang cooldown theo ti le nay."""
+        if self.max_queue <= 0:
+            return 0.0
+        return max(0.0, min(1.0, self.queue_size / float(self.max_queue)))
 
     # -- gating (gọi từ main loop, rẻ, không inference) --
     def need_face(
@@ -152,7 +195,10 @@ class FaceWorker:
                 return False
             self._pending.add(key)
         try:
-            self._jobs.put_nowait(job)
+            with self._lock:
+                self._job_sequence += 1
+                sequence = self._job_sequence
+            self._jobs.put_nowait(_PrioritizedJob(job.priority, sequence, job))
             return True
         except queue.Full:
             with self._lock:
@@ -171,20 +217,34 @@ class FaceWorker:
     def _drain(self) -> None:
         while not self._stop.is_set():
             try:
-                job = self._jobs.get(timeout=0.05)
+                queued = self._jobs.get(timeout=0.05)
             except queue.Empty:
                 continue
+            job = queued.job
             try:
                 # Drop job cũ: mặt trong crop 2s trước không còn giá trị.
                 if time.monotonic() - job.enqueued_at > self.max_job_age_s:
+                    self.jobs_expired += 1
                     continue
                 observations = self._run_job(job)
+                self.jobs_processed += 1
                 for obs in observations:
                     try:
                         self._results.put_nowait(obs)
                     except queue.Full:
                         break
-            except Exception:
+            except Exception as error:  # noqa: BLE001 - keep worker alive
+                self.jobs_failed += 1
+                self.last_error = f"{type(error).__name__}: {error}"
+                # Throttle repeated model errors, but never hide the first
+                # failure.  The short traceback identifies the broken stage
+                # without flooding the realtime console on every frame.
+                now = time.monotonic()
+                if now - self._last_error_log_at >= 10.0:
+                    self._last_error_log_at = now
+                    detail = "".join(traceback.format_exception_only(
+                        type(error), error)).strip()
+                    print(f"[FaceWorker] job {job.channel}/G{job.gid} lỗi: {detail}")
                 continue
             finally:
                 with self._lock:
