@@ -52,6 +52,14 @@ from camera_tracking.voice.rtsp_voice_listener import (
     rms_level,
     transcribe_segment_fw,
 )
+from camera_tracking.voice.speaker_guard import (
+    mark_speaker_busy,
+    speaker_busy,
+)
+from camera_tracking.voice.turn_guard import (
+    clear_turn,
+    mark_turn,
+)
 from camera_tracking.voice.voice_trigger import normalize_trigger_text
 
 HA_LINH_PROMPT = """Bạn là Hà Linh, trợ lý giọng nói tiếng Việt cho hệ thống Camera-OJT.
@@ -63,8 +71,12 @@ Quy tắc trả lời:
 * Không giải thích dài dòng, không lặp lại câu hỏi.
 * Không dùng Markdown, bullet point hoặc tiêu đề.
 * Dùng tiếng Việt tự nhiên, dễ nghe khi chuyển sang giọng nói.
-* Với câu hỏi đơn giản, chỉ đưa ra thông tin cần thiết.
-* Nếu thiếu thông tin quan trọng để trả lời chính xác, hỏi lại bằng một câu ngắn.
+ * Với câu hỏi đơn giản, chỉ đưa ra thông tin cần thiết.
+ * TUYỆT ĐỐI không hỏi ngược lại người dùng dưới mọi hình thức: không câu
+   hỏi làm rõ, không gợi ý hỏi tiếp, không đặt nhiều câu hỏi trong một lượt
+   (hệ thống chưa có memory hội thoại).
+ * Nếu thiếu thông tin, trả lời ngay với giả định hợp lý nhất và nói rõ
+   giả định đó trong cùng 1 câu, không hỏi lại.
 * Nếu có dữ liệu từ tool/API, chỉ tóm tắt kết quả quan trọng nhất cho người dùng.
 * Không mô tả quá trình suy nghĩ hoặc xử lý của bạn.
 * Không nói bạn là AI, trừ khi người dùng hỏi trực tiếp.
@@ -114,9 +126,9 @@ ROUTER_PROTOCOL = """Bạn là bộ định tuyến câu hỏi tiếng Việt, t
 {"type":"direct|tool","tool":"<tên_tool hoặc null>","args":{},"text":"<câu trả lời ngắn nếu type=direct, ngược lại để rỗng>"}
 
 Luật:
-* type=direct: tự trả lời ngắn gọn 1-2 câu, dưới 40 từ, tiếng Việt tự nhiên để đọc thành tiếng, không Markdown.
-* type=tool: chỉ dùng tool trong danh sách dưới; điền đủ tham số bắt buộc; tham số tùy chọn không biết thì bỏ qua (tool có giá trị mặc định).
-* Không bịa tham số: nghe "mấy giờ" thì gọi get_current_time không tham số; nghe thiếu thông tin bắt buộc thì hỏi lại bằng type=direct.
+ * type=direct: tự trả lời ngắn gọn 1-2 câu, dưới 40 từ, tiếng Việt tự nhiên để đọc thành tiếng, không Markdown. CẤM hỏi ngược lại (không câu hỏi làm rõ, không gợi ý hỏi tiếp).
+ * type=tool: chỉ dùng tool trong danh sách dưới; điền đủ tham số bắt buộc; tham số tùy chọn không biết thì bỏ qua (tool có giá trị mặc định).
+ * Không bịa tham số: nghe "mấy giờ" thì gọi get_current_time không tham số; nghe thiếu thông tin bắt buộc thì type=direct với câu trả lời tốt nhất theo giả định mặc định (nêu giả định), KHÔNG hỏi lại.
 * Ví dụ: "Python là gì" -> {"type":"direct","tool":null,"args":{},"text":"Python là ngôn ngữ lập trình phổ biến, dễ đọc và dùng nhiều cho AI."}
 * Ví dụ: "Đà Nẵng hôm nay bao nhiêu độ" -> {"type":"tool","tool":"get_weather","args":{"city":"Đà Nẵng"},"text":""}
 
@@ -167,6 +179,55 @@ def strip_ack_echo(command: str) -> str:
     return " ".join(tokens[cut:])
 
 
+def fast_answer(question: str) -> str | None:
+    """Tra loi ngay cau thuong gap, KHONG goi Gemini (~14s).
+
+    Tra None khi khong khop -> flow Gemini binh thuong. Chi nhan cau
+    ngan, ro rang de khong cuop cau phuc tap cua router.
+    """
+    norm = normalize_trigger_text(question)
+    if not norm:
+        return None
+    words = norm.split()
+    n = len(words)
+
+    if n <= 8 and ("may gio" in norm or norm in ("gio", "gio roi", "bay gio may gio")):
+        try:
+            from camera_tracking.voice.qa_tools import get_current_time
+            return get_current_time()
+        except Exception:
+            return None
+    if n <= 10 and ("ngay may" in norm or "ngay bao nhieu" in norm
+                      or "thu may" in norm):
+        try:
+            from camera_tracking.voice.qa_tools import get_current_date
+            return get_current_date()
+        except Exception:
+            return None
+    # "hom nay ..." mot minh rat mo ho (thoi tiet hom nay? lich hom nay?) ->
+    # chi nhan khi cuc ngan va khong co tu khoa thoi tiet.
+    if (n <= 5 and "hom nay" in norm
+            and not any(k in norm for k in
+                        ("thoi tiet", "nhiet do", "do am", "mua", "nang",
+                         "gio", "bao", "uv", "do c"))):
+        try:
+            from camera_tracking.voice.qa_tools import get_current_date
+            return get_current_date()
+        except Exception:
+            return None
+    if n <= 6 and (norm.startswith("cam on") or norm in ("cam on", "cam on nhe", "ok cam on")):
+        return "Không có gì. Chúc bạn một ngày tốt lành."
+    if n <= 6 and ("tam biet" in norm or "hen gap lai" in norm):
+        return "Tạm biệt bạn. Hẹn gặp lại."
+    if n <= 6 and ("ban la ai" in norm or norm in ("ten gi", "ten ban la gi")):
+        return "Mình là Hà Linh, trợ lý giọng nói của hệ thống camera."
+    if norm in ("xin chao", "chao", "chao ban", "hello", "hi"):
+        return "Chào bạn. Hà Linh nghe đây."
+    if n <= 4 and ("khoe khong" in norm or norm in ("khoe khong", "ban khoe khong")):
+        return "Mình khỏe. Rất vui được nói chuyện với bạn."
+    return None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=str(ROOT / "config" / "default.yaml"))
@@ -179,11 +240,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tts-voice", default="maichi")
     parser.add_argument("--tts-device", default="cuda",
                         help="cuda (co GPU) hoac cpu.")
-    parser.add_argument("--cmd-model", default="medium",
-                        help="DEPRECATED (medium-only, small da bo): giu de tuong "
-                             "thich CLI.")
-    parser.add_argument("--think-filler-s", type=float, default=1.2,
-                        help="Xu ly lau hon nguong nay thi phat filler thinking.")
+    parser.add_argument("--wake-model", default="zipformer",
+                        help="Model STT vong cho wake 'Ha Linh oi': zipformer "
+                             "= nhanh ~0.1s (khuyen nghi), small/tiny = "
+                             "whisper CPU.")
+    parser.add_argument("--cmd-model", default="zipformer",
+                        help="Model STT vong nghe lenh: zipformer=Zipformer-vi "
+                             "30M CPU ~0.3s (khuyen nghi), medium=chuan ~9s "
+                             "CPU, small=nhanh ~2-3s.")
+    parser.add_argument("--think-filler-s", type=float, default=6.0,
+                        help="Xu ly lau hon nguong nay thi phat filler thinking "
+                             "(cao de filler P2P ~10s khong cong them delay).")
     parser.add_argument("--think-timeout-s", type=float, default=90.0)
     parser.add_argument("--wake-miss-n", type=int, default=3,
                         help="Hut wake lien tiep bao nhieu lan co tieng thi "
@@ -229,6 +296,7 @@ def capture_utterance(
     max_len_s: float = 10.0,
     max_wait_s: float | None = None,
     meter_s: float | None = None,
+    respect_speaker_busy: bool = True,
 ) -> bytes | None:
     """Ghi 1 doan noi: doi tieng noi (vo han neu max_wait_s=None) roi cat khi im.
 
@@ -236,6 +304,8 @@ def capture_utterance(
     ["-fflags", "nobuffer", "-rtsp_transport", "tcp", "-i", rtsp_url].
     meter_s: in dong muc mic moi N giay trong luc doi. Het max_wait_s
     thi tra None; None (EOF/stream chet) thi vong goi tu mo lai stream.
+    respect_speaker_busy: True = tat mic khi loa dang phat (trong turn,
+    tranh echo). False = mic luon mo (vong cho wake, tranh miss tieng goi).
     """
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
@@ -274,6 +344,9 @@ def capture_utterance(
     leftover = bytearray()
     next_meter = time.monotonic() + (meter_s or 0)
     max_bytes = int(max_len_s * TARGET_RATE * 2)
+    busy = False
+    busy_checks = 0
+    busy_announced = False
     print(prompt, flush=True)
     try:
         while True:
@@ -286,6 +359,26 @@ def capture_utterance(
                 frame = bytes(leftover[:FRAME_BYTES])
                 del leftover[:FRAME_BYTES]
                 n_frames += 1
+                # Half-duplex xuyen process: loa (greeter chao / Ha Linh
+                # noi) dang phat thi TAT MIC - bo frame, huy doan dang
+                # ghi do de khoi nghe lai chinh tieng loa. Check moi 8
+                # frame (~4 lan/giay) cho nhe.
+                # CHI ap dung trong turn (sau WAKE): luc cho wake mic
+                # luon mo de khong miss tieng goi, ke ca loa dang chao.
+                busy_checks += 1
+                if (respect_speaker_busy and busy_checks % 8 == 1):
+                    busy = speaker_busy()
+                if busy and respect_speaker_busy:
+                    heard = 0
+                    if not busy_announced:
+                        busy_announced = True
+                        print("[HaLinh] loa dang phat - tam tat mic.",
+                              flush=True)
+                    if started:
+                        started = False
+                        buf.clear()
+                        silence_ms = 0
+                    continue
                 level = rms_level(frame)
                 thr = tracker.update(level)
                 if not got_frame:
@@ -419,16 +512,86 @@ def main() -> None:
     )
     from camera_tracking.voice.zerotts_tts import ZeroTTSBackend
 
-    print("[HaLinh] warmup (STT tiny-wake + medium-lenh, TTS CUDA, tunnel loa)...", flush=True)
+    print("[HaLinh] warmup (STT wake + lenh, TTS CUDA, tunnel loa)...", flush=True)
     t0 = time.monotonic()
-    stt_wake = WhisperModel("tiny", device="cpu", compute_type="int8")
-    print(f"[HaLinh] STT wake tiny xong ({time.monotonic() - t0:.1f}s).", flush=True)
+    # RTX 2050 4GB: STT giu CPU (CUDA tran VRAM voi ZeroTTS).
+    # zipformer-vi 30M (~0.3s) cho ca wake + lenh; whisper giu lam fallback.
+    # Chon qua --wake-model / --cmd-model.
+    def _pick(name: str, default: str) -> str:
+        val = str(name or default).strip().lower()
+        if val not in ("tiny", "small", "medium", "zipformer"):
+            print(f"[HaLinh] model {name!r} la, dung {default}.", flush=True)
+            return default
+        return val
+    _wake_model = _pick(args.wake_model, "zipformer")
+    _cmd_model = _pick(args.cmd_model, "zipformer")
+    _zipformer = None
+    if "zipformer" in (_wake_model, _cmd_model):
+        from camera_tracking.voice.sherpa_stt import SherpaZipformerSTT
+
+        _zipformer = SherpaZipformerSTT(
+            num_threads=int(getattr(voice_cfg, "stt_threads", 6)))
+        _zipformer.warmup()
+        print(f"[HaLinh] STT zipformer CPU xong "
+              f"({time.monotonic() - t0:.1f}s, dung chung wake+lenh).",
+              flush=True)
+
+    def _zip_text(pcm: bytes) -> str:
+        # Transducer khong co cua no_speech nhu Whisper: tieng on phong
+        # van ra 1-2 tu rac ("CAC", "TRONG") -> <2 tu coi nhu im lang.
+        # Wake ("ha linh oi"=3 tu, "linh oi"=2 tu) va lenh that (ca cau)
+        # deu di qua; chi mat case goi cut "linh" 1 tu.
+        assert _zipformer is not None
+        text = _zipformer.transcribe_pcm(pcm)
+        if len(text.split()) < 2:
+            return ""
+        return text
+
+    if _wake_model == "zipformer":
+        def transcribe_wake(pcm: bytes) -> str:
+            return _zip_text(pcm)
+    else:
+        stt_wake = WhisperModel(_wake_model, device="cpu",
+                                compute_type="int8")
+
+        def transcribe_wake(pcm: bytes) -> str:
+            return transcribe_segment_fw(
+                stt_wake, pcm, str(voice_cfg.voice_stt_lang),
+                max_no_speech_prob=0.60,
+                min_avg_logprob=-1.10,
+                initial_prompt=WAKE_STT_PROMPT,
+            )
+        print(f"[HaLinh] STT wake {_wake_model} xong "
+              f"({time.monotonic() - t0:.1f}s).", flush=True)
     t0 = time.monotonic()
-    stt_medium = WhisperModel("medium", device="cpu", compute_type="int8")
-    stt_cmd = stt_medium
-    print(f"[HaLinh] STT lenh medium xong ({time.monotonic() - t0:.1f}s).", flush=True)
+    if _cmd_model == "zipformer":
+        assert _zipformer is not None
+
+        def transcribe_cmd(pcm: bytes) -> str:
+            return _zip_text(pcm)
+
+        print(f"[HaLinh] STT lenh zipformer CPU xong "
+              f"({time.monotonic() - t0:.1f}s).", flush=True)
+    else:
+        stt_medium = WhisperModel(_cmd_model, device="cpu",
+                                  compute_type="int8")
+
+        def transcribe_cmd(pcm: bytes) -> str:
+            return transcribe_segment_fw(
+                stt_medium, pcm, str(voice_cfg.voice_stt_lang),
+                max_no_speech_prob=float(
+                    voice_cfg.voice_max_no_speech_prob),
+                min_avg_logprob=float(voice_cfg.voice_min_avg_logprob),
+            )
+
+        print(f"[HaLinh] STT lenh {_cmd_model} CPU xong "
+              f"({time.monotonic() - t0:.1f}s).", flush=True)
     tts = ZeroTTSBackend(device=args.tts_device, voice=args.tts_voice)
     tts._load()
+    # Tunnel RIENG cho Ha Linh (halinh_bind_port, mac dinh 18087): greeter
+    # tracking giu 18086. Chung port -> bind fail -> talk 25-70s.
+    _halinh_port = int(getattr(voice_cfg, "halinh_bind_port",
+                               getattr(voice_cfg, "p2p_bind_port", 18086) + 1))
     p2p = ImouP2PTalkOutput(
         ImouP2PCredentials.from_env(),
         channel=channel,
@@ -437,6 +600,7 @@ def main() -> None:
         retry_delay=float(voice_cfg.p2p_retry_delay_s),
         sample_rate=int(voice_cfg.p2p_sample_rate),
         volume=float(voice_cfg.p2p_volume),
+        bind_port=_halinh_port,
     )
     # Duong truyen loa phai SAN SANG THAT moi duoc noi "san sang":
     # cho dong bo, retry vai lan; khong noi thi dung (khong gia vo san sang).
@@ -455,18 +619,46 @@ def main() -> None:
             "cloud Imou roi chay lai). Chua san sang, dung chuong trinh.")
 
     def talk(path: str | Path, _channel: int | None = None) -> None:
+        # Phan xu loa: greeter (hinh anh) co the dang phat do loi chao
+        # da xep tu truoc WAKE -> doi loa ranh (toi da 10s) roi moi noi,
+        # khong de 2 ben noi chong nhau.
+        _waited = 0.0
+        while speaker_busy() and _waited < 10.0:
+            time.sleep(0.2)
+            _waited += 0.2
+        if _waited >= 10.0:
+            print(f"[HaLinh] loa van ban sau 10s, cu phat "
+                  f"{Path(path).name} (co the chong lan nhau).", flush=True)
+        # Giu mic rong truoc: P2P relay cham hon file nhieu (7-28s) nen
+        # duration file + margin khong du; giu thua roi that lai sau.
+        from camera_tracking.voice.speaker_guard import media_seconds
+
+        _dur = media_seconds(path) or 6.0
+        try:
+            mark_speaker_busy(hold_s=_dur + 30.0)
+        except Exception:  # noqa: BLE001 - guard chi la phu
+            pass
         t0 = time.monotonic()
-        p2p(path, channel)
+        try:
+            p2p(path, channel)
+        finally:
+            # Phat xong: chi giu duoi vang 2s cho mic mo lai ngay.
+            try:
+                mark_speaker_busy(hold_s=2.0)
+            except Exception:  # noqa: BLE001
+                pass
         print(f"[HaLinh] loa xong {Path(path).name} "
               f"({time.monotonic() - t0:.1f}s).", flush=True)
 
-    # Pre-convert filler ack sang AAC ngay tu warmup de lan ack dau
-    # khong mat them 1-2s spawn ffmpeg convert.
+    # Pre-convert TAT CA filler sang AAC ngay tu warmup: moi cau
+    # (ready/listening/thinking/missed) tiet kiem 1-2s spawn ffmpeg o lan
+    # phat dau, quan trong khi P2P relay von da cham.
     try:
-        p2p._convert_cached(filler_dir / FILLER_FILES["listening"])
-        print("[HaLinh] da preload AAC ack.", flush=True)
+        for _filler in FILLER_FILES.values():
+            p2p._convert_cached(filler_dir / _filler)
+        print("[HaLinh] da preload AAC fillers.", flush=True)
     except Exception as preload_error:  # noqa: BLE001 - chi la toi uu
-        print(f"[HaLinh] preload AAC ack loi (bo qua): {preload_error}",
+        print(f"[HaLinh] preload AAC fillers loi (bo qua): {preload_error}",
               flush=True)
 
     talk(filler_dir / FILLER_FILES["ready"], channel)
@@ -483,22 +675,19 @@ def main() -> None:
             if args.rounds and done_rounds >= args.rounds:
                 break
             # -- WAIT_WAKE (tiny 0.3s, nhanh gap ~10x medium) --
+            # Mic LUON MO o vong nay (ke ca loa dang chao) de khong miss
+            # tieng goi "Ha Linh oi". Ne echo chi bat sau WAKE.
             pcm = capture_utterance(
                 mic_input, voice_cfg,
                 prompt="[HaLinh] ... nghe (goi 'Hà Linh ơi') ...",
                 end_silence_ms=700, max_len_s=4.0, max_wait_s=None,
-                meter_s=3.0)
+                meter_s=3.0, respect_speaker_busy=False)
             if not pcm:
                 time.sleep(1.0)
                 continue
             t0 = time.monotonic()
-            wake_text = transcribe_segment_fw(
-                stt_wake, pcm, str(voice_cfg.voice_stt_lang),
-                max_no_speech_prob=0.60,
-                min_avg_logprob=-1.10,
-                initial_prompt=WAKE_STT_PROMPT,
-            )
-            print(f"[HaLinh] STT wake ({time.monotonic() - t0:.2f}s, tiny): "
+            wake_text = transcribe_wake(pcm)
+            print(f"[HaLinh] STT wake ({time.monotonic() - t0:.2f}s, {_wake_model}): "
                   f"{wake_text!r}", flush=True)
             if not wake_text or not is_wake(wake_text):
                 # Co tieng nhung khong phai goi Ha Linh: dem hut; du N lan thi
@@ -522,21 +711,23 @@ def main() -> None:
             wake_miss = 0
             empty_wake = 0
             print(f"[HaLinh] WAKE: {wake_text}", flush=True)
+            # Khoa turn-taking: pipeline tracking nhin thay thi tam ngung
+            # xep chao vẫy/mặt de 2 loa khong noi chong giua hoi-dap.
+            # TTL tu het neu crash giua turn.
+            try:
+                mark_turn()
+            except Exception:  # noqa: BLE001
+                pass
             question = strip_wake_command(wake_text)
             stt_s = 0.0
             if question:
                 # Wake kem lenh ("Ha Linh oi, may gio roi"): tiny bat wake
-                # nhanh nhung co the sai lenh dai -> chay lai medium tren
-                # cung pcm de lay lenh chuan (hiem, chap nhan cham 1 lan).
+                # nhanh nhung co the sai lenh dai -> chay lai model lenh
+                # tren cung pcm de lay lenh chuan (hiem, chap nhan cham 1 lan).
                 t0 = time.monotonic()
-                refined = transcribe_segment_fw(
-                    stt_cmd, pcm, str(voice_cfg.voice_stt_lang),
-                    max_no_speech_prob=float(
-                        voice_cfg.voice_max_no_speech_prob),
-                    min_avg_logprob=float(voice_cfg.voice_min_avg_logprob),
-                )
+                refined = transcribe_cmd(pcm)
                 refined_cmd = strip_wake_command(refined) if refined else ""
-                print(f"[HaLinh] refine lenh medium "
+                print(f"[HaLinh] refine lenh ({_cmd_model}) "
                       f"({time.monotonic() - t0:.2f}s): {refined!r} -> "
                       f"{refined_cmd!r}", flush=True)
                 if refined_cmd:
@@ -548,18 +739,20 @@ def main() -> None:
                       flush=True)
                 ack_via_camera(talk, filler_dir, channel)
 
-            # -- LISTEN_CMD (medium, chuan) --
+            # -- LISTEN_CMD (model lenh: medium/zipformer) --
             if not question:
                 stt_s = 0.0
                 attempt = 0
                 while True:
                     attempt += 1
+                    # Trong turn (sau WAKE): mic NE loa dang phat de lenh
+                    # khong dinh echo cau chao/ack.
                     pcm = capture_utterance(
                         mic_input, voice_cfg,
                         prompt="[HaLinh] NÓI NGAY (cứ nói, Hà Linh vẫn nghe)...",
-                        end_silence_ms=2000,
-                        max_len_s=15.0,
-                        max_wait_s=None)
+                        end_silence_ms=1300,
+                        max_len_s=10.0,
+                        max_wait_s=None, respect_speaker_busy=True)
                     if not pcm:
                         print(f"[HaLinh] lan {attempt}: mat stream mic, "
                               f"mo lai...", flush=True)
@@ -567,12 +760,7 @@ def main() -> None:
                         continue
                     total0 = time.monotonic()
                     t0 = time.monotonic()
-                    question = transcribe_segment_fw(
-                        stt_cmd, pcm, str(voice_cfg.voice_stt_lang),
-                        max_no_speech_prob=float(
-                            voice_cfg.voice_max_no_speech_prob),
-                        min_avg_logprob=float(voice_cfg.voice_min_avg_logprob),
-                    )
+                    question = transcribe_cmd(pcm)
                     stt_s = time.monotonic() - t0
                     if question:
                         question = strip_ack_echo(question)
@@ -624,7 +812,16 @@ def main() -> None:
             answer = ""
             tool_s = 0.0
             llm_s = 0.0
+            # Fast-path: cau thuong gap tra ngay, khoi doi Gemini ~14s.
+            fast = fast_answer(question)
+            if fast is not None:
+                result = {"answer": fast, "tool_s": 0.0, "used": ["fast-path"]}
+                llm_s = 0.0
+                think_ok = True
+                print(f"[HaLinh] fast-path (0s): {fast}", flush=True)
             for quota_try in range(3):
+                if think_ok:
+                    break
                 result, llm_s = _run_think_once()
                 error = result.get("error")
                 if error is None:
@@ -668,12 +865,14 @@ def main() -> None:
                           f"{speak_error}", flush=True)
                 time.sleep(60.0)
             if not think_ok:
+                clear_turn()
                 continue
             answer = result.get("answer", "")
             tool_s = result.get("tool_s", 0.0)
             if not answer:
                 print(f"[HaLinh] Gemini tra rong ({llm_s:.2f}s), ve cho.",
                       flush=True)
+                clear_turn()
                 continue
             print(f"[HaLinh] dap ({llm_s:.2f}s, tool {tool_s:.2f}s "
                   f"{result.get('used', [])}): {answer}", flush=True)
@@ -689,9 +888,14 @@ def main() -> None:
             print(f"[HaLinh] TTS {tts_s:.2f}s | loa {play_s:.2f}s | "
                   f"VONG {time.monotonic() - total0:.1f}s.", flush=True)
             done_rounds += 1
+            clear_turn()
     except KeyboardInterrupt:
         print("\n[HaLinh] dung.", flush=True)
     finally:
+        try:
+            clear_turn()
+        except Exception:  # noqa: BLE001
+            pass
         p2p.close()
 
 

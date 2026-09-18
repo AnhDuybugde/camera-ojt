@@ -1091,6 +1091,12 @@ def main() -> None:
             same_camera_reconnect_s=identity_cfg.same_camera_reconnect_s,
             min_appearance_similarity=identity_cfg.min_appearance_similarity,
             named_appearance_floor=identity_cfg.named_appearance_floor,
+            named_floor_locked=identity_cfg.named_floor_locked,
+            face_anchor_ttl_s=identity_cfg.face_anchor_ttl_s,
+            face_anchor_ttl_steps=identity_cfg.face_anchor_ttl_steps,
+            occlusion_iou_threshold=identity_cfg.occlusion_iou_threshold,
+            occlusion_area_jump_ratio=identity_cfg.occlusion_area_jump_ratio,
+            gallery_append_min_sim=identity_cfg.gallery_append_min_sim,
             active_duplicate_similarity=identity_cfg.active_duplicate_similarity,
             tentative_min_hits=identity_cfg.tentative_min_hits,
             temp_lost_s=identity_cfg.temp_lost_s,
@@ -2067,6 +2073,13 @@ def main() -> None:
             if not manager.bind_employee(identity_gid, employee_id):
                 print(f"[Identity conflict] refused {employee_id} -> G{identity_gid}")
                 return
+            # Face anchor: GID vua duoc face diem cao xac nhan -> khoa tam
+            # thoi de chong B cuop khi che A hoan toan (xem global_identity).
+            try:
+                manager.set_face_anchor(
+                    identity_gid, employee_id, float(match.score), now_s)
+            except (AttributeError, TypeError, ValueError):
+                pass
             if face_worker is not None:
                 face_worker.mark_known(identity_gid, now_s, channel)
             gid_to_score[identity_gid] = max(

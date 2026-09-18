@@ -14,6 +14,7 @@ from camera_tracking.gesture.wave import (
     is_front_facing_hand,
     is_hand_near_face,
     is_open_palm,
+    open_palm_score,
 )
 
 
@@ -237,6 +238,23 @@ def test_open_palm_required_four_allows_occluded_thumb() -> None:
     hand = _palm_landmarks(True)
     hand[4] = hand[3]
     assert is_open_palm(hand, required=4) is True
+    assert is_open_palm(hand, required=5) is False
+
+
+def test_open_palm_score_full_and_fist() -> None:
+    assert open_palm_score(_palm_landmarks(True)) == 1.0
+    assert open_palm_score(_palm_landmarks(False)) == 0.0
+    assert open_palm_score([(0.1, 0.1)] * 5) == 0.0
+
+
+def test_open_palm_score_ninety_percent_allows_near_miss() -> None:
+    # 1 ngon gap gan het (dau ngon sat khop giua): diem ~0.9, tong ~4.9.
+    # required=4.5 (90%) cho qua, required=5 (100% cu) rot.
+    hand = _palm_landmarks(True)
+    hand[8] = (hand[8][0], 0.47)
+    score = open_palm_score(hand)
+    assert 0.88 < score < 1.0
+    assert is_open_palm(hand, required=4.5) is True
     assert is_open_palm(hand, required=5) is False
 
 

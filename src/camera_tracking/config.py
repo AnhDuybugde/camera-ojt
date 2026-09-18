@@ -24,7 +24,7 @@ class CameraConfig(StrictModel):
 class DetectionConfig(StrictModel):
     model_path: str = "yolo26s.pt"
     confidence_threshold: float = Field(default=0.25, ge=0, le=1)
-    nms_iou_threshold: float = Field(default=0.85, ge=0, le=1)
+    nms_iou_threshold: float = Field(default=0.9, ge=0, le=1)
     nested_box_containment_threshold: float = Field(default=0.85, ge=0, le=1)
     person_class_id: int = 0
     image_size: int = 640
@@ -67,6 +67,18 @@ class GlobalIdentityConfig(StrictModel):
     # appearance phai >= nguong nay ke ca khi spatial/time cao. Chong vu
     # G1-LeHoAnhDuy an di roi gán sang nguoi khac dung gan.
     named_appearance_floor: float = Field(default=0.70, ge=0, le=1)
+    # Face anchor: GID vua duoc face diem cao xac nhan duoc khoa tam thoi,
+    # body la muon claim phai vuot floor cao hon + khong duoc reconnect
+    # thuan spatial khi mat embedding (chong B cuop khi che A hoan toan).
+    named_floor_locked: float = Field(default=0.80, ge=0, le=1)
+    face_anchor_ttl_s: float = Field(default=10.0, ge=0)
+    face_anchor_ttl_steps: int = Field(default=120, ge=1)
+    # Nghi che khuat: IoU 2 box cung frame vuot nguong nay -> fast-path phai
+    # verify appearance thay vi giu mu.
+    occlusion_iou_threshold: float = Field(default=0.40, ge=0, le=1)
+    occlusion_area_jump_ratio: float = Field(default=0.30, ge=0)
+    # Gallery hygiene: embedding moi qua khac gallery thi khong append.
+    gallery_append_min_sim: float = Field(default=0.60, ge=0, le=1)
     active_duplicate_similarity: float = Field(default=0.90, ge=0, le=1)
     temp_lost_s: float = Field(default=10.0, ge=0)
     long_lost_s: float = Field(default=120.0, ge=0)
@@ -262,6 +274,12 @@ class VoiceConfig(StrictModel):
     p2p_retry_delay_s: float = Field(default=5.0, ge=0)
     p2p_sample_rate: int = Field(default=16000, ge=8000)
     p2p_volume: float = Field(default=0.3, ge=0.0, le=1.0)
+    # Tunnel P2P local (127.0.0.1:<port> -> camera 8086). Greeter (tracking)
+    # va Ha Linh (subprocess) MOI BEN 1 TUNNEL RIENG: chung port 18086 se
+    # tranh nhau (bind fail -> establish Timeout -> talk 25-70s). Mac dinh
+    # greeter 18086, Ha Linh 18087.
+    p2p_bind_port: int = Field(default=18086, ge=1, le=65535)
+    halinh_bind_port: int = Field(default=18087, ge=1, le=65535)
     # WAV chao tao san bang ZeroTTS (scripts/build_greeting_wavs.py):
     # manifest.json anh xa nguyen van cau chao -> file wav.
     greeting_dir: Path = Path("output/voice_greetings")
@@ -301,7 +319,9 @@ class VoiceConfig(StrictModel):
     focus_switch_hold_s: float = Field(default=0.50, ge=0.0)
     focus_lost_grace_s: float = Field(default=1.00, ge=0.0)
     # A wave is intentional only after a full open-palm activation.
-    wave_required_fingers: int = Field(default=5, ge=5, le=5)
+    # Diem mo ban tay theo ngon-tuong-duong (float): 5.0 = 100% (gat nhu
+    # cu), 4.5 = 90% (1 ngon gan-du van qua). Vay chinh dung 4.5.
+    wave_required_fingers: float = Field(default=4.5, ge=1.0, le=5.0)
     wave_palm_confirm_frames: int = Field(default=2, ge=1)
     wave_palm_release_frames: int = Field(default=5, ge=1)
     wave_face_ttl_s: float = Field(default=8.0, gt=0.0)
@@ -325,7 +345,7 @@ class VoiceConfig(StrictModel):
     palm_confirm_frames: int = Field(default=1, ge=1)
     palm_release_frames: int = Field(default=2, ge=1)
     palm_min_detection_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
-    palm_required_fingers: int = Field(default=4, ge=3, le=5)
+    palm_required_fingers: float = Field(default=4, ge=1.0, le=5.0)
     palm_min_input_height_px: int = Field(default=320, ge=0)
     palm_head_region_max_y: float = Field(default=0.60, gt=0.0, le=1.0)
     palm_allow_without_face: bool = True

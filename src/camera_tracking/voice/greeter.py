@@ -388,10 +388,31 @@ class VoiceGreeter:
                         self._inflight.discard(identity_key)
                     self._rollback(day, identity_key, enqueued_now_s, out_channel)
                     continue
+                # Turn-taking xuyen process: Ha Linh bat dau hoi-dap SAU
+                # khi loi chao nay duoc xep -> huy, nhuong loa cho hoi-dap
+                # (da co khoa moi chan xep tiep, day la chan phat tre).
+                try:
+                    from camera_tracking.voice.turn_guard import turn_active
+                    _in_turn = bool(turn_active())
+                except Exception:  # noqa: BLE001 - guard chi la phu
+                    _in_turn = False
+                if _in_turn:
+                    with self._lock:
+                        self._inflight.discard(identity_key)
+                    self._rollback(day, identity_key, enqueued_now_s, out_channel)
+                    print(f"[Voice] Bo loi chao '{text}': nhuong loa cho "
+                          f"Hà Linh (dang hoi-dap).")
+                    continue
                 # Half-duplex xuyen process: bao mic (Ha Linh) biet loa
                 # dang phat de bo frame, khoi dem hut wake vo ich.
+                # P2P relay cham hon file nhieu -> giu thua truoc, that
+                # chat lai duoi vang sau khi phat xong (nhu talk()).
                 try:
-                    mark_speaker_busy(path)
+                    from camera_tracking.voice.speaker_guard import (
+                        media_seconds,
+                    )
+                    _dur = media_seconds(path) or 6.0
+                    mark_speaker_busy(hold_s=_dur + 30.0)
                 except Exception:  # noqa: BLE001 - guard chi la phu
                     pass
                 try:
@@ -402,6 +423,10 @@ class VoiceGreeter:
                             self.output(path, out_channel)
                     else:
                         self._play(path)
+                    try:
+                        mark_speaker_busy(hold_s=2.0)
+                    except Exception:  # noqa: BLE001
+                        pass
                     if self.on_spoken is not None:
                         try:
                             self.on_spoken(text)

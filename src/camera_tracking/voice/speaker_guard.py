@@ -53,10 +53,19 @@ def media_seconds(path: str | Path) -> float | None:
 
 def mark_speaker_busy(path: str | Path | None = None,
                       extra_s: float = 0.8,
-                      default_s: float = DEFAULT_BUSY_S) -> float:
-    """Danh dau loa ban den timestamp; tra ve thoi diem het ban."""
-    duration = media_seconds(path) if path else None
-    until = time.time() + (duration or float(default_s)) + float(extra_s)
+                      default_s: float = DEFAULT_BUSY_S,
+                      hold_s: float | None = None) -> float:
+    """Danh dau loa ban den timestamp; tra ve thoi diem het ban.
+
+    hold_s: giu mic dung so giay nay (ghi de duration+extra). Dung khi
+    biet chinh xac khoang can ne, VD talk() P2P: giu rong truoc phat
+    (file + relay cham) roi that chat lai duoi vang sau khi phat xong.
+    """
+    if hold_s is not None:
+        until = time.time() + max(0.0, float(hold_s))
+    else:
+        duration = media_seconds(path) if path else None
+        until = time.time() + (duration or float(default_s)) + float(extra_s)
     try:
         target = guard_file()
         target.parent.mkdir(parents=True, exist_ok=True)

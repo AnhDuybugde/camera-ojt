@@ -84,6 +84,20 @@ class GlobalIdentityConfig:
     # Stricter appearance floor for reusing a named (employee-bound) identity.
     # Ngăn GID đã gắn tên bị body khác mặc đồ khác chiếm chỉ vì đứng gần.
     named_appearance_floor: float = 0.70
+    # Even stricter floor while a fresh high-score face anchors the identity
+    # (see set_face_anchor). Ngăn B cướp GID của A ngay sau khi A vừa được
+    # face xác nhận điểm cao rồi bị che khuất.
+    named_floor_locked: float = 0.80
+    # Face anchor TTL: bao lâu sau 1 face score cao thì GID được "khóa".
+    face_anchor_ttl_s: float = 10.0
+    face_anchor_ttl_steps: int = 120
+    # Occlusion suspicion: IoU giữa 2 track cùng frame vượt ngưỡng này thì
+    # fast-path phải verify appearance thay vì giữ mù.
+    occlusion_iou_threshold: float = 0.40
+    # Area jump tương đối so với sighting cũ vượt ngưỡng này cũng nghi ngờ.
+    occlusion_area_jump_ratio: float = 0.30
+    # Gallery hygiene: embedding mới khác gallery hiện tại quá thì không append.
+    gallery_append_min_sim: float = 0.60
     # Strong evidence for merging two simultaneously active cross-camera IDs.
     active_duplicate_similarity: float = 0.90
     tentative_min_hits: int = 1
@@ -144,6 +158,16 @@ class IdentityRecord:
     last_match_score: float = 0.0
     employee_id: str | None = None
     sightings: dict[str, CameraSighting] = field(default_factory=dict)
+    # Occlusion / face-anchor state (transient, không persist qua ngày).
+    # last_good_embedding: embedding gần nhất đã verify khớp gallery.
+    last_good_embedding: np.ndarray | None = None
+    # True khi lần observe gần nhất bị nghi hijack/che khuất.
+    occluded: bool = False
+    # Face anchor: GID vừa được face điểm cao xác nhận -> "khóa" tạm thời.
+    face_anchor_employee: str | None = None
+    face_anchor_score: float = 0.0
+    face_anchor_s: float | None = None
+    face_anchor_step: int = 0
 
 
 @dataclass
@@ -225,6 +249,10 @@ class GlobalIdentityManager:
 
         # 1. Fast path: an alive ByteTrack tracklet keeps its Global ID as long
         #    as the same-channel spatial gate still passes (no teleport).
+        #    Anti-hijack: khi nghi occlusion (2 box đè nhau / area jump) hoặc
+        #    GID đang face-locked, bắt buộc verify appearance. Nếu embedding
+        #    khác gallery quá thì đá xuống pending để Hungarian quyết định lại
+        #    thay vì giữ mù (B cướp GID + tên của A khi che hoàn toàn).
         pending: list[Track] = []
         for track in tracks:
             key = _tracklet_key(channel, track.track_id)
@@ -235,12 +263,55 @@ class GlobalIdentityManager:
                 and gid not in claimed_gids
                 and self._spatial_ok(channel, track.bbox, frame_shape, record)
             ):
+                suspect = self._is_occlusion_suspect(
+                    track, tracks, record, frame_shape, channel
+                )
+                locked = self._is_face_locked(record, now_s)
+                # Named GID (đã có employee) luôn verify: số người có tên ít
+                # nên tốn thêm ReID mỗi frame là chấp nhận được, đổi lại bắt
+                # được cả case B thay A khớp khít box mà không gây IoU/area jump.
+                need_verify = (
+                    refresh_gallery or suspect or locked or record.occluded
+                    or record.employee_id is not None
+                )
+                if not need_verify:
+                    assignments[track.track_id] = gid
+                    claimed_gids.add(gid)
+                    self._observe(record, channel, track, None, now_s,
+                                  score=1.0)
+                    continue
+                embedding = self._cached_embedding(frame, track, embeddings)
+                if embedding is None:
+                    # Không verify được mà đã có gallery history + (nghi ngờ
+                    # hoặc named/locked) thì không giữ mù -> pending.
+                    if record.gallery and (
+                        suspect or locked or record.employee_id
+                    ):
+                        record.occluded = True
+                        if key in self._tracklet_to_gid:
+                            del self._tracklet_to_gid[key]
+                        pending.append(track)
+                        continue
+                    assignments[track.track_id] = gid
+                    claimed_gids.add(gid)
+                    self._observe(record, channel, track, None, now_s,
+                                  score=1.0)
+                    continue
+                floor = self._effective_appearance_floor(record, now_s)
+                sim = (
+                    _gallery_similarity(embedding, record.gallery)
+                    if record.gallery else 1.0
+                )
+                if record.gallery and sim < floor:
+                    # Appearance đổi rõ trong khi vị trí vẫn gần -> khả năng
+                    # cao là người khác đã che/nhận box -> pending.
+                    record.occluded = True
+                    if key in self._tracklet_to_gid:
+                        del self._tracklet_to_gid[key]
+                    pending.append(track)
+                    continue
                 assignments[track.track_id] = gid
                 claimed_gids.add(gid)
-                embedding = (
-                    self._cached_embedding(frame, track, embeddings)
-                    if refresh_gallery else None
-                )
                 self._observe(record, channel, track, embedding, now_s,
                               score=1.0)
             else:
@@ -348,6 +419,9 @@ class GlobalIdentityManager:
         if record is None or not record.employee_id:
             return False
         record.employee_id = None
+        # Hủy face anchor đi cùng để GID thua conflict không giữ khóa.
+        record.face_anchor_employee = None
+        record.face_anchor_score = 0.0
         return True
 
     def restore_identity(
@@ -507,7 +581,13 @@ class GlobalIdentityManager:
         distance = _normalized_distance_to_sighting(
             bbox, same_sighting, frame_shape
         )
+        locked = self._is_face_locked(record, now_s)
         if embedding is None or not record.gallery:
+            # Face-locked GID không được reconnect thuần spatial khi mất
+            # embedding: đúng lúc che khuất ReID hay None nhất, cho spatial
+            # là cho B mượn luôn GID + tên của A.
+            if locked:
+                return None
             if (
                 same_sighting is not None
                 and distance is not None
@@ -516,22 +596,13 @@ class GlobalIdentityManager:
             ):
                 return cfg.match_threshold
             return None
+        floor = self._effective_appearance_floor(record, now_s)
         if (
             embedding is not None
             and len(record.gallery) > 0
-            and appearance < cfg.min_appearance_similarity
+            and appearance < floor
         ):
             return None  # Gating: looks like a different person.
-        # Named-ID guard: GID da gan employee_id khong duoc tai su dung
-        # boi body khac chi vi dung gan / mat dau ngan. Can appearance
-        # that su khop, ke ca khi embedding 2 ben deu co.
-        if (
-            record.employee_id
-            and embedding is not None
-            and len(record.gallery) > 0
-            and appearance < cfg.named_appearance_floor
-        ):
-            return None
         # thi khong duoc gán cho tracklet kenh nay -> tach GID moi.
         same_channel = same_sighting is not None
         if same_channel and distance is not None and distance > cfg.max_center_distance_ratio:
@@ -585,7 +656,29 @@ class GlobalIdentityManager:
         ):
             normalized = _normalize_embedding(embedding)
             if normalized is not None:
-                record.gallery.append(normalized)
+                # Gallery hygiene: embedding mới quá khác gallery hiện tại
+                # (B đè box A) thì không append để tránh pollution khiến lần
+                # sau càng dễ match nhầm. Vẫn update vị trí để giữ continuity.
+                if record.gallery:
+                    sim = _gallery_similarity(embedding, record.gallery)
+                    if sim >= self.config.gallery_append_min_sim:
+                        record.gallery.append(normalized)
+                        record.last_good_embedding = normalized
+                        record.occluded = False
+                    else:
+                        record.occluded = True
+                else:
+                    record.gallery.append(normalized)
+                    record.last_good_embedding = normalized
+                    record.occluded = False
+        elif embedding is not None:
+            # Embedding có nhưng crop/conf quá yếu -> không append nhưng cũng
+            # không đánh dấu occluded (chỉ là quan sát kém).
+            pass
+        else:
+            # Không có embedding mới: giữ nguyên gallery, không đổi cờ occluded
+            # ở đây (fast-path đã quyết định trước khi gọi).
+            pass
         record.bbox = track.bbox
         record.center = _center(track.bbox)
         record.channel = channel
@@ -646,10 +739,12 @@ class GlobalIdentityManager:
         gid = self._next_global_id
         self._next_global_id += 1
         gallery: deque[np.ndarray] = deque(maxlen=self.config.gallery_size)
+        last_good: np.ndarray | None = None
         if embedding is not None:
             normalized = _normalize_embedding(embedding)
             if normalized is not None:
                 gallery.append(normalized)
+                last_good = normalized
         record = IdentityRecord(
             global_id=gid,
             gallery=gallery,
@@ -661,6 +756,7 @@ class GlobalIdentityManager:
             last_seen_step=self._step,
             last_seen_s=now_s,
             total_hits=1,
+            last_good_embedding=last_good,
             tracklet_keys={_tracklet_key(channel, track.track_id)},
             sightings={
                 channel: CameraSighting(
@@ -737,6 +833,88 @@ class GlobalIdentityManager:
             return True  # cross-channel pairs are decided by global matching.
         distance = _normalized_distance_to_sighting(bbox, sighting, frame_shape)
         return distance is not None and distance <= self.config.max_center_distance_ratio
+
+    def set_face_anchor(
+        self,
+        global_id: int,
+        employee_id: str,
+        score: float,
+        now_s: float | None = None,
+    ) -> bool:
+        """Khóa tạm thời GID vừa được face điểm cao xác nhận.
+
+        Trong TTL, body lạ muốn claim GID này phải vượt
+        ``named_floor_locked`` (cao hơn floor thường) và không được
+        reconnect thuần spatial khi mất embedding.
+        """
+        record = self._identities.get(global_id)
+        if record is None or not employee_id:
+            return False
+        record.face_anchor_employee = employee_id
+        record.face_anchor_score = float(score)
+        record.face_anchor_s = now_s
+        record.face_anchor_step = self._step
+        return True
+
+    def _is_face_locked(
+        self, record: IdentityRecord, now_s: float | None
+    ) -> bool:
+        if not record.face_anchor_employee:
+            return False
+        # Chỉ khóa đúng employee đang giữ (tránh khóa nhầm sau unbind).
+        if (
+            record.employee_id is not None
+            and record.face_anchor_employee != record.employee_id
+        ):
+            return False
+        if now_s is not None and record.face_anchor_s is not None:
+            return (now_s - record.face_anchor_s) <= max(
+                0.0, self.config.face_anchor_ttl_s
+            )
+        return (self._step - record.face_anchor_step) <= max(
+            1, self.config.face_anchor_ttl_steps
+        )
+
+    def _effective_appearance_floor(
+        self, record: IdentityRecord, now_s: float | None
+    ) -> float:
+        cfg = self.config
+        if self._is_face_locked(record, now_s):
+            return max(cfg.min_appearance_similarity,
+                       cfg.named_appearance_floor,
+                       cfg.named_floor_locked)
+        if record.employee_id:
+            return max(cfg.min_appearance_similarity,
+                       cfg.named_appearance_floor)
+        return cfg.min_appearance_similarity
+
+    def _is_occlusion_suspect(
+        self,
+        track: Track,
+        tracks: list[Track],
+        record: IdentityRecord,
+        frame_shape: tuple[int, ...] | None = None,
+        channel: str | None = None,
+    ) -> bool:
+        """Nghi che khuất khi box đè nhau hoặc area jump bất thường."""
+        cfg = self.config
+        # 1. Cùng frame có box khác IoU cao với track hiện tại (2 người đè).
+        for other in tracks:
+            if other.track_id == track.track_id:
+                continue
+            iou = _bbox_iou(track.bbox, other.bbox)
+            if iou >= cfg.occlusion_iou_threshold:
+                return True
+        # 2. Diện tích box đổi đột ngột so với sighting cũ (A bị B che nửa).
+        lookup = channel or record.channel
+        sighting = record.sightings.get(lookup) if lookup else None
+        if sighting is not None and sighting.bbox is not None:
+            old_area = max(1.0, sighting.bbox.area)
+            new_area = max(1.0, track.bbox.area)
+            jump = abs(new_area - old_area) / old_area
+            if jump >= cfg.occlusion_area_jump_ratio:
+                return True
+        return False
 
     def _missing_amount(self, record: IdentityRecord, now_s: float | None) -> float:
         if now_s is not None and record.last_seen_s is not None:
@@ -846,6 +1024,16 @@ def _bbox_intersection(left: BoundingBox, right: BoundingBox) -> float:
     return max(0.0, min(left.x2, right.x2) - max(left.x1, right.x1)) * max(
         0.0, min(left.y2, right.y2) - max(left.y1, right.y1)
     )
+
+
+def _bbox_iou(left: BoundingBox, right: BoundingBox) -> float:
+    intersection = _bbox_intersection(left, right)
+    if intersection <= 0:
+        return 0.0
+    union = left.area + right.area - intersection
+    if union <= 0:
+        return 0.0
+    return intersection / union
 
 
 def _normalize_embedding(embedding: np.ndarray | None) -> np.ndarray | None:

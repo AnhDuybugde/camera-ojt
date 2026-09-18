@@ -426,8 +426,10 @@ def parse_args() -> argparse.Namespace:
                         help="Duong dan voice script (mac dinh scripts/halinh_assistant.py).")
     parser.add_argument("--halinh-restarts", type=int, default=3,
                         help="So lan tu restart voice khi crash (mac dinh 3).")
-    parser.add_argument("--halinh-cmd-model", default="medium",
-                        help="Model STT vong nghe lenh cua voice (medium/small).")
+    parser.add_argument("--halinh-wake-model", default="zipformer",
+                        help="Model STT vong cho wake 'Ha Linh oi' (zipformer/small/tiny).")
+    parser.add_argument("--halinh-cmd-model", default="zipformer",
+                        help="Model STT vong nghe lenh cua voice (zipformer/medium/small).")
     parser.add_argument("--halinh-channel", type=int, default=None,
                         help="Kenh loa P2P cho Ha Linh (mac dinh p2p_channel trong config).")
     parser.add_argument(
@@ -1077,6 +1079,12 @@ def main() -> None:
             same_camera_reconnect_s=identity_cfg.same_camera_reconnect_s,
             min_appearance_similarity=identity_cfg.min_appearance_similarity,
             named_appearance_floor=identity_cfg.named_appearance_floor,
+            named_floor_locked=identity_cfg.named_floor_locked,
+            face_anchor_ttl_s=identity_cfg.face_anchor_ttl_s,
+            face_anchor_ttl_steps=identity_cfg.face_anchor_ttl_steps,
+            occlusion_iou_threshold=identity_cfg.occlusion_iou_threshold,
+            occlusion_area_jump_ratio=identity_cfg.occlusion_area_jump_ratio,
+            gallery_append_min_sim=identity_cfg.gallery_append_min_sim,
             active_duplicate_similarity=identity_cfg.active_duplicate_similarity,
             tentative_min_hits=identity_cfg.tentative_min_hits,
             temp_lost_s=identity_cfg.temp_lost_s,
@@ -1625,7 +1633,8 @@ def main() -> None:
         if not Path(halinh_script).is_file():
             print(f"[HaLinh-sup] khong thay {halinh_script}, bo qua voice.")
         else:
-            halinh_extra = ["--cmd-model", str(args.halinh_cmd_model)]
+            halinh_extra = ["--wake-model", str(args.halinh_wake_model),
+                              "--cmd-model", str(args.halinh_cmd_model)]
             if args.halinh_channel is not None:
                 halinh_extra += ["--channel", str(args.halinh_channel)]
             halinh_stop = threading.Event()
@@ -1723,8 +1732,8 @@ def main() -> None:
                         min_gap_s=float(getattr(
                             voice_cfg, "wave_min_gap_s", 0.08)),
                         cooldown_s=min(_wave_cooldown, _unknown_cooldown),
-                        required_fingers=int(getattr(
-                            voice_cfg, "wave_required_fingers", 5)),
+                        required_fingers=float(getattr(
+                            voice_cfg, "wave_required_fingers", 4.5)),
                         palm_confirm_frames=int(getattr(
                             voice_cfg, "wave_palm_confirm_frames", 2)),
                         palm_release_frames=int(getattr(
@@ -1733,7 +1742,7 @@ def main() -> None:
                     )
                 elif _mode == "palm" and hand_detector is not None:
                     gesture_detectors[_ch] = OpenPalmDetector(
-                        required_fingers=int(getattr(
+                        required_fingers=float(getattr(
                             voice_cfg, "palm_required_fingers", 4)),
                         cooldown_s=min(_palm_cooldown, _unknown_cooldown),
                         confirm_frames=int(getattr(
@@ -1767,6 +1776,7 @@ def main() -> None:
                     retry_delay=voice_cfg.p2p_retry_delay_s,
                     sample_rate=voice_cfg.p2p_sample_rate,
                     volume=voice_cfg.p2p_volume,
+                    bind_port=int(getattr(voice_cfg, 'p2p_bind_port', 18086)),
                 )
             elif voice_cfg.backend == "imou_web":
                 from camera_tracking.voice.imou_bridge import (
@@ -1868,6 +1878,18 @@ def main() -> None:
             except (AttributeError, TypeError, ValueError):
                 return int(voice_cfg.p2p_channel)
         return int(voice_cfg.p2p_channel)
+
+    def _ha_turn_active() -> bool:
+        """True khi Ha Linh dang hoi-dap -> chao nhuong turn, khoi noi chong.
+
+        Doc file khoa TTL (tu het han neu subprocess crash). Voice khong
+        bao gio duoc lam chet pipeline nen moi loi deu -> False.
+        """
+        try:
+            from camera_tracking.voice.turn_guard import turn_active
+            return bool(turn_active())
+        except Exception:  # noqa: BLE001
+            return False
 
     face_greet_on_by_channel: dict[str, bool] = {
         _ch: _face_greet_enabled(_ch) for _ch in ("A", "B")
@@ -2054,6 +2076,13 @@ def main() -> None:
             if not manager.bind_employee(identity_gid, employee_id):
                 print(f"[Identity conflict] refused {employee_id} -> G{identity_gid}")
                 return
+            # Face anchor: GID vua duoc face diem cao xac nhan -> khoa tam
+            # thoi de chong B cuop khi che A hoan toan (xem global_identity).
+            try:
+                manager.set_face_anchor(
+                    identity_gid, employee_id, float(match.score), now_s)
+            except (AttributeError, TypeError, ValueError):
+                pass
             if face_worker is not None:
                 face_worker.mark_known(identity_gid, now_s, channel)
             gid_to_score[identity_gid] = max(
@@ -2086,7 +2115,8 @@ def main() -> None:
             _focus_gid = foreground_by_channel.get(channel)
             _is_foreground = _focus_gid in (raw_gid, identity_gid)
             if (face_greet_on_by_channel.get(channel, face_greet_on)
-                    and greeter is not None and _is_foreground):
+                    and greeter is not None and _is_foreground
+                    and not _ha_turn_active()):
                 try:
                     _spk = _speaker_channel(channel)
                     _guest_age: float | None = None
@@ -2954,12 +2984,12 @@ def main() -> None:
                             if now_s < _due:
                                 continue
                             pending_unknown_greet.pop(_ug_gid, None)
-                            if greeter.face_greet(
+                            if (not _ha_turn_active() and greeter.face_greet(
                                 day=_day, person_id=None,
                                 display_name=None,
                                 now_s=now_s, global_id=_ug_gid,
                                 channel=_spk,
-                            ):
+                            )):
                                 _note_event(
                                     event="FACE_GREET", global_id=_ug_gid,
                                     channel=_ch, at_iso=_iso,
@@ -3113,12 +3143,15 @@ def main() -> None:
                                         continue
                                     # Yeu cau chu dong (vay tay): phat ngay khi
                                     # loa ranh, khong cooldown, chong spam 5s.
-                                    if greeter.face_greet(
-                                        day=day_str, person_id=_pid,
-                                        display_name=_name, now_s=now_s,
-                                        global_id=_gid, channel=_spk,
-                                        proactive=True,
-                                    ):
+                                    # Nhuong turn Ha Linh: dang hoi-dap thi bo
+                                    # qua, tranh 2 loa noi chong nhau.
+                                    if (not _ha_turn_active()
+                                            and greeter.face_greet(
+                                                day=day_str, person_id=_pid,
+                                                display_name=_name, now_s=now_s,
+                                                global_id=_gid, channel=_spk,
+                                                proactive=True,
+                                            )):
                                         _note_event(
                                             event=("WAVE" if _mode == "wave" else "PALM"),
                                             global_id=_gid,
@@ -3135,8 +3168,12 @@ def main() -> None:
                                         # Hiem (don thread): dat cho that bai do race
                                         # voi worker hoan reservation.
                                         palm_dbg_at[_gid] = now_s
-                                        print(f"[{_gesture_label}][{_ch}] G{_gid} loa vua ban, "
-                                              f"vẫy lại sau ít giây")
+                                        if _ha_turn_active():
+                                            print(f"[{_gesture_label}][{_ch}] G{_gid} dang "
+                                                  f"hoi-dap Ha Linh, bo qua chao vẫy")
+                                        else:
+                                            print(f"[{_gesture_label}][{_ch}] G{_gid} loa vua ban, "
+                                                  f"vẫy lại sau ít giây")
 
             # --- Live view: annotated Global-ID frames for window/stream ---
             need_vis = args.display or stream_on

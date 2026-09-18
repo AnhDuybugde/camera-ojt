@@ -268,7 +268,7 @@ class WaveDetector:
     min_amplitude: float = 0.06
     min_gap_s: float = 0.08
     cooldown_s: float = 30.0
-    required_fingers: int = 5
+    required_fingers: float = 5
     palm_confirm_frames: int = 2
     palm_release_frames: int = 5
     max_hand_center_y: float = 0.65
@@ -496,31 +496,60 @@ def count_extended_fingers(landmarks: list[tuple[float, float]]) -> int:
         return 0
 
 
-def is_open_palm(landmarks: list[tuple[float, float]], required: int = 5) -> bool:
-    """True khi thấy bàn tay dựng, xoè đủ ngón.
+def _clamp01(value: float) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return 0.0
 
-    Dùng hình học tương đối với cổ tay nên bàn tay vẫn hợp lệ khi người dùng
-    nghiêng tay trong lúc vẫy; không ép các ngón phải thẳng đứng trên ảnh.
+
+def open_palm_score(landmarks: list[tuple[float, float]]) -> float:
+    """Diem mo ban tay 0..1 (trung binh diem duoi tung ngon / 5).
+
+    Moi ngon cham lien tuc thay vi nhi phan: ti le khoang cach
+    tip/pip = 1.0 (gap) -> 0 diem, >= nguong cu (1.08 ngon dai / 1.03
+    ngon cai) -> 1 diem. Ngon gan-du-nguong van duoc diem mot phan
+    thay vi 0 nhu truoc, chong truong hop thieu 1 chut la rot.
+    """
+    if landmarks is None or len(landmarks) < 21:
+        return 0.0
+    try:
+        wrist = landmarks[0]
+        total = 0.0
+        for tip, pip in ((8, 6), (12, 10), (16, 14), (20, 18)):
+            denom = _dist(landmarks[pip], wrist)
+            if denom <= 1e-9:
+                continue
+            ratio = _dist(landmarks[tip], wrist) / denom
+            total += _clamp01((ratio - 1.0) / 0.08)
+        denom = _dist(landmarks[3], wrist)
+        if denom > 1e-9:
+            ratio = _dist(landmarks[4], wrist) / denom
+            base = _clamp01((ratio - 1.0) / 0.03)
+            sep = abs(float(landmarks[4][0]) - float(landmarks[5][0]))
+            total += base * _clamp01((sep - 0.02) / 0.02)
+        return _clamp01(total / 5.0)
+    except (IndexError, TypeError, ValueError):
+        return 0.0
+
+
+def is_open_palm(
+    landmarks: list[tuple[float, float]],
+    required: float = 5,
+) -> bool:
+    """True khi diem mo ban tay dat nguong (mac dinh 5/5 = 100%).
+
+    required la so ngon-tuong-duong (float): 4.5 = 90%, cho phep 1 ngon
+    gan-du (VD kheo tay hoi cong) van qua. Dung hinh hoc tuong doi voi
+    co tay nen ban tay van hop le khi nghieng trong luc vay.
     """
     if landmarks is None or len(landmarks) < 21:
         return False
     try:
-        wrist = landmarks[0]
-        long_pairs = ((8, 6), (12, 10), (16, 14), (20, 18))
-        # Đếm theo khoảng cách tương đối, bất biến với góc xoay của bàn tay.
-        long_extended = sum(
-            _dist(landmarks[tip], wrist) > _dist(landmarks[pip], wrist) * 1.08
-            for tip, pip in long_pairs
-        )
-        thumb_extended = (
-            _dist(landmarks[4], wrist) > _dist(landmarks[3], wrist) * 1.03
-            and abs(landmarks[4][0] - landmarks[5][0]) >= 0.04
-        )
-        if long_extended + int(thumb_extended) < max(1, required):
-            return False
-        return True
-    except (IndexError, TypeError, ValueError):
+        need = max(0.0, min(5.0, float(required)))
+    except (TypeError, ValueError):
         return False
+    return bool(open_palm_score(landmarks) * 5.0 >= need)
 
 
 def is_front_facing_hand(
@@ -582,7 +611,7 @@ class OpenPalmDetector:
     hạ tay đủ số frame release rồi giơ lại; giữ nguyên bàn tay không lặp greet.
     """
 
-    required_fingers: int = 5
+    required_fingers: float = 5
     cooldown_s: float = 30.0
     confirm_frames: int = 4
     release_frames: int = 2
@@ -673,6 +702,7 @@ __all__ = [
     "OpenPalmDetector",
     "WaveDetector",
     "count_extended_fingers",
+    "open_palm_score",
     "count_reversals",
     "is_front_facing_hand",
     "is_hand_near_face",

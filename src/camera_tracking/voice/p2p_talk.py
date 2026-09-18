@@ -480,6 +480,9 @@ class ImouP2PTalkOutput:
         sample_rate: int = 16000,
         volume: float = 1.0,
         persistent: bool = True,
+        bind_host: str = "127.0.0.1",
+        bind_port: int = 18086,
+        establish_timeout: float = 45.0,
     ) -> None:
         self.creds = creds or ImouP2PCredentials.from_env()
         self.channel = int(channel)
@@ -489,7 +492,18 @@ class ImouP2PTalkOutput:
         self.sample_rate = int(sample_rate)
         self.volume = max(0.0, min(1.0, float(volume)))
         self.persistent = bool(persistent)
-        self._tunnel = PersistentP2PTunnel(self.creds) if self.persistent else None
+        self.bind_host = str(bind_host)
+        self.bind_port = int(bind_port)
+        self._tunnel = (
+            PersistentP2PTunnel(
+                self.creds,
+                bind_host=self.bind_host,
+                bind_port=self.bind_port,
+                establish_timeout=float(establish_timeout),
+            )
+            if self.persistent
+            else None
+        )
         self._aac_cache: dict[tuple, bytes] = {}
         self._aac_lock = threading.Lock()
 

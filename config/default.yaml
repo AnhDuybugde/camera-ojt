@@ -16,7 +16,7 @@ detection:
   # Recall-first nhưng bớt ghost: 0.25 đủ cho ByteTrack low-conf nối lại.
   # 0.10 cũ đẻ quá nhiều box yếu -> ghost GID.
   confidence_threshold: 0.25
-  nms_iou_threshold: 0.85
+  nms_iou_threshold: 0.9
   # Loại thêm bbox nhỏ nằm gần như hoàn toàn trong bbox lớn.
   nested_box_containment_threshold: 0.85
   person_class_id: 0
@@ -57,6 +57,17 @@ identity:
   same_camera_reconnect_s: 2.0
   min_appearance_similarity: 0.70
   named_appearance_floor: 0.70
+  # Face anchor: GID vua duoc face diem cao khoa tam 10s, body la muon claim
+  # phai vuot 0.80 + khong duoc reconnect thuan spatial khi mat embedding.
+  named_floor_locked: 0.80
+  face_anchor_ttl_s: 10.0
+  face_anchor_ttl_steps: 120
+  # Occlusion: IoU 2 box cung frame >=0.40 hoac area jump >=30% -> fast-path
+  # phai verify appearance thay vi giu mu (chong B cuop GID khi che A).
+  occlusion_iou_threshold: 0.40
+  occlusion_area_jump_ratio: 0.30
+  # Gallery hygiene: embedding moi <0.60 so voi gallery thi khong append.
+  gallery_append_min_sim: 0.60
   active_duplicate_similarity: 0.90
   temp_lost_s: 10.0
   long_lost_s: 120.0
@@ -244,7 +255,11 @@ voice:
   p2p_retry_delay_s: 5.0
   p2p_sample_rate: 16000
   # 0.0=im lang, 0.2=nho, 0.5=nua am luong, 1.0=giu nguyen file TTS.
-  p2p_volume: 1.0
+  p2p_volume: 0.2
+  # Tunnel P2P rieng: greeter (tracking) 18086, Ha Linh (subprocess) 18087.
+  # Chung port se bind-fail -> talk 25-70s.
+  p2p_bind_port: 18086
+  halinh_bind_port: 18087
   # WAV chao tao san (scripts/build_greeting_wavs.py, ZeroTTS).
   greeting_dir: output/voice_greetings
   zerotts_voice: maichi
@@ -264,7 +279,9 @@ voice:
   focus_switch_hold_s: 0.50
   focus_lost_grace_s: 1.00
   # Wave bat buoc: 5 ngon xoe -> giu palm activation -> lac qua lai.
-  wave_required_fingers: 5
+  # Cham theo diem lien tuc (90% = 4.5/5): 1 ngon gan-du van qua,
+  # khong rot oan nhu dem nhi phan 5/5 cu.
+  wave_required_fingers: 4.5
   wave_palm_confirm_frames: 2
   # Cho phep MediaPipe hut ngan khi ban tay dao huong/cheo canh; chi mau OPEN
   # moi duoc dem, nhung khong xoa ngay lich su cua mot cai vay dang dien ra.
