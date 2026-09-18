@@ -25,6 +25,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from camera_tracking.voice.speaker_guard import mark_speaker_busy
+
 
 def _phrase_key(text: str, voice: str) -> str:
     digest = hashlib.sha256(f"{voice}|{text}".encode()).hexdigest()[:16]
@@ -386,6 +388,12 @@ class VoiceGreeter:
                         self._inflight.discard(identity_key)
                     self._rollback(day, identity_key, enqueued_now_s, out_channel)
                     continue
+                # Half-duplex xuyen process: bao mic (Ha Linh) biet loa
+                # dang phat de bo frame, khoi dem hut wake vo ich.
+                try:
+                    mark_speaker_busy(path)
+                except Exception:  # noqa: BLE001 - guard chi la phu
+                    pass
                 try:
                     if self.output is not None:
                         if out_channel is None or not self._output_takes_channel():

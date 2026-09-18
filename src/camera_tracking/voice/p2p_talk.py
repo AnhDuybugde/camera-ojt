@@ -345,7 +345,9 @@ class PersistentP2PTunnel:
             return future.result(timeout=self.establish_timeout)
         except Exception as error:
             self._up = False
-            raise P2PTalkError(f"P2P tunnel establish failed: {error}") from error
+            detail = str(error) or type(error).__name__
+            raise P2PTalkError(
+                f"P2P tunnel establish failed: {detail}") from error
 
     async def _reap(self, task: asyncio.Task) -> None:
         try:
@@ -440,8 +442,8 @@ def _visualtalk_once(
         sample_rate=int(sample_rate),
         frame_ms=64,
         timeout=float(timeout),
-        attempts=1,
-        retry_delay=0.0,
+        attempts=2,
+        retry_delay=2.0,
         debug=False,
     )
 
@@ -491,8 +493,12 @@ class ImouP2PTalkOutput:
         self._aac_cache: dict[tuple, bytes] = {}
         self._aac_lock = threading.Lock()
 
-    def warmup(self) -> None:
-        """Mo san tunnel o nen (lan chao dau khong mat tien bat tay)."""
+    def warmup(self, *, raise_on_error: bool = False) -> None:
+        """Mo san tunnel o nen (lan chao dau khong mat tien bat tay).
+
+        raise_on_error=True: nem P2PTalkError thay vi chi in log (dung khi
+        caller muon cho den khi san sang that, vd tro ly Ni).
+        """
         if self._tunnel is None:
             return
         try:
@@ -500,6 +506,9 @@ class ImouP2PTalkOutput:
             print("[Voice:P2P] Duong truyen loa da san sang.")
         except Exception as error:  # noqa: BLE001 - se thu lai o lan chao dau
             print(f"[Voice:P2P] Warmup chua xong ({error}); se mo o lan chao dau.")
+            if raise_on_error:
+                detail = str(error) or type(error).__name__
+                raise P2PTalkError(f"P2P warmup failed: {detail}") from error
 
     def _convert_cached(self, audio_path: str | Path) -> bytes:
         src = Path(audio_path)
@@ -562,6 +571,8 @@ class ImouP2PTalkOutput:
                     sample_rate=self.sample_rate,
                     volume=self.volume,
                 )
+            print(f"[Voice:P2P] Phat xong {Path(audio_path).name} "
+                  f"({time.monotonic() - started:.1f}s).")
         except P2PTalkError as error:
             elapsed = time.monotonic() - started
             print(f"[Voice:P2P] Bo loi chao sau {elapsed:.1f}s: {error}")

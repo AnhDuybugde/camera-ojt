@@ -28,6 +28,7 @@ export default function PipelineControl() {
   const [busy, setBusy] = useState(false)
   const [imgsz, setImgsz] = useState('800')
   const [noFace, setNoFace] = useState(false)
+  const [script, setScript] = useState('scripts/run_workstate.py')
   const [msg, setMsg] = useState('')
 
   async function refresh() {
@@ -50,7 +51,7 @@ export default function PipelineControl() {
     setBusy(true)
     setMsg('')
     try {
-      const r = (await api('/api/start', { imgsz: Number(imgsz) || 800, no_face: noFace })) as {
+      const r = (await api('/api/start', { script, imgsz: Number(imgsz) || 800, no_face: noFace })) as {
         started: boolean
         reason?: string
         pid?: number
@@ -96,6 +97,13 @@ export default function PipelineControl() {
       ) : (
         <>
           <div className="control-row">
+            <label>
+              Pipeline:{' '}
+              <select value={script} onChange={(e) => setScript(e.target.value)} disabled={status?.running || busy}>
+                <option value="scripts/run_workstate.py">run_workstate.py — 2× Imou</option>
+                <option value="scripts/run_workstate_local.py">run_workstate_local.py — webcam + Hà Linh</option>
+              </select>
+            </label>
             <label>
               Model size:{' '}
               <select value={imgsz} onChange={(e) => setImgsz(e.target.value)} disabled={status?.running || busy}>

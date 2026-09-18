@@ -261,7 +261,7 @@ class VoiceConfig(StrictModel):
     p2p_attempts: int = Field(default=2, ge=1)
     p2p_retry_delay_s: float = Field(default=5.0, ge=0)
     p2p_sample_rate: int = Field(default=16000, ge=8000)
-    p2p_volume: float = Field(default=0.1, ge=0.0, le=1.0)
+    p2p_volume: float = Field(default=0.3, ge=0.0, le=1.0)
     # WAV chao tao san bang ZeroTTS (scripts/build_greeting_wavs.py):
     # manifest.json anh xa nguyen van cau chao -> file wav.
     greeting_dir: Path = Path("output/voice_greetings")

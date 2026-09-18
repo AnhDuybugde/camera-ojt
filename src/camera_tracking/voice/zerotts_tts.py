@@ -24,12 +24,66 @@ DEFAULT_MODEL = "zeroweight-ai/ZeroTTS"
 DEFAULT_VOICE = "maichi"
 
 
+def _expose_nvidia_libs() -> None:
+    """Dua lib CUDA/cuDNN di kem torch (pip nvidia-*) vao LD_LIBRARY_PATH.
+
+    onnxruntime nap CUDA qua dlopen nen set os.environ truoc khi tao
+    session la du (khong can export tay ngoai shell). Chi prepend, khong
+    ghi de, that bai thi im lang (fallback CPU o tang goi).
+    """
+    import os
+    import sys
+
+    try:
+        roots = [Path(sys.prefix) / "lib",
+                  Path(sys.prefix) / "lib64",
+                  Path(sys.prefix) / "lib" / "python3.10" / "site-packages"]
+        extra = [str(p) for root in roots for p in
+                 [root / "nvidia" / name / "lib" for name in (
+                     "cudnn", "cuda_runtime", "cublas", "cufft",
+                     "curand", "cusolver", "cusparse", "nvjitlink")]
+                 if p.is_dir()]
+        if not extra:
+            return
+        current = os.environ.get("LD_LIBRARY_PATH", "")
+        have = set(current.split(":")) if current else set()
+        os.environ["LD_LIBRARY_PATH"] = ":".join(
+            extra + ([current] if current and current not in have else []))
+        # tren mot so may, dlopen bo qua LD_LIBRARY_PATH set luc runtime:
+        # nap thang cac lib NVIDIA bang duong dan tuyet doi de phien
+        # onnxruntime CUDA mo sau thay san (that bai thi im lang).
+        try:
+            import ctypes
+
+            for libdir in extra:
+                for soname in (
+                    "libcudart.so.12", "libcublasLt.so.12", "libcublas.so.12",
+                    "libcudnn.so.9", "libcufft.so.11", "libcurand.so.10",
+                    "libcusolver.so.11", "libcusparse.so.12",
+                ):
+                    candidate = Path(libdir) / soname
+                    if candidate.is_file():
+                        try:
+                            ctypes.CDLL(str(candidate))
+                        except OSError:
+                            pass
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+
 @dataclass
 class ZeroTTSBackend:
-    """Lazy wrapper quanh ``zerotts.ZeroTTS`` (CPU, 48 kHz)."""
+    """Lazy wrapper quanh ``zerotts.ZeroTTS`` (48 kHz).
+
+    device="cuda" dung CUDAExecutionProvider (ONNX) khi co GPU,
+    fallback CPU khi khong co. Giu 1 instance cho ca process (warmup 1 lan).
+    """
 
     model: str = DEFAULT_MODEL
     voice: str = DEFAULT_VOICE
+    device: str = "cpu"
     _tts: object = field(default=None, init=False, repr=False)
 
     def _load(self):  # type: ignore[no-untyped-def]
@@ -41,7 +95,18 @@ class ZeroTTSBackend:
                     "zerotts chua cai. Chay: python -m pip install zerotts "
                     "(lan dau can mang de tai weights ~900MB)"
                 ) from error
-            self._tts = ZeroTTS.from_pretrained(self.model)
+            providers = ["CPUExecutionProvider"]
+            if str(self.device).lower() in ("cuda", "gpu"):
+                _expose_nvidia_libs()
+                try:
+                    import onnxruntime as ort
+
+                    available = set(ort.get_available_providers())
+                    wanted = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+                    providers = [p for p in wanted if p in available] or providers
+                except ImportError:
+                    pass
+            self._tts = ZeroTTS.from_pretrained(self.model, providers=providers)
         return self._tts
 
     def list_voices(self) -> list[str]:

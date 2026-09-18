@@ -1,4 +1,4 @@
-"""Demo tracking Global ID 2 channel IMOU.
+"""Demo tracking Global ID 2 channel IMOU + voice Ha Linh (mic/loa camera).
 
 Moi channel chay doc lap: YOLO(26s) -> ByteTrack (tracking ngan han:
 motion prediction, IoU matching, data association, track buffer).
@@ -10,9 +10,16 @@ Lop business theo channel (ChannelBusinessTracker) tra loi rieng
 "nguoi do dang lam gi" (WORKING/AWAY_TEMP/POSSIBLY_OUT/RETURNING) va khong
 duoc phep anh huong toi ID.
 
+Am thanh HOAN TOAN camera IMOU (doi lap voi run_workstate_local.py):
+  * Greet vay tay/palm + face-trigger phat ra loa camera (backend imou_p2p).
+  * Voice Ha Linh medium-only (scripts/halinh_assistant.py) chay subprocess
+    rieng, mic RTSP camera + loa camera P2P, tu restart khi crash.
+  * Da bo hello imou / STT small.
+
 Chay:
   python scripts/run_workstate.py --config config/default.yaml --display
   python scripts/run_workstate.py --source-a 0 --source-b data/samples/hallway.mp4 --display
+  python scripts/run_workstate.py --no-halinh  # tat voice Ha Linh
 
 RTSP IMOU lay tu .env (IMOU_IP/USER/PASSWORD) neu khong truyen --source.
 Nhan 'q' hoac ESC de thoat.
@@ -25,6 +32,7 @@ import binascii
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -297,6 +305,94 @@ def low_latency_capture(
     return latest
 
 
+def execute_voice_command(
+    cmd: dict,
+    *,
+    greeter=None,
+    find_person=None,
+    save_snapshot=None,
+    day: str = "",
+    now_s: float = 0.0,
+) -> tuple[bool, str]:
+    """Thuc thi lenh tu voice (chao/chup anh), tra (ok, message de noi lai)."""
+    action = str(cmd.get("action") or "").strip().lower()
+    if action == "greet":
+        name = str(cmd.get("name") or "").strip()
+        if greeter is None:
+            return False, "loa chào chưa sẵn sàng."
+        found = find_person(name) if (find_person and name) else None
+        if found is None:
+            return False, f"Không thấy {name or 'người này'} trong phòng."
+        person_id, display_name = found
+        try:
+            ok = greeter.wave_greet(
+                day=day, person_id=person_id, display_name=display_name,
+                now_s=now_s, proactive=True)
+        except Exception as error:  # noqa: BLE001
+            return False, f"chào {display_name} lỗi: {error}"
+        return ok, (f"Đã chào {display_name}."
+                    if ok else f"{display_name} vừa được chào rồi.")
+    if action == "snapshot":
+        if save_snapshot is None:
+            return False, "camera chưa sẵn sàng chụp."
+        try:
+            path = save_snapshot(str(cmd.get("camera") or "A"))
+        except Exception as error:  # noqa: BLE001
+            return False, f"chụp ảnh lỗi: {error}"
+        if not path:
+            return False, "chụp ảnh thất bại (chưa có khung hình)."
+        return True, f"Đã chụp ảnh, lưu tại {path}."
+    return False, f"lệnh {action or '?'} chưa hỗ trợ."
+
+
+def supervise_halinh(
+    script: str | Path,
+    stop_event: threading.Event,
+    max_restarts: int = 3,
+    extra_args: list[str] | None = None,
+) -> None:
+    """Chay voice Ha Linh BAN CAMERA subprocess, tu restart khi crash.
+
+    Dung khi pipeline dung (stop_event) hoac het luot restart. Log voice
+    giu tag [HaLinh]/[HaLinh-sup] rieng de phan biet voi log tracking.
+    Mic RTSP camera + loa camera P2P (doi lap voi ban _local).
+    """
+    restarts = 0
+    cmd = [sys.executable, "-u", str(script), *(extra_args or [])]
+    while not stop_event.is_set():
+        print(f"[HaLinh-sup] khoi dong voice ({' '.join(cmd)})...", flush=True)
+        try:
+            proc = subprocess.Popen(cmd)
+        except OSError as error:
+            print(f"[HaLinh-sup] khong chay duoc voice: {error}", flush=True)
+            return
+        while proc.poll() is None:
+            if stop_event.wait(timeout=1.0):
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=10.0)
+                except subprocess.SubprocessError:
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                print("[HaLinh-sup] voice da dung theo pipeline.", flush=True)
+                return
+        code = proc.returncode
+        if stop_event.is_set():
+            return
+        restarts += 1
+        print(f"[HaLinh-sup] voice thoat (code={code}) lan {restarts}/"
+              f"{max(0, max_restarts) + 1}.", flush=True)
+        if restarts > max(0, max_restarts):
+            print("[HaLinh-sup] het luot restart, tracking van chay.", flush=True)
+            return
+        time.sleep(2.0)
+
+
 def imou_url(channel: int, subtype: int = 1) -> str | None:
     ip = os.getenv("IMOU_IP", "")
     user = os.getenv("IMOU_USER", "")
@@ -317,11 +413,23 @@ def source_label(source: int | str) -> str:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Tracking ID 2 camera (YOLO + ByteTrack + Re-ID).")
+    parser = argparse.ArgumentParser(description="Tracking ID 2 camera + voice Ha Linh camera (YOLO + ByteTrack + Re-ID).")
     parser.add_argument("--config", type=Path, default=_PROJECT_ROOT / "config/default.yaml",
                         help="Duong dan config (mac dinh: config/default.yaml cua repo, khoi can truyen).")
     parser.add_argument("--source-a", default=None, help="Override camera A.")
     parser.add_argument("--source-b", default=None, help="Override camera B.")
+    parser.add_argument("--halinh", dest="halinh",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="Luon bat voice Ha Linh BAN CAMERA (mic RTSP + loa P2P) "
+                             "song song tracking. Mac dinh bat, tat bang --no-halinh.")
+    parser.add_argument("--halinh-script", default=None,
+                        help="Duong dan voice script (mac dinh scripts/halinh_assistant.py).")
+    parser.add_argument("--halinh-restarts", type=int, default=3,
+                        help="So lan tu restart voice khi crash (mac dinh 3).")
+    parser.add_argument("--halinh-cmd-model", default="medium",
+                        help="Model STT vong nghe lenh cua voice (medium/small).")
+    parser.add_argument("--halinh-channel", type=int, default=None,
+                        help="Kenh loa P2P cho Ha Linh (mac dinh p2p_channel trong config).")
     parser.add_argument(
         "--model",
         help="Override YOLO weights from config, for example yolo26s.pt.",
@@ -392,9 +500,9 @@ def parse_args() -> argparse.Namespace:
                         help="Chi gio tay moi chao; tat chao tu dong khi nhan dien mat "
                         "(mac dinh da palm-only).")
     parser.add_argument("--voice-trigger", dest="voice_trigger",
-                        action=argparse.BooleanOptionalAction, default=True,
-                        help="OR voi gio tay: ai noi hello/xin chao truoc mic camera "
-                        "cung duoc chao. Mac dinh bat, tat bang --no-voice-trigger.")
+                        action=argparse.BooleanOptionalAction, default=False,
+                        help="DEPRECATED (da bo hello imou): giu de tuong thich CLI, "
+                        "khong con tac dung.")
     parser.add_argument("--identity-log", type=Path, default=None,
                         help="Write identity predictions CSV for replay evaluation.")
     parser.add_argument("--metrics-log-s", type=float, default=0.0,
@@ -1251,6 +1359,8 @@ def main() -> None:
     room_status_now: dict = {}
     last_flush_s = 0.0
     last_metrics_log_s = 0.0
+    last_runtime_write_s = 0.0
+    runtime_prev = {"t": 0.0, "frame": 0}
     # Unknown GID -> canonical (identified) GID after face reconcile.
     gid_alias: dict[int, int] = {}
     reconciler = IdentityReconciler(threshold=face_threshold)
@@ -1503,6 +1613,30 @@ def main() -> None:
     ))
 
     print("Dang chay tracking Global ID. Nhan 'q' hoac ESC de thoat.")
+    # Voice Ha Linh BAN CAMERA luon bat song song tracking (subprocess
+    # rieng, tu restart khi crash). Mic RTSP camera + loa camera P2P
+    # (doi lap voi ban _local dung mic/loa laptop). Tat bang --no-halinh.
+    # Hello imou + STT small da bo: chi medium.
+    halinh_stop: threading.Event | None = None
+    halinh_thread: threading.Thread | None = None
+    if args.halinh:
+        halinh_script = (args.halinh_script
+                         or str(_PROJECT_ROOT / "scripts" / "halinh_assistant.py"))
+        if not Path(halinh_script).is_file():
+            print(f"[HaLinh-sup] khong thay {halinh_script}, bo qua voice.")
+        else:
+            halinh_extra = ["--cmd-model", str(args.halinh_cmd_model)]
+            if args.halinh_channel is not None:
+                halinh_extra += ["--channel", str(args.halinh_channel)]
+            halinh_stop = threading.Event()
+            halinh_thread = threading.Thread(
+                target=supervise_halinh,
+                args=(halinh_script, halinh_stop, args.halinh_restarts,
+                      halinh_extra),
+                name="halinh-supervisor",
+                daemon=True,
+            )
+            halinh_thread.start()
     start = time.time()
     metrics = StageMetrics()
     frame_idx = 0
@@ -1701,104 +1835,14 @@ def main() -> None:
             if voice_bridge is not None:
                 voice_bridge.close()
                 voice_bridge = None
-    # Voice-trigger (OR voi palm): mic camera nghe hello/xin chao -> greet
-    # nguoi gan nhat. Mac dinh BAT (tat bang --no-voice-trigger).
-    # Thread nen RTSP + faster-whisper; loi dep thi tu disable, giu palm.
-    import threading as _voice_th
-
+    # Voice-trigger "hello imou" DA BO (user khong dung): chi giu greet
+    # vay tay/palm + face-trigger. Khong mo mic RTSP, khong STT small,
+    # khong inhibit 12s. Flag --voice-trigger giu de tuong thich CLI
+    # nhung khong con tac dung.
     voice_trigger = None
     voice_listener = None
     voice_stop = None
-    trigger_on = bool(
-        voice_on and greeter is not None
-        and (args.voice_trigger or getattr(voice_cfg, "voice_trigger_enabled", False))
-    )
-    if trigger_on:
-        try:
-            from camera_tracking.voice.voice_trigger import (
-                VoiceTrigger,
-                load_wake_phrases,
-            )
-            from camera_tracking.voice.rtsp_voice_listener import build_listener_from_env
-
-            # Cụm gọi lập trình sẵn (config/voice_triggers/*.yaml) + cụm bổ
-            # sung trong config. Thêm file yaml là có cụm mới, khỏi sửa code.
-            _wake_phrases, _wake_fillers, _wake_max_fill = load_wake_phrases(
-                getattr(voice_cfg, "trigger_phrase_dir", "config/voice_triggers"),
-                extra_words=tuple(getattr(voice_cfg, "voice_trigger_words", []) or ()),
-            )
-            # P6: inhibit phủ đuôi vang thật = câu chào dài nhất + đuôi dội.
-            _longest_greet = 0.0
-            try:
-                import wave as _wave_mod
-
-                for _wav in (phrase_files or {}).values():
-                    _p = Path(_wav)
-                    if _p.suffix.lower() != ".wav":
-                        continue
-                    try:
-                        with _wave_mod.open(str(_p), "rb") as _w:
-                            _longest_greet = max(
-                                _longest_greet,
-                                _w.getnframes() / max(1, _w.getframerate()),
-                            )
-                    except (OSError, EOFError, _wave_mod.Error):
-                        continue
-            except (ImportError, AttributeError, TypeError, ValueError):
-                _longest_greet = 0.0
-            _inhibit_s = max(
-                float(getattr(voice_cfg, "voice_trigger_inhibit_s", 4.0)),
-                _longest_greet + float(getattr(
-                    voice_cfg, "voice_trigger_echo_tail_s", 2.0)),
-            )
-            voice_trigger = VoiceTrigger(
-                trigger_words=_wake_phrases,
-                window_s=float(getattr(voice_cfg, "voice_trigger_window_s", 5.0)),
-                inhibit_s=_inhibit_s,
-                fillers=_wake_fillers,
-                max_fillers=_wake_max_fill,
-            )
-            voice_stop = _voice_th.Event()
-            voice_listener = build_listener_from_env(
-                voice_trigger,
-                channel=int(getattr(voice_cfg, "voice_listen_channel", 1)),
-                subtype=int(getattr(voice_cfg, "voice_listen_subtype", 1)),
-                fw_model_name=str(getattr(voice_cfg, "voice_stt_model", "small")),
-                fw_lang=str(getattr(voice_cfg, "voice_stt_lang", "vi")),
-                vad_threshold=float(getattr(voice_cfg, "voice_vad_threshold", 0.012)),
-                min_seg_rms=float(getattr(voice_cfg, "voice_min_seg_rms", 0.008)),
-                max_no_speech_prob=float(getattr(
-                    voice_cfg, "voice_max_no_speech_prob", 0.40)),
-                min_avg_logprob=float(getattr(
-                    voice_cfg, "voice_min_avg_logprob", -0.70)),
-                vad_floor_factor=float(getattr(
-                    voice_cfg, "voice_vad_floor_factor", 3.0)),
-                vad_floor_min=float(getattr(
-                    voice_cfg, "voice_vad_floor_min", 0.02)),
-                vad_ceiling=float(getattr(
-                    voice_cfg, "voice_vad_ceiling", 0.15)),
-                snr_min_db=float(getattr(
-                    voice_cfg, "voice_snr_min_db", 10.0)),
-                stop_event=voice_stop,
-                dump_dir=str(getattr(
-                    voice_cfg, "voice_dump_dir", "") or "") or None,
-            )
-            if voice_listener is None:
-                voice_trigger = None
-                trigger_on = False
-            else:
-                # P2P co the bat tay lau hon inhibit ban dau. Dat lai inhibit
-                # sau khi am thanh da phat xong de mic khong nghe chinh loa.
-                greeter.on_spoken = lambda _text: voice_trigger.set_inhibit()
-                voice_listener.start()
-                print(f"VoiceTrigger: OR vẫy tay | cụm gọi {sorted(_wake_phrases)} "
-                      f"(window {voice_trigger.window_s:.0f}s, inhibit {_inhibit_s:.0f}s, "
-                      f"STT {voice_cfg.voice_stt_model}/{voice_cfg.voice_stt_lang}).")
-        except (ImportError, OSError, RuntimeError, ValueError) as error:
-            print(f"VoiceTrigger disabled ({error}); giu palm-only.")
-            voice_trigger = None
-            voice_listener = None
-            trigger_on = False
+    trigger_on = False
     # A=phong: wave-only (khong chao mat); B=cua: face-trigger (thay mat la chao).
     # Cau hinh per-channel (greet_on_face_{a,b}) fallback ve global de tuong
     # thich cu; --no-face-greet tat het.
@@ -2371,6 +2415,165 @@ def main() -> None:
                     print(f"[Face] apply skipped G{res.gid}: {error}")
                     continue
 
+    def poll_voice_command() -> None:
+        """Doc lenh voice (chao/chup) va thuc thi, ghi ket qua lai file."""
+        import json as _json
+
+        try:
+            target = (_PROJECT_ROOT / "output" / "qa_cache"
+                      / "voice_command.json")
+            cmd = _json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(cmd, dict) or cmd.get("status") != "pending":
+            return
+        try:
+            age = time.time() - float(cmd.get("ts", 0))
+        except (TypeError, ValueError):
+            age = 9999.0
+        if age > 60:
+            cmd["status"] = "expired"
+        else:
+            def _find_person(name: str):
+                want = name.strip().lower()
+                for gid, disp in gid_to_display.items():
+                    if not disp:
+                        continue
+                    have = disp.strip().lower()
+                    if have and (have in want or want in have):
+                        return gid_to_person.get(gid), disp
+                return None
+
+            def _save_snapshot(camera: str | None):
+                import datetime as _dt
+
+                use_b = (camera or "A").strip().upper() == "B"
+                frame = (vis_b if use_b else vis_a)
+                if frame is None:
+                    frame = frame_b if use_b else frame_a
+                if frame is None:
+                    return None
+                snap_dir = _PROJECT_ROOT / "output" / "snapshots"
+                try:
+                    snap_dir.mkdir(parents=True, exist_ok=True)
+                    stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+                    path = (snap_dir /
+                            f"snap_cam_{(camera or 'A').strip().upper()}_{stamp}.jpg")
+                    if not cv2.imwrite(str(path), frame):
+                        return None
+                except (OSError, cv2.error):
+                    return None
+                return str(path.relative_to(_PROJECT_ROOT))
+
+            ok, message = execute_voice_command(
+                cmd, greeter=greeter, find_person=_find_person,
+                save_snapshot=_save_snapshot, day=day_str, now_s=now_s)
+            cmd["status"] = "done" if ok else "failed"
+            cmd["message"] = message
+            print(f"[Voice-cmd] {cmd.get('action')}: {message}", flush=True)
+        try:
+            tmp = target.with_suffix(".tmp")
+            tmp.write_text(_json.dumps(cmd, ensure_ascii=False),
+                           encoding="utf-8")
+            tmp.replace(target)
+        except OSError:
+            pass
+
+    def write_runtime_status() -> None:
+        """Ghi trang thai runtime cho voice Ha Linh BAN CAMERA doc (2s/lan).
+
+        File: output/qa_cache/runtime_status.json. Voice tool
+        (get_person_count, get_camera_status...) doc file nay de tra loi
+        so lieu THAT thay vi stub random. Loi thi bo qua (khong chet loop).
+        """
+        import json as _json
+
+        now_wall = time.time()
+        people = []
+        try:
+            for gid, st in room_status_now.items():
+                wgid = gid_alias.get(gid, gid)
+                record = manager.identities.get(wgid)
+                last_s = record.last_seen_s if record is not None else None
+                ago = (now_s - last_s) if last_s is not None else None
+                people.append({
+                    "gid": int(wgid),
+                    "name": str(getattr(st, "display_name", "") or ""),
+                    "label": str(getattr(st, "label", "") or ""),
+                    "in_room": bool(getattr(st, "in_room", False)),
+                    "last_seen_ago_s": ago,
+                })
+        except Exception:
+            people = []
+        try:
+            day = day_str
+            att = ([{"name": r.display_name, "time": r.wall_time}
+                    for r in attendance.records_for_day(day)]
+                   if attendance is not None else [])
+        except Exception:
+            att = []
+        try:
+            events = []
+            for item in list(recent_events)[-5:]:
+                events.append(item.get("event", str(item))
+                              if isinstance(item, dict) else str(item))
+        except Exception:
+            events = []
+        try:
+            det = (metrics.snapshot() or {}).get("detection", {}) or {}
+            infer_ms = det.get("mean_ms")
+        except Exception:
+            infer_ms = None
+        prev_t, prev_f = runtime_prev["t"], runtime_prev["frame"]
+        dt = now_wall - prev_t
+        fps = (frame_idx - prev_f) / dt if dt > 0.5 else None
+        runtime_prev["t"], runtime_prev["frame"] = now_wall, frame_idx
+
+        def _stream_state(stream, enabled: bool) -> dict:
+            inner = getattr(stream, "stream", stream)
+            capture = getattr(inner, "capture", None)
+            try:
+                opened = bool(capture.isOpened()) if capture is not None else False
+            except Exception:
+                opened = False
+            try:
+                exhausted = bool(stream.exhausted)
+            except Exception:
+                exhausted = True
+            return {"enabled": bool(enabled), "open": opened,
+                    "exhausted": exhausted}
+
+        payload = {
+            "ts": now_wall,
+            "app": "run_workstate",
+            "single_channel": False,
+            "uptime_s": now_s,
+            "camera_a": _stream_state(stream_a, True),
+            "camera_b": _stream_state(stream_b, True),
+            "count": int(count_a.value + count_b.value),
+            "count_a": int(count_a.value),
+            "count_b": int(count_b.value),
+            "people": people,
+            "inference_ms": infer_ms,
+            "loop_fps": fps,
+            "attendance_today": att,
+            "recent_events": events,
+            "models": {
+                "yolo": str(model_path),
+                "reid": str(getattr(config.identity, "reid_model", "?")),
+                "face": ("bat" if shared_face_embedder is not None else "tat"),
+            },
+        }
+        try:
+            target = _PROJECT_ROOT / "output" / "qa_cache" / "runtime_status.json"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp = target.with_suffix(".tmp")
+            tmp.write_text(_json.dumps(payload, ensure_ascii=False),
+                           encoding="utf-8")
+            tmp.replace(target)
+        except OSError:
+            pass
+
     try:
         while True:
             now_s = time.time() - start
@@ -2763,12 +2966,8 @@ def main() -> None:
                                 )
                     except Exception as error:  # noqa: BLE001
                         print(f"[Voice] Bo loi chao khach tre: {error}")
-                # --- Gesture theo kenh OR voice-hello -> greet ---
-                # A=phong: vay tay (WaveDetector); B=cua: off (face-trigger o
-                # _handle_one_face, khong ton MediaPipe). Voice-hello toan cuc.
-                if voice_on and greeter is not None and (
-                    gesture_detectors or voice_trigger is not None
-                ):
+                # --- Gesture theo kenh -> greet (vay tay/palm only, da bo voice-hello) ---
+                if voice_on and greeter is not None and gesture_detectors:
                     voice_tick += 1
                     _has_wave = any(
                         m == "wave" for m in gesture_modes.values()
@@ -2782,18 +2981,6 @@ def main() -> None:
                             getattr(voice_cfg, "wave_every_k", 4))))
                     if voice_tick % _gesture_every == 0:
                         with metrics.measure("wave"):
-                            # Voice-hello là toàn cục (mic không gắn GID):
-                            # cache 1 lần/tick, 1 câu hello chỉ greet 1 người
-                            # gần nhất rồi consume (tránh greet cả 2 kênh).
-                            _voice_avail = False
-                            _voice_text: str | None = None
-                            if voice_trigger is not None:
-                                try:
-                                    # VoiceTrigger dung monotonic clock noi bo;
-                                    # khong truyen now_s (giay tu luc pipeline start).
-                                    _voice_avail, _voice_text = voice_trigger.recent()
-                                except (AttributeError, TypeError, ValueError):
-                                    _voice_avail, _voice_text = False, None
                             for _ch, _frame, _tracks in (
                                 ("A", frame_a if ret_a else None, last_tracks_a),
                                 ("B", frame_b if ret_b else None, last_tracks_b),
@@ -2802,8 +2989,7 @@ def main() -> None:
                                     continue
                                 _mode = gesture_modes.get(_ch, "off")
                                 _det = gesture_detectors.get(_ch)
-                                # B=off: bo qua MediaPipe, chi xet voice-hello.
-                                if _det is None and not _voice_avail:
+                                if _det is None:
                                     continue
                                 # Gesture and voice target only the stable
                                 # foreground subject (largest bbox + hysteresis).
@@ -2817,8 +3003,7 @@ def main() -> None:
                                 for _track in (_focus_track,):
                                     _gid = _track.track_id
                                     # Gate: bbox quá nhỏ thì tay không đủ pixel.
-                                    # Voice-hello van cho qua de cua van chao duoc.
-                                    if (not _voice_avail and _det is not None
+                                    if (_det is not None
                                             and _track.bbox.area < float(getattr(
                                                 voice_cfg, "palm_min_person_area_px", 8000.0))):
                                         continue
@@ -2906,38 +3091,13 @@ def main() -> None:
                                                 )
                                             except RuntimeError:
                                                 gestured = False
-                                    # OR: tay HOẶC cụm gọi. Voice dùng chung
-                                    # identity + cooldown loa với gesture.
-                                    # P5: voice chỉ hiệu lực khi có mặt tươi
-                                    # trong TTL và người đủ lớn (mic toàn cục
-                                    # nên đây là cửa chống nhầm chính: loại
-                                    # tiếng gọi từ xa ngoài khung hình).
-                                    _voice_face_ttl = float(getattr(
-                                        voice_cfg, "voice_face_ttl_s", 3.0))
-                                    _voice_min_area = float(getattr(
-                                        voice_cfg, "voice_min_person_area_px",
-                                        getattr(voice_cfg, "palm_min_person_area_px",
-                                                8000.0)))
-                                    _fresh_voice_face = bool(
-                                        _face_state is not None
-                                        and now_s - _face_state[0] <= _voice_face_ttl
-                                    )
-                                    _voice_big_enough = bool(
-                                        _track.bbox.area >= _voice_min_area)
-                                    _via_voice = bool(
-                                        not gestured and _voice_avail
-                                        and _fresh_voice_face and _voice_big_enough)
-                                    if not gestured and not _via_voice:
+                                    # Chi tay (wave/palm): hello imou da bo.
+                                    if not gestured:
                                         # Log chan doan throttle theo GID.
                                         if now_s - palm_dbg_at.get(
                                                 _gid, float("-inf")) > 15.0:
                                             palm_dbg_at[_gid] = now_s
-                                            if _voice_avail and not (
-                                                    _fresh_voice_face
-                                                    and _voice_big_enough):
-                                                print(f"[Voice][{_ch}] G{_gid} nghe cụm gọi "
-                                                      f"nhưng chờ mặt tươi+đủ lớn")
-                                            elif _mode == "wave":
+                                            if _mode == "wave":
                                                 try:
                                                     _rev = _det.current_reversals(_gid)
                                                 except (AttributeError, TypeError, ValueError):
@@ -2951,7 +3111,7 @@ def main() -> None:
                                                 print(f"[Palm][{_ch}] G{_gid} khong thay "
                                                       f"{_reason}")
                                         continue
-                                    # Yeu cau chu dong (vay/voice): phat ngay khi
+                                    # Yeu cau chu dong (vay tay): phat ngay khi
                                     # loa ranh, khong cooldown, chong spam 5s.
                                     if greeter.face_greet(
                                         day=day_str, person_id=_pid,
@@ -2959,32 +3119,14 @@ def main() -> None:
                                         global_id=_gid, channel=_spk,
                                         proactive=True,
                                     ):
-                                        if _via_voice:
-                                            # 1 câu hello chỉ greet 1 lần.
-                                            _voice_avail = False
-                                            try:
-                                                assert voice_trigger is not None
-                                                voice_trigger.consume()
-                                            except (AssertionError, AttributeError,
-                                                    TypeError, ValueError):
-                                                pass
-                                        elif voice_trigger is not None:
-                                            # Chặn mic tự nghe loa TTS vừa phát.
-                                            try:
-                                                voice_trigger.set_inhibit()
-                                            except (AttributeError, TypeError, ValueError):
-                                                pass
                                         _note_event(
-                                            event="VOICE" if _via_voice else (
-                                                "WAVE" if _mode == "wave" else "PALM"),
+                                            event=("WAVE" if _mode == "wave" else "PALM"),
                                             global_id=_gid,
                                             channel=_ch, at_iso=wall_iso,
                                             person_id=_pid, person_name=_name,
                                         )
-                                        _tag = "Voice" if _via_voice else (
-                                            "Wave" if _mode == "wave" else "Palm")
-                                        _why = (f"nghe '{_voice_text}'" if _via_voice
-                                                else ("vẫy tay" if _mode == "wave"
+                                        _tag = ("Wave" if _mode == "wave" else "Palm")
+                                        _why = (("vẫy tay" if _mode == "wave"
                                                       else "giơ tay"))
                                         print(f"[{_tag}][{_ch}] "
                                               f"{_name or 'Unknown'} (G{_gid}, {_why}, "
@@ -3132,6 +3274,18 @@ def main() -> None:
                         "count_b": count_b.value,
                     })
 
+            # Cau runtime cho voice Ha Linh BAN CAMERA (2s/lan): dem nguoi,
+            # camera, fps, diem danh, su kien -> tool tra loi so THAT.
+            if process_frame and now_s - last_runtime_write_s >= 2.0:
+                last_runtime_write_s = now_s
+                try:
+                    write_runtime_status()
+                except Exception:
+                    pass
+                try:
+                    poll_voice_command()
+                except Exception:
+                    pass
             if args.display:
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q") or key == 27:
@@ -3183,6 +3337,10 @@ def main() -> None:
                 voice_stop.set()
         except Exception as error:  # noqa: BLE001
             print(f"VoiceTrigger stop loi: {error}")
+        if halinh_stop is not None:
+            halinh_stop.set()
+        if halinh_thread is not None:
+            halinh_thread.join(timeout=15.0)
         stream_a.close()
         stream_b.close()
         cv2.destroyAllWindows()

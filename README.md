@@ -1,238 +1,177 @@
 # Camera OJT
 
-Hệ thống điểm danh và theo dõi trạng thái nhân viên bằng hai camera:
+Điểm danh và theo dõi trạng thái nhân viên bằng camera:
 
-- YOLO phát hiện người (person detection).
-- ByteTrack và Global Identity theo dõi người trong và giữa hai camera.
-- InsightFace `buffalo_s` đăng ký và nhận diện khuôn mặt trên Channel A/B.
-- React + Vite cung cấp màn hình check-in, camera trực tiếp và trang quản trị.
-- Supabase lưu nhân viên, điểm danh và trạng thái phòng (tùy chọn).
+- **Nhìn**: YOLO phát hiện người → ByteTrack → Global Identity (OSNet ReID) giữ ID xuyên camera; InsightFace `buffalo_s` nhận diện khuôn mặt để điểm danh; MediaPipe phát hiện vẫy/giơ tay để chào.
+- **Nghe–nói**: trợ lý voice “Hà Linh” (mic RTSP + loa camera P2P, STT faster-whisper, hiểu lệnh bằng Gemini, nói bằng ZeroTTS).
+- **Hiện**: React + Vite (live MJPEG, check-in kiosk, quản trị) + Supabase (tùy chọn, offline vẫn chạy nhờ hàng đợi local).
 
-## 1. Yêu cầu máy
+## 1. Yêu cầu
 
-- Windows 10/11 và PowerShell.
-- Git.
-- Python 3.10 trở lên. Dự án hiện đã kiểm thử với Python 3.12.
-- Node.js 20 trở lên và npm.
-- Camera RTSP hoặc webcam/video để thử nghiệm.
-- NVIDIA GPU được khuyến nghị. Hệ thống vẫn chạy CPU nhưng chậm hơn.
+- Git, Python 3.10+ (đã kiểm thử 3.10–3.12), Node.js 20+ và npm.
+- `ffmpeg` trong PATH (mic RTSP, TTS, loa).
+- Camera RTSP (Imou) hoặc webcam/video để thử. NVIDIA GPU khuyến nghị (chạy CPU vẫn được nhưng chậm).
+- Linux và Windows đều chạy được. Lệnh dưới đây là Linux/macOS; trên Windows PowerShell thay `cp` bằng `Copy-Item`, `source .venv/bin/activate` bằng `.venv\Scripts\Activate.ps1`.
 
-## 2. Clone branch Ngoc
+## 2. Lấy code
 
-```powershell
-git clone -b Ngoc https://github.com/AnhDuybugde/camera-ojt.git
+```bash
+git clone https://github.com/AnhDuybugde/camera-ojt.git
 cd camera-ojt
 ```
 
-Nếu repository đã có sẵn trên máy:
+Máy đã có repo thì cập nhật nhánh `main`:
 
-```powershell
+```bash
 git fetch origin
-git switch Ngoc
-git pull --ff-only origin Ngoc
+git switch main
+git pull --ff-only origin main
 ```
 
 ## 3. Cài backend Python
 
-Tạo virtual environment riêng cho dự án:
-
-```powershell
-py -3.12 -m venv yolovenv
-.\yolovenv\Scripts\Activate.ps1
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
 python -m pip install --upgrade pip setuptools wheel
-python -m pip install -e ".[face,store,dev]"
+python -m pip install -e ".[face,store,reid,voice,dev]"
+# hoặc: pip install -r requirements.txt  (tương đương dòng trên)
 ```
 
-Nếu PowerShell chặn script kích hoạt, chạy một lần trong terminal hiện tại:
+`reid` (OSNet) là bắt buộc ở production — pipeline dừng rõ ràng nếu không tải được, không tự hạ cấp. Muốn dùng CUDA thì cài PyTorch đúng driver **trước**:
 
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\yolovenv\Scripts\Activate.ps1
-```
-
-`reid` là dependency bắt buộc cho production. Pipeline sẽ dừng rõ ràng nếu
-OSNet không tải được; không tự hạ xuống histogram vì có thể nối nhầm người:
-
-```powershell
-python -m pip install -e ".[reid]"
-```
-
-Để dùng CUDA, cài bản PyTorch tương thích với GPU/driver trước khi chạy. Kiểm tra:
-
-```powershell
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 python -c "import torch; print('CUDA:', torch.cuda.is_available())"
 ```
 
-## 4. Cấu hình camera và Supabase
+Lần chạy đầu cần mạng để tải `yolo26s.pt` (Ultralytics) và `buffalo_s` (InsightFace). File `.engine` (TensorRT) và `.pt` **không commit** — máy mới tự tải lại.
 
-Tạo `.env` từ file mẫu:
+## 4. Cấu hình `.env`
 
-```powershell
-Copy-Item .env.example .env
+```bash
+cp .env.example .env
 ```
 
-Mở `.env` và thay bằng thông tin thật:
+Mở `.env` và điền giá trị thật (xem chú thích trong file mẫu):
 
-```dotenv
-IMOU_IP=192.168.1.100
-IMOU_USER=admin
-IMOU_PASSWORD=your_camera_password
+| Biến | Dùng cho | Bắt buộc khi nào |
+|---|---|---|
+| `IMOU_IP`, `IMOU_USER`, `IMOU_PASSWORD` | RTSP hình + mic camera | Chạy bản camera |
+| `IMOU_DEVICE_ID`, `IMOU_CAMERA_PASSWORD` | Loa camera qua P2P VisualTalk | Chào/nói ra loa (`--greet`, `--halinh`) |
+| `GEMINI_API_KEY` (`GEMINI_MODEL` tùy chọn) | Trợ lý Hà Linh | Chạy `--halinh` (mặc định bật) |
+| `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `SUPABASE_ANON_KEY` | Lưu điểm danh online | Khi muốn đồng bộ cloud |
 
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_SERVICE_KEY=your_service_role_key
-SUPABASE_ANON_KEY=your_anon_key
-```
-
-Camera A và B mặc định dùng channel `1` và `2` trên cùng thiết bị IMOU. Có thể
-ghi đè nguồn khi chạy bằng `--source-a` và `--source-b`.
-
-Supabase là tùy chọn. Nếu sử dụng:
-
-1. Chạy [supabase/schema.sql](supabase/schema.sql) trong Supabase SQL Editor.
-2. Tạo hai Storage bucket `face-crops` và `enrolled-faces`.
-3. Tạo tài khoản quản trị và thêm role:
-
-```sql
-insert into public.roles (user_id, role)
-values ('<uuid-admin>', 'admin');
-```
-
-Không đưa `SUPABASE_SERVICE_KEY` vào frontend. Key này chỉ được lưu trong `.env`
-ở máy chạy pipeline.
+Kênh loa (`voice.p2p_channel`, `voice.p2p_channel_b`) nằm trong `config/default.yaml`, không cần `.env`. Supabase là tùy chọn: nếu dùng thì chạy `supabase/schema.sql` trong SQL Editor, tạo 2 bucket `face-crops`, `enrolled-faces`, rồi bật `store.supabase_enabled: true` trong config. Không bao giờ đưa `SUPABASE_SERVICE_KEY` vào frontend.
 
 ## 5. Cài frontend
 
-```powershell
-Copy-Item dashboard\.env.example dashboard\.env
-Set-Location dashboard
-npm install
-Set-Location ..
+```bash
+cp dashboard/.env.example dashboard/.env
+cd dashboard && npm install && cd ..
 ```
 
-Các biến frontend chính trong `dashboard/.env`:
+Biến chính trong `dashboard/.env` (mặc định đã đúng khi chạy local):
 
 ```dotenv
 VITE_STREAM_URL=http://localhost:8765
 VITE_KIOSK_CHANNEL=A
 VITE_CONTROL_URL=http://localhost:8766
-VITE_SUPABASE_URL=https://your-project.supabase.co
-VITE_SUPABASE_ANON_KEY=your_anon_key
 ```
 
-Có thể bỏ trống cấu hình Supabase khi chỉ thử camera và đăng ký nhân viên cục bộ.
+## 6. Tạo file chào (WAV)
 
-## 6. Chạy hệ thống (2 lệnh)
+File WAV trong `output/` **không commit** — máy mới tự tạo lại:
 
-Lệnh 1 — backend + supervisor (tự bật sẵn API `:8766` cho dashboard):
-
-```powershell
-.\yolovenv\Scripts\Activate.ps1
-python scripts\run_workstate.py --greet
+```bash
+source .venv/bin/activate
+python scripts/build_greeting_wavs.py --voice maichi
 ```
 
-Lệnh 2 — dashboard:
+Chạy lại mỗi khi thêm/sửa nhân viên hoặc đổi câu chào.
 
-```powershell
-Set-Location dashboard
-npm run dev
+## 7. Chạy
+
+**Bản camera** (2 cam Imou + voice Hà Linh, triển khai thật) — terminal 1:
+
+```bash
+source .venv/bin/activate
+python scripts/run_workstate.py --greet
 ```
 
-Muốn tắt supervisor nhúng: thêm `--no-supervisor` (dashboard mất nút
-Start/Stop) hoặc đổi cổng `--supervisor-port 8770`.
+**Bản local** (webcam + mic/loa laptop, dev không cần camera):
 
-Truy cập địa chỉ Vite in trên terminal, thông thường là:
-
-```text
-http://localhost:5173
+```bash
+python scripts/run_workstate_local.py --display
 ```
 
-Backend camera và API chạy mặc định tại:
+**Dashboard** — terminal 2:
 
-```text
-http://localhost:8765
+```bash
+cd dashboard && npm run dev   # thường là http://localhost:5173
 ```
 
-Lần chạy đầu, Ultralytics và InsightFace có thể tải model `yolo26s.pt` và
-`buffalo_s`. Cần giữ kết nối mạng cho đến khi tải xong.
+Cổng mặc định: camera/MJPEG `:8765`, điều khiển pipeline `:8766`. Backend `run_workstate*.py` mặc định tự bật voice Hà Linh ở subprocess riêng (crash tự restart 3 lần); tắt bằng `--no-halinh`. Muốn tắt supervisor nhúng thì thêm `--no-supervisor`.
 
-## 7. Đăng ký nhân viên
+## 8. Đăng ký nhân viên
 
-1. Mở dashboard và vào `Đăng ký nhân viên`.
-2. Nhập mã nhân viên duy nhất và họ tên.
-3. Chụp/tải ảnh chỉ có một khuôn mặt, rõ, đủ sáng và nhìn gần chính diện.
-4. Xác nhận đồng ý xử lý dữ liệu khuôn mặt rồi nhấn đăng ký.
-5. Đứng trước Channel A khoảng 1-2 giây để kiểm tra nhận diện/check-in.
+1. Mở dashboard → `Đăng ký nhân viên`.
+2. Nhập mã nhân viên duy nhất + họ tên.
+3. Chụp/tải ảnh **một khuôn mặt**, rõ, đủ sáng, gần chính diện.
+4. Đồng ý xử lý dữ liệu khuôn mặt → đăng ký.
+5. Đứng trước Channel A 1–2 giây để kiểm tra nhận diện/check-in.
 
-Thông tin đăng ký cục bộ nằm trong `data/images/registry.json`; ảnh nằm trong
-`data/images/`. Cả hai đều bị `.gitignore` loại khỏi Git vì là dữ liệu cá nhân.
-Khi chuyển sang máy khác, phải đăng ký lại hoặc chuyển dữ liệu qua kênh bảo mật
-có sự đồng ý của nhân viên.
+Gallery nằm ở `data/images/` + `data/images/registry.json` — là dữ liệu cá nhân, **bị `.gitignore`**, máy mới phải đăng ký lại (hoặc chuyển qua kênh bảo mật có sự đồng ý). Không đăng ký cùng một khuôn mặt cho nhiều mã.
 
-Không đăng ký cùng một khuôn mặt dưới nhiều mã nhân viên. Việc này làm danh tính
-không xác định khi hai embedding gần như giống nhau.
+## 9. Chạy từ máy khác trong LAN
 
-## 8. Chạy từ máy khác trong mạng LAN
+Máy gắn camera:
 
-Trên máy gắn camera:
-
-```powershell
-python scripts\run_workstate.py --stream-host 0.0.0.0
+```bash
+python scripts/run_workstate.py --stream-host 0.0.0.0
 ```
 
-Trên máy chạy dashboard, sửa:
+Máy chạy dashboard sửa `dashboard/.env`:
 
 ```dotenv
 VITE_STREAM_URL=http://<IP_MAY_CAMERA>:8765
 ```
 
-Khởi động lại `npm run dev` sau khi thay biến môi trường. Cho phép cổng `8765`
-qua Windows Firewall nếu máy khác không truy cập được.
+Khởi động lại `npm run dev`; mở firewall cổng `8765` nếu cần.
 
-## 9. Lệnh hữu ích
+## 10. Lệnh hữu ích
 
-```powershell
-# Chạy tracking nhưng tắt nhận diện khuôn mặt
-python scripts\run_workstate.py --no-face --display
-
-# Dùng webcam 0 và 1 thay cho RTSP
-python scripts\run_workstate.py --source-a 0 --source-b 1 --display
-
-# Giảm tải GPU/CPU
-python scripts\run_workstate.py --imgsz 640
-
+```bash
+# Tracking nhưng tắt nhận diện mặt
+python scripts/run_workstate.py --no-face --display
+# Tắt voice Hà Linh (chỉ tracking + chào tay)
+python scripts/run_workstate.py --no-halinh
+# Webcam thay RTSP
+python scripts/run_workstate.py --source-a 0 --source-b 1 --display
+# Nhẹ GPU/CPU hơn
+python scripts/run_workstate.py --imgsz 640
+# Voice rời (debug, không cần pipeline)
+python scripts/halinh_assistant.py              # bản camera
+python scripts/halinh_assistant_local.py        # bản laptop
+# Test loa P2P trực tiếp
+python scripts/test_imou_p2p_voice.py --greeting unknown
 # Benchmark model, không mở RTSP
-python scripts\benchmark_inference.py --device cuda --frames 30
-
-# Chạy kiểm thử backend
+python scripts/benchmark_inference.py --device cuda --frames 30
+# Kiểm thử backend
 python -m pytest -q
-
-# Kiểm tra frontend production build
-Set-Location dashboard
-npm run build
+# Build frontend production
+cd dashboard && npm run build
 ```
 
-## 10. Xử lý lỗi thường gặp
+## 11. Xử lý lỗi thường gặp
 
-### Không mở được camera A/B
+**Không mở được camera A/B** — kiểm tra `IMOU_IP`/user/password trong `.env`, máy và camera cùng mạng, RTSP đã bật; thử `--source-a/--source-b` với video/webcam.
 
-- Kiểm tra `IMOU_IP`, user/password và channel trong `.env`.
-- Xác nhận máy và camera cùng mạng, RTSP đã được bật.
-- Thử truyền URL/video/webcam bằng `--source-a` và `--source-b`.
-- Không đặt chuỗi chữ `RTSP stream` vào `.env`; đây chỉ là nhãn log đã ẩn mật khẩu.
+**Đăng ký xong vẫn Unknown** — log phải có `Face gallery: N nguoi` với `N > 0`; không chạy `--no-face`; đứng gần, nhìn chính diện, tránh ngược sáng; không dùng một mặt cho hai mã.
 
-### Đăng ký xong vẫn hiện Unknown
+**Dashboard không có hình** — mở `http://localhost:8765/status.json`; kiểm tra `VITE_STREAM_URL` rồi khởi động lại Vite; cổng bận thì đổi `--stream-port`.
 
-- Kiểm tra log có dòng `Face gallery: N nguoi`, với `N > 0`.
-- Đảm bảo không chạy `--no-face`.
-- Đứng đủ gần, nhìn gần chính diện và tránh ngược sáng.
-- Channel A và B đều hỗ trợ face matching; Channel A là kênh kiosk mặc định.
-- Không dùng cùng một ảnh/khuôn mặt cho hai mã nhân viên.
-
-### Dashboard không có hình
-
-- Mở `http://localhost:8765/status.json` để kiểm tra backend.
-- Kiểm tra `VITE_STREAM_URL` và khởi động lại Vite sau khi sửa.
-- Nếu cổng đang bận, dừng tiến trình cũ hoặc chọn `--stream-port` khác.
+**Hà Linh không trả lời** — thiếu `GEMINI_API_KEY` trong `.env`; kiểm tra mic RTSP (`IMOU_*`) và loa P2P (`IMOU_DEVICE_ID` + `IMOU_CAMERA_PASSWORD`); hết quota Gemini thì loa báo và tự thử lại sau 60s.
 
 ## Kiến trúc rút gọn
 
@@ -240,7 +179,7 @@ npm run build
 flowchart LR
     A[Camera A/B] --> B[YOLO person detection]
     B --> C[ByteTrack]
-    C --> D[Global Identity]
+    C --> D[Global Identity - OSNet]
     C --> E[InsightFace]
     E --> F[Employee matching]
     D --> G[Workstate and room presence]
@@ -252,16 +191,10 @@ flowchart LR
     J --> K[React dashboard]
 ```
 
-Entry point production chính là `scripts/run_workstate.py`.
-`scripts/run_pipeline.py` chỉ là demo analytics một camera dùng cho smoke test.
-
-Contract Global ID, face consensus và replay benchmark được mô tả tại
-[docs/IDENTITY_ARCHITECTURE.md](docs/IDENTITY_ARCHITECTURE.md).
+Entry point production là `scripts/run_workstate.py` (camera) và `scripts/run_workstate_local.py` (laptop). `scripts/run_pipeline.py` chỉ là demo một camera. Contract Global ID, face consensus và replay benchmark ở `docs/IDENTITY_ARCHITECTURE.md`; tổng quan voice + chống spam ở `docs/OVERVIEW.md`; tune ngưỡng ở `docs/TUNE_GUIDE.md`; loa P2P ở `docs/P2P_TALK.md`.
 
 ## Bảo mật dữ liệu
 
-- Không commit `.env`, service key, mật khẩu RTSP hoặc ảnh khuôn mặt.
-- Chỉ thu thập ảnh khi nhân viên đã đồng ý.
-- Giới hạn quyền truy cập Supabase và định kỳ xóa ảnh không còn cần thiết.
-- Global ID chỉ là ID theo dõi tạm thời; `employee_id` sau face matching mới là
-  danh tính nhân viên dùng cho chấm công.
+- Không commit `.env`, service key, mật khẩu RTSP, ảnh khuôn mặt, WAV chào tên riêng, file `.engine`/`.pt`.
+- Chỉ thu thập ảnh khi nhân viên đã đồng ý; giới hạn quyền Supabase; xóa ảnh không cần thiết định kỳ.
+- Global ID chỉ là ID theo dõi tạm thời; `employee_id` sau face matching mới là danh tính chấm công.

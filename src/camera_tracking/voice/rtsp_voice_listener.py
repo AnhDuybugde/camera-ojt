@@ -41,6 +41,28 @@ def db_to_amplitude_ratio(db: float) -> float:
     return 10.0 ** (max(0.0, float(db)) / 20.0)
 
 
+# Thoi gian STT cac lan gan nhat (giay, toi da 20) - voice tool
+# get_stt_latency doc de tra loi that thay vi stub.
+STT_LATENCIES: collections.deque[float] = collections.deque(maxlen=20)
+
+
+def note_stt_latency(seconds: float) -> None:
+    """Ghi 1 mau thoi gian STT (goi tu wrapper transcribe_segment_fw)."""
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return
+    if value >= 0:
+        STT_LATENCIES.append(value)
+
+
+def stt_latency_stats() -> tuple[int, float] | None:
+    """(so mau, trung binh giay) hoac None khi chua co mau nao."""
+    if not STT_LATENCIES:
+        return None
+    return len(STT_LATENCIES), sum(STT_LATENCIES) / len(STT_LATENCIES)
+
+
 class NoiseFloorTracker:
     """P1 — ngưỡng VAD động bám nền ồn (trị ồn đều, không cần đo phòng).
 
@@ -111,7 +133,7 @@ def rms_level(pcm: bytes) -> float:
     return math.sqrt(total / max(1, n)) / 32768.0
 
 
-def transcribe_segment_fw(
+def _transcribe_segment_fw(
     fw_model, pcm: bytes, lang: str = "vi", *,
     max_no_speech_prob: float = 0.40,
     min_avg_logprob: float = -0.70,
@@ -176,6 +198,20 @@ def transcribe_segment_fw(
             Path(tmp).unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def transcribe_segment_fw(
+    fw_model, pcm: bytes, lang: str = "vi", **kwargs) -> str:
+    """Wrapper cua _transcribe_segment_fw + ghi thoi gian STT that.
+
+    Chu ky giu nguyen de moi noi goi cu khong doi; tool get_stt_latency
+    doc STT_LATENCIES de tra loi thay vi stub.
+    """
+    start = time.monotonic()
+    try:
+        return _transcribe_segment_fw(fw_model, pcm, lang, **kwargs)
+    finally:
+        note_stt_latency(time.monotonic() - start)
 
 
 class RtspVoiceListener(threading.Thread):
@@ -479,6 +515,8 @@ __all__ = [
     "build_listener_from_env",
     "db_to_amplitude_ratio",
     "find_ffmpeg",
+    "note_stt_latency",
     "rms_level",
+    "stt_latency_stats",
     "transcribe_segment_fw",
 ]

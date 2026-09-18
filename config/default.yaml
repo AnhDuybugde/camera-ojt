@@ -244,7 +244,7 @@ voice:
   p2p_retry_delay_s: 5.0
   p2p_sample_rate: 16000
   # 0.0=im lang, 0.2=nho, 0.5=nua am luong, 1.0=giu nguyen file TTS.
-  p2p_volume: 0.1
+  p2p_volume: 1.0
   # WAV chao tao san (scripts/build_greeting_wavs.py, ZeroTTS).
   greeting_dir: output/voice_greetings
   zerotts_voice: maichi
@@ -300,12 +300,7 @@ voice:
   face_max_queue: 8
   face_max_job_age_s: 5.0
   face_recheck_s: 30.0
-  # Voice-trigger (OR với wave): mic camera nghe cụm gọi lập trình sẵn
-  # (config/voice_triggers/: "hello imou", "xin chào imou", thêm sau chỉ
-  # cần thêm file yaml) thì greet người gần nhất. Cụm dài + gắn mặt nên
-  # TV/phòng ồn khó gây nhầm hơn "hello" trần.
-  # Bật bằng --voice-trigger (cần kèm --greet để có loa). STT faster-whisper
-  # small/vi: model nhỏ ít bịa chữ từ ồn, nhẹ CPU.
+  # Voice-trigger hello imou DA BO. STT medium-only cho Ha Linh.
   voice_trigger_enabled: false
   trigger_phrase_dir: config/voice_triggers
   # Cụm bổ sung ngoài folder (nối thêm, ít dùng).
@@ -325,8 +320,8 @@ voice:
   voice_vad_ceiling: 0.15
   # P3: đoạn chỉ đi STT khi to hơn nền >= 10dB (bỏ ồn to đều/tiếng xa nhỏ).
   voice_snr_min_db: 10.0
-  # small da cache tren may, nhanh hon medium CPU cho keyword ngan.
-  voice_stt_model: small
+  # medium-only cho Ha Linh (small da bo).
+  voice_stt_model: medium
   voice_stt_lang: vi
   voice_listen_channel: 1
   voice_listen_subtype: 1

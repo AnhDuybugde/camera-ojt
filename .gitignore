@@ -11,9 +11,10 @@ __pycache__/
 !dashboard/.env.example
 !.env.example
 
-# Large/local artifacts
+# Large/local artifacts (machine-specific or personal data, never commit)
 *.pt
 *.onnx
+*.engine
 data/raw/*
 data/processed/*
 data/samples/*
@@ -21,6 +22,8 @@ data/faces/*
 data/images/*
 models/*
 output/*
+audio/*.wav
+!audio/camera-test-vi.wav
 dashboard/node_modules/
 dashboard/dist/
 dashboard/*.tsbuildinfo

@@ -135,6 +135,9 @@ export default function App() {
   const [liveEvents, setLiveEvents] = useState<KioskEvent[]>([])
   const [sendingAttendance, setSendingAttendance] = useState(false)
   const [liveOk, setLiveOk] = useState(false)
+  // Single-channel (run_workstate_local.py): cam B tat -> an khung B
+  // thay vi hien anh vo (backend tra 503). Mac dinh true de tuong thich cu.
+  const [camBLive, setCamBLive] = useState(true)
 
   useEffect(() => {
     if (!supabaseConfigured) return
@@ -208,6 +211,11 @@ export default function App() {
           setAttendance(data.attendance_today as AttendanceRow[])
         }
         setLiveOk(true)
+        const cams = (data as { cameras?: { name?: string; live?: boolean }[] }).cameras
+        if (Array.isArray(cams)) {
+          const b = cams.find((c) => c.name === 'cam_b')
+          setCamBLive(!b || b.live === true)
+        }
       } catch {
         if (alive) setLiveOk(false)
       }
@@ -372,10 +380,14 @@ export default function App() {
                 <img src={`${STREAM_URL}/cam_a.mjpg`} alt="Channel A live" />
                 <figcaption>Channel A — room (YOLO + Global ID overlay)</figcaption>
               </figure>
-              <figure>
-                <img src={`${STREAM_URL}/cam_b.mjpg`} alt="Channel B live" />
-                <figcaption>Channel B — door + face check-in</figcaption>
-              </figure>
+              {camBLive ? (
+                <figure>
+                  <img src={`${STREAM_URL}/cam_b.mjpg`} alt="Channel B live" />
+                  <figcaption>Channel B — door + face check-in</figcaption>
+                </figure>
+              ) : (
+                <p className="footnote">Channel B off (single-channel local mode).</p>
+              )}
             </div>
             <div className="live-chips">
               {livePeople.length === 0 && <span className="footnote">No one tracked right now.</span>}
