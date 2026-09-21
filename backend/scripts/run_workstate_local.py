@@ -61,6 +61,7 @@ import cv2
 import numpy as np
 
 from camera_tracking.camera import FrameHub
+from camera_tracking.alerting import AlertPublisher
 from camera_tracking.config import load_config
 from camera_tracking.detection import YoloPersonDetector, resolve_device
 
@@ -948,6 +949,10 @@ def main() -> None:
     os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "fatal")
     args = parse_args()
     config = load_config(args.config)
+    alert_publisher, alert_dispatcher = AlertPublisher.from_env(config.output.output_dir)
+    if alert_dispatcher is not None:
+        alert_dispatcher.start()
+        print("Alerting: n8n webhook dispatcher enabled.")
     # Ban local: loa camera khong co -> greet (vay tay/palm + face) phat
     # bang loa laptop (backend local = ffplay). Model MediaPipe wave/palm
     # giu nguyen nhu ban goc.
@@ -1907,7 +1912,8 @@ def main() -> None:
     recent_events: deque = deque(maxlen=20)
 
     def _note_event(*, event: str, global_id: int, channel: str,
-                    at_iso: str, person_id=None, person_name=None) -> None:
+                    at_iso: str, person_id=None, person_name=None,
+                    confidence: float | None = None) -> None:
         recent_events.append({
             "event": event,
             "global_id": global_id,
@@ -1916,6 +1922,16 @@ def main() -> None:
             "person_id": person_id,
             "person_name": person_name,
         })
+        if alert_publisher is not None:
+            alert_publisher.publish(
+                event_type=event,
+                occurred_at=at_iso,
+                global_id=global_id,
+                channel=channel,
+                person_id=person_id,
+                person_name=person_name,
+                confidence=confidence,
+            )
 
     def _handle_one_face(*, channel: str, frame, track, crop, det, match,
                            sharp, quality: float = 1.0,
@@ -2203,6 +2219,7 @@ def main() -> None:
                         channel=channel, at_iso=wall_iso,
                         person_id=ticked.person_id,
                         person_name=ticked.display_name,
+                        confidence=ticked.face_score,
                     )
                     print(f"[Diem danh][{channel}] {ticked.display_name} "
                           f"(G{ticked.global_id}, "
@@ -3331,6 +3348,11 @@ def main() -> None:
             if args.max_frames is not None and frame_idx >= args.max_frames:
                 break
     finally:
+        if alert_dispatcher is not None:
+            try:
+                alert_dispatcher.stop()
+            except Exception as error:  # noqa: BLE001
+                print(f"Alert dispatcher stop loi: {error}")
         identity_trace.close()
         identity_store.save(
             current_identity_day, manager

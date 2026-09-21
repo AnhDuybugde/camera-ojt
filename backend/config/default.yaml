@@ -12,7 +12,7 @@ detection:
   # Rebuild khi doi GPU/model:
   # yolo export model=yolo26s.pt format=engine half=True imgsz=640 device=0 dynamic=True batch=2
   # Nếu thiếu .engine / TRT sẽ tự fallback .pt (vẫn cuda) + cảnh báo.
-  model_path: yolo26s.engine
+  model_path: yolo26s.pt
   # Recall-first nhưng bớt ghost: 0.25 đủ cho ByteTrack low-conf nối lại.
   # 0.10 cũ đẻ quá nhiều box yếu -> ghost GID.
   confidence_threshold: 0.25
@@ -21,7 +21,7 @@ detection:
   nested_box_containment_threshold: 0.85
   person_class_id: 0
   image_size: 640
-  device: cuda
+  device: cpu
 
 tracking:
   # Legacy IoUTracker (scripts/run_pipeline.py demo) dùng 2 dòng dưới.
@@ -82,7 +82,7 @@ identity:
   # Lightweight mặc định: x0_25 (~0.4M params, nhanh ~3x so với x1_0).
   # Cần chính xác hơn thì tune lên x0_5 / x1_0.
   reid_model: osnet_x0_25
-  reid_device: cuda
+  reid_device: cpu
 
 analytics:
   floor_width_m: 8.0
@@ -131,7 +131,7 @@ face:
   enabled: true
   channels: [A, B]
   # cuda = bắt buộc GPU (khuyến nghị). auto = cuda nếu có provider, không thì cpu.
-  face_device: cuda
+  face_device: cpu
   gallery_dir: data/images
   model_pack: buffalo_s
   match_threshold: 0.45
