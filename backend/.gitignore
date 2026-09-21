@@ -1,0 +1,49 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environment
+.env
+.env.*
+!dashboard/.env.example
+!.env.example
+
+# Large/local artifacts (machine-specific or personal data, never commit)
+*.pt
+*.onnx
+*.engine
+data/raw/*
+data/processed/*
+data/samples/*
+data/faces/*
+data/images/*
+models/*
+output/*
+audio/*.wav
+!audio/camera-test-vi.wav
+dashboard/node_modules/
+dashboard/dist/
+dashboard/*.tsbuildinfo
+
+# Keep folder structure
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/samples/.gitkeep
+!data/images/.gitkeep
+!models/.gitkeep
+!output/.gitkeep
+
+# IDE/OS
+.idea/
+.vscode/
+.cursor/
+.codegraph/
+Thumbs.db
+Desktop.ini
+
+# Build artifacts
+*.egg-info/
+src/*.egg-info/

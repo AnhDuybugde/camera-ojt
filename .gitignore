@@ -1,49 +1,37 @@
-.venv/
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
+# Environments and secrets
+**/.venv/
+**/.env
+!**/.env.example
 
-# Local environment
-.env
-.env.*
-!dashboard/.env.example
-!.env.example
+# Python and test caches
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.ruff_cache/
+**/*.egg-info/
 
-# Large/local artifacts (machine-specific or personal data, never commit)
+# Runtime data and models
+backend/output/*
+backend/logs/*
+backend/models/*
+backend/data/images/*
+backend/data/faces/*
+frontend/data/*
+frontend/logs/*
 *.pt
 *.onnx
 *.engine
-data/raw/*
-data/processed/*
-data/samples/*
-data/faces/*
-data/images/*
-models/*
-output/*
-audio/*.wav
-!audio/camera-test-vi.wav
-dashboard/node_modules/
-dashboard/dist/
-dashboard/*.tsbuildinfo
 
-# Keep folder structure
-!data/raw/.gitkeep
-!data/processed/.gitkeep
-!data/samples/.gitkeep
-!data/images/.gitkeep
-!models/.gitkeep
-!output/.gitkeep
+# Frontend/build output
+backend/dashboard/node_modules/
+backend/dashboard/dist/
+frontend/.streamlit/secrets.toml
 
-# IDE/OS
-.idea/
-.vscode/
-.cursor/
-.codegraph/
-Thumbs.db
-Desktop.ini
+# Integrated launcher state
+.runtime/
+logs/
 
-# Build artifacts
-*.egg-info/
-src/*.egg-info/
+# Preserve empty folders when present
+!backend/output/.gitkeep
+!backend/models/.gitkeep
+!backend/data/images/.gitkeep
