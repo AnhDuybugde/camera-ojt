@@ -31,6 +31,7 @@ class RoomStatusRow:
 @dataclass(slots=True)
 class DailyStateCache:
     inroom_min_interval_s: float = 3600.0
+    heartbeat_interval_s: float = 30.0
     _attendance_done: set[tuple[str, str]] = field(default_factory=set, init=False)
     _status: dict[tuple[str, int], RoomStatusRow] = field(default_factory=dict, init=False)
 
@@ -73,6 +74,9 @@ class DailyStateCache:
         label_changed = row.label != label
         inroom_flipped = row.in_room != in_room
         if not label_changed and not inroom_flipped:
+            if now_s - row.last_write_s >= self.heartbeat_interval_s:
+                row.last_write_s = now_s
+                return True, False
             return False, False
         if inroom_flipped and not throttle_ok(
             row.last_inroom_flip_s, now_s, self.inroom_min_interval_s

@@ -9,6 +9,7 @@ import threading
 
 from camera_tracking.api.server import make_server
 from camera_tracking.api.service import ApplicationAPI
+from camera_tracking.api.supabase_auth import SupabaseAuth
 from camera_tracking.store.aimind_bridge import drain_once, load_person_map
 from camera_tracking.store.event_log import EventSync
 from camera_tracking.store.queue import WriteQueue
@@ -39,7 +40,8 @@ def run_backend(stop=None, port=8767):
     embedding_path = db.path
     from camera_tracking.api.enrollment import Enrollment
     from face.detector import FaceDetector
-    api = ApplicationAPI(db, auth, admin, sheets, Operations(db, attendance, embedding_path),
+    identity = SupabaseAuth() if os.getenv("SUPABASE_URL") else auth
+    api = ApplicationAPI(db, identity, admin, sheets, Operations(db, attendance, embedding_path),
                          Enrollment(FaceDetector()))
     server = make_server(api, port=port)
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -59,7 +61,9 @@ def run_backend(stop=None, port=8767):
         while not stop.is_set():
             try:
                 if cloud:
-                    replica.sync(transport)
+                    allowed = (None if os.getenv("CAMERA_SYNC_BIOMETRIC", "0") == "1"
+                               else TABLES.keys())
+                    replica.sync(transport, allowed_kinds=allowed)
                     cloud.flush()
                 sheets.sync_pending(actor_role="SYSTEM")
             except Exception as error:

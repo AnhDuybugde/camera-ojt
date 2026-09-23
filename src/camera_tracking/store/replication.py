@@ -111,12 +111,15 @@ class SQLiteReplica:
         finally:
             db.execute("UPDATE sync_control SET applying=0 WHERE id=1")
 
-    def sync(self, remote):
+    def sync(self, remote, *, allowed_kinds=None):
+        allowed = None if allowed_kinds is None else set(allowed_kinds)
         with self.connect() as db:
             rows = db.execute("""SELECT o.* FROM record_outbox o LEFT JOIN record_conflicts c
                 USING(kind,record_key) WHERE c.kind IS NULL ORDER BY
                 CASE o.kind WHEN 'employees' THEN 0 WHEN 'work_schedules' THEN 1 ELSE 2 END
                 LIMIT 100""").fetchall()
+        if allowed is not None:
+            rows = [row for row in rows if row["kind"] in allowed]
         results = remote.compare_batch([dict(row) for row in rows]) if rows else []
         if len(results) != len(rows):
             raise ValueError("Cloud batch acknowledgement count mismatch")

@@ -107,6 +107,8 @@ def _render_camera_ojt() -> None:
         f'</div>', height=520, scrolling=False,
     )
     people = [item for item in status.get("people", []) if isinstance(item, dict)]
+    anonymous_count = int(status.get("anonymous_count") or 0)
+    st.caption(f"Nhân viên đã liên kết: {len(people)} · Khách/chưa định danh: {anonymous_count}")
     data_table(
         [
             TableColumn("employee", "Nhân viên", 230),

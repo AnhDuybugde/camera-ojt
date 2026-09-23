@@ -45,22 +45,11 @@ if st.session_state.get("_table_ui_version") != _TABLE_UI_VERSION:
     st.session_state._table_ui_version = _TABLE_UI_VERSION
 
 db = get_db(4)
-auth_service = get_auth_service(2)
+auth_service = get_auth_service(3)
 role = st.session_state.get("role")
-if role == EMPLOYEE and st.session_state.get("authenticated"):
-    try:
-        account = auth_service.account(st.session_state.get("employee_id", ""))
-    except ValueError:
-        account = None
-    if not account or account["version"] != st.session_state.get("account_version"):
-        st.session_state.clear()
-        role = None
 if not st.session_state.get("authenticated") or role not in {EMPLOYEE, ADMIN}:
     login.render(auth_service)
     st.stop()
-
-if role == EMPLOYEE and account["must_change"]:
-    login.force_password_change(auth_service)
 
 ALL_PAGES = (
     ("Tổng quan", "Dashboard", "grid_view", "dashboard"),
@@ -171,16 +160,6 @@ elif page == "Registration":
     if role == ADMIN and registration_section == "Nhân viên":
         with st.container():
             employees.render(db, role)
-            auth_service.ensure_accounts()
-            rows = db.list_employees()
-            if rows:
-                with st.expander("Tài khoản nhân viên · Đặt lại mật khẩu"):
-                    selected = st.selectbox("Mã nhân viên", [r["employee_id"] for r in rows], key="reset_account")
-                    confirm = st.checkbox("Tạo mật khẩu tạm mới và yêu cầu đổi khi đăng nhập")
-                    if st.button("Đặt lại mật khẩu", disabled=not confirm):
-                        temporary_password = auth_service.reset_employee_password(selected, actor_role=role)
-                        st.success("Đã vô hiệu phiên cũ. Gửi riêng mật khẩu tạm cho nhân viên:")
-                        st.code(temporary_password)
     if registration_section == "Đăng ký khuôn mặt":
         register_face.render(db, get_detector(), get_recognizer(), role)
 elif page == "Work Schedule":

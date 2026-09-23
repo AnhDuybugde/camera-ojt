@@ -10,12 +10,12 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "apps/attendance"))
 
 from camera_tracking.api.service import ApplicationAPI
+from camera_tracking.api.supabase_auth import SupabaseAuth
 from camera_tracking.store.embeddings import EmbeddingStore
 from camera_tracking.store.event_log import EventSync
 from camera_tracking.store.replication import SQLiteReplica
 from camera_tracking.workstate.door import DoorTransitions
 from attendance.attendance_service import AttendanceService
-from auth.service import AuthService
 from database.db import Database
 
 
@@ -58,12 +58,13 @@ def test_door_requires_observed_direction_and_does_not_infer_exit():
 
 
 def test_api_enforces_owner_and_does_not_accept_sql(business, monkeypatch):
-    monkeypatch.setenv("CAMERA_ADMIN_PASSWORD", "test-admin-password")
-    auth = AuthService(business)
-    password = auth.reset_employee_password("NV01", actor_role="ADMIN")
-    auth.change_employee_password("NV01", password, "employee-password", "employee-password")
-    api = ApplicationAPI(business, auth, None, None)
-    token = api.login("EMPLOYEE", "employee-password", "NV01")["token"]
+    class Auth:
+        def login(self, email, password):
+            assert email == "nv01@example.com" and password == "employee-password"
+            return {"role": "EMPLOYEE", "employee_id": "NV01", "user_id": "user-01",
+                    "email": email, "expires_in": 3600}
+    api = ApplicationAPI(business, Auth(), None, None)
+    token = api.login("nv01@example.com", "employee-password")["token"]
     assert len(api.dispatch("employees", "list_employees", [], {}, token)) == 1
     with pytest.raises(PermissionError):
         api.dispatch("employees", "get_employee", ["NV02"], {}, token)
@@ -72,6 +73,22 @@ def test_api_enforces_owner_and_does_not_accept_sql(business, monkeypatch):
     with pytest.raises(PermissionError):
         api.dispatch("employees", "save_work_schedules", [[("NV02", "2026-09-21", "MORNING", "OFF")]],
                      {"actor_role": "SYSTEM"}, token)
+
+
+def test_supabase_auth_maps_role_without_returning_tokens():
+    import io
+    class Response(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *_): self.close()
+    def opener(request, timeout):
+        if "/token?" in request.full_url:
+            return Response(b'{"access_token":"not-returned","expires_in":3600,'
+                            b'"user":{"id":"u1","email":"e@example.com"}}')
+        return Response(b'[{"user_id":"u1","employee_id":"NV01","role":"employee","active":true}]')
+    auth = SupabaseAuth("https://example.supabase.co", "anon", "service", opener)
+    identity = auth.login("e@example.com", "pw")
+    assert identity["role"] == "EMPLOYEE" and identity["employee_id"] == "NV01"
+    assert "access_token" not in identity
 
 
 def test_versioned_gallery_keeps_all_samples_and_replaces_atomically(tmp_path):

@@ -638,7 +638,7 @@ def _flush_queue(
                 payload.get("local_path", ""), payload.get("storage_path", "")
             )
         if done:
-            queue.ack(row_id)
+            queue.ack(row_id, payload)
             ok += 1
         else:
             queue.bump(row_id)
@@ -3043,7 +3043,7 @@ def main(profile: str = "imou") -> None:
                         day_cache.note_leave_enter(day_str, wgid, leave_at=wall_iso)
                     if st.just_returned:
                         day_cache.note_leave_enter(day_str, wgid, enter_at=wall_iso)
-                    if log_event and established and (
+                    if log_event and established and gid_to_person.get(wgid) and (
                             st.just_left_office or st.just_returned):
                         _store_or_queue(write_queue, supabase, "event", {
                             "date": day_str, "global_id": wgid,
@@ -3074,7 +3074,7 @@ def main(profile: str = "imou") -> None:
                             person_id=gid_to_person.get(wgid),
                             person_name=gid_to_display.get(wgid),
                         )
-                    if write_row and established:
+                    if write_row and established and gid_to_person.get(wgid):
                         row = day_cache.status_of(day_str, wgid)
                         if row is None:
                             continue
@@ -3428,7 +3428,11 @@ def main(profile: str = "imou") -> None:
                             jpeg_renderer.submit("cam_b", vis_b)
                 if process_frame:
                     live_people = []
+                    anonymous_count = 0
                     for gid, st in sorted(room_status_now.items()):
+                        if not gid_to_person.get(gid):
+                            anonymous_count += 1
+                            continue
                         identity = manager.identities.get(gid)
                         live_people.append({
                             "gid": gid,
@@ -3475,6 +3479,7 @@ def main(profile: str = "imou") -> None:
                     streamer.set_status({
                         "schema_version": "camera-ojt.status.v1",
                         "people": live_people,
+                        "anonymous_count": anonymous_count,
                         "attendance_today": attendance_today,
                         "recent_events": list(recent_events),
                         "pending_attendance": pending_attendance(),

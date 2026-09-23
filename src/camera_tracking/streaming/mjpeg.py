@@ -26,6 +26,9 @@ class MjpegStreamer:
         self._frames: dict[str, bytes] = {}
         self._frame_at: dict[str, float] = {}
         self._status: dict = {"cameras": [], "people": []}
+        self._pending_status: dict | None = None
+        self._status_interval_s = 0.5
+        self._status_published_at = 0.0
         self._attendance_pending: Callable[[], list[dict]] = list
         self._attendance_send: Callable[[], dict] = lambda: {"sent": 0}
         self._enrollment_register: Callable[[dict], dict] = lambda _payload: {
@@ -55,7 +58,15 @@ class MjpegStreamer:
 
     def set_status(self, payload: dict) -> None:
         with self._lock:
-            self._status = dict(payload)
+            self._pending_status = dict(payload)
+            self._publish_status_locked(time.monotonic())
+
+    def _publish_status_locked(self, now: float) -> None:
+        if (self._pending_status is not None and
+                now - self._status_published_at >= self._status_interval_s):
+            self._status = self._pending_status
+            self._pending_status = None
+            self._status_published_at = now
 
     def set_attendance_actions(
         self,
@@ -78,8 +89,10 @@ class MjpegStreamer:
 
     def snapshot(self) -> tuple[dict[str, bytes], dict]:
         with self._lock:
+            now = time.monotonic()
+            self._publish_status_locked(now)
             live = {name: frame for name, frame in self._frames.items()
-                    if time.monotonic() - self._frame_at.get(name, 0) < 5.0}
+                    if now - self._frame_at.get(name, 0) < 5.0}
             return live, dict(self._status)
 
     def start(self) -> bool:

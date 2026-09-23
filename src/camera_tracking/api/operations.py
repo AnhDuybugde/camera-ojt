@@ -1,10 +1,9 @@
 """Administration operations backed by the same database as attendance."""
 from datetime import datetime
 import json
-from pathlib import Path
 from uuid import uuid5, NAMESPACE_URL
 
-from camera_tracking.store.replication import SQLiteReplica, ENROLLMENT_TABLES
+from camera_tracking.store.replication import SQLiteReplica, TABLES, ENROLLMENT_TABLES
 
 
 class Operations:
@@ -55,8 +54,6 @@ class Operations:
              json.dumps({"kind": kind, "key": record_key, "store": store}), choice))
 
     def _replica(self, store):
-        if store == "business":
-            return SQLiteReplica(self.db.path)
-        if store == "enrollment" and Path(self.embedding_path).is_file():
-            return SQLiteReplica(self.embedding_path, ENROLLMENT_TABLES)
-        raise ValueError("Unknown replica")
+        if store not in {"business", "enrollment"}:
+            raise ValueError("Unknown replica")
+        return SQLiteReplica(self.db.path, {**TABLES, **ENROLLMENT_TABLES})

@@ -21,7 +21,8 @@ def main():
     try:
         with connection.cursor() as cursor:
             if args.apply:
-                cursor.execute((root / "migrations/supabase/001_unified_platform.sql").read_text())
+                for migration in sorted((root / "migrations/supabase").glob("*.sql")):
+                    cursor.execute(migration.read_text())
             cursor.execute("SELECT count(*) FROM pg_tables WHERE schemaname='public' "
                            "AND tablename IN ('camera_events','camera_records','camera_memberships') AND rowsecurity")
             print("Platform tables with RLS:", cursor.fetchone()[0])

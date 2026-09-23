@@ -25,6 +25,16 @@ def test_status_writes_on_label_change_only() -> None:
     assert write is True
 
 
+def test_status_heartbeat_is_bounded_to_one_write_per_interval() -> None:
+    cache = DailyStateCache(heartbeat_interval_s=30.0)
+    assert cache.status_should_write(day="2026-09-12", global_id=8,
+        label="Working", in_room=True, now_s=0.0) == (True, True)
+    assert cache.status_should_write(day="2026-09-12", global_id=8,
+        label="Working", in_room=True, now_s=29.9) == (False, False)
+    assert cache.status_should_write(day="2026-09-12", global_id=8,
+        label="Working", in_room=True, now_s=30.0) == (True, False)
+
+
 def test_inroom_flip_throttled_one_hour() -> None:
     cache = DailyStateCache(inroom_min_interval_s=3600.0)
     cache.status_should_write(day="2026-09-12", global_id=2,

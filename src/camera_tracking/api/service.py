@@ -13,11 +13,10 @@ DB_METHODS = frozenset({
     "get_work_schedule", "list_work_schedules", "save_work_schedule", "save_work_schedules",
     "pending_attendance", "save_embedding_samples",
 })
-AUTH_METHODS = frozenset({"account", "ensure_accounts", "change_employee_password",
-                          "reset_employee_password", "change_password"})
+AUTH_METHODS = frozenset({"change_password", "recover", "provision"})
 EMPLOYEE_METHODS = frozenset({"get_employee", "list_employees", "list_attendance",
     "get_work_schedule", "list_work_schedules", "save_work_schedule", "save_work_schedules",
-    "save_embedding", "save_embedding_samples", "account", "change_employee_password", "detect"})
+    "save_embedding", "save_embedding_samples", "detect"})
 
 
 class ApplicationAPI:
@@ -28,37 +27,35 @@ class ApplicationAPI:
         self.sessions = {}
         self.lock = threading.Lock()
 
-    def _version(self, role, employee_id):
-        if role == "EMPLOYEE":
-            account = self.auth.account(employee_id)
-            return account.get("version") if account else None
-        row = self.db.fetch_one("SELECT password_hash FROM auth_settings WHERE role='ADMIN'")
-        return row["password_hash"] if row else None
+    def login(self, email, password):
+        account = self.auth.login(email, password)
+        return self._start_session(account)
 
-    def login(self, role, password, employee_id=""):
-        if role not in {"ADMIN", "EMPLOYEE"}:
-            raise ValueError("Invalid role")
-        account = self.auth.login(role, password, employee_id)
-        if account is None:
-            return None
+    def _start_session(self, account):
+        role, employee_id = account["role"], account["employee_id"]
         token = secrets.token_urlsafe(32)
         with self.lock:
             now = time.monotonic()
-            self.sessions = {k: v for k, v in self.sessions.items() if v[3] > now}
-            self.sessions[token] = (role, employee_id, self._version(role, employee_id), now + 28800)
-        return {"token": token, "version": account.get("version"),
-                "must_change": account.get("must_change", False)}
+            self.sessions = {k: v for k, v in self.sessions.items() if v[4] > now}
+            self.sessions[token] = (role, employee_id, account["user_id"],
+                                    account["email"], now + account["expires_in"])
+        return {"token": token, "role": role, "employee_id": employee_id,
+                "email": account["email"], "expires_in": account["expires_in"]}
 
     def dispatch(self, service, method, args, kwargs, token):
         if (service, method) == ("auth", "login"):
             return self.login(*args, **kwargs)
+        if (service, method) == ("auth", "recover"):
+            return self.auth.recover(*args, **kwargs)
+        if (service, method) == ("auth", "request_otp"):
+            return self.auth.request_otp(*args, **kwargs)
+        if (service, method) == ("auth", "verify_otp"):
+            return self._start_session(self.auth.verify_otp(*args, **kwargs))
         with self.lock:
             session = self.sessions.get(token)
-        if session is None or session[3] <= time.monotonic():
+        if session is None or session[4] <= time.monotonic():
             raise PermissionError("Session expired. Please sign in again.")
-        role, employee_id, version, _ = session
-        if self._version(role, employee_id) != version:
-            raise PermissionError("Account changed. Please sign in again.")
+        role, employee_id, user_id, email, _ = session
         allowed = {"employees": DB_METHODS, "auth": AUTH_METHODS,
                    "attendance": {"update_attendance"}, "sync": {"sync_pending"},
                    "operations": {"diagnostics", "review_events", "review", "conflicts", "resolve_conflict"},
@@ -66,11 +63,15 @@ class ApplicationAPI:
         if method not in allowed.get(service, set()):
             raise PermissionError("Operation is not exposed")
         if role == "EMPLOYEE":
-            account = self.auth.account(employee_id)
-            if account["must_change"] and method not in {"account", "change_employee_password"}:
-                raise PermissionError("Change your initial password first")
             if method not in EMPLOYEE_METHODS:
                 raise PermissionError("Administrator access required")
+        if method == "provision" and role != "ADMIN":
+            raise PermissionError("Administrator access required")
+        if method == "change_password":
+            if len(args) == 3:
+                kwargs = {**kwargs, "email": email, "current": args[0],
+                          "new": args[1], "confirmation": args[2]}
+            args = ()
         fn = getattr(self.services[service], method)
         bound = inspect.signature(fn).bind_partial(*args, **kwargs)
         if "actor_role" in inspect.signature(fn).parameters:
@@ -91,9 +92,4 @@ class ApplicationAPI:
         result = fn(*bound.args, **bound.kwargs)
         if method == "list_employees" and role == "EMPLOYEE":
             result = [row for row in result if row["employee_id"] == employee_id]
-        if method == "account" and result:
-            result = {key: result[key] for key in ("employee_id", "version", "must_change")}
-        if method in {"change_employee_password", "change_password"}:
-            with self.lock:
-                self.sessions[token] = (role, employee_id, self._version(role, employee_id), session[3])
         return result

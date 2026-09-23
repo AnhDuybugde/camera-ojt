@@ -5,14 +5,18 @@ from pathlib import Path
 
 import streamlit as st
 
-from auth.permissions import ADMIN, EMPLOYEE
-from auth.service import AuthService
+def _establish_session(account, email):
+    st.session_state.clear()
+    st.session_state.api_token = account.get("token", "")
+    st.session_state.authenticated = True
+    st.session_state.role = account["role"]
+    st.session_state.employee_id = account.get("employee_id") or None
+    st.session_state.email = account.get("email", email.strip().lower())
+    st.session_state.active_page = "Tổng quan"
+    st.rerun()
 
 
-ROLE_LABELS = {EMPLOYEE: "Nhân viên", ADMIN: "Quản trị viên"}
-
-
-def render(auth_service: AuthService) -> None:
+def render(auth_service) -> None:
     st.markdown(
         """<style>
         [data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"] {display:none!important}
@@ -37,20 +41,8 @@ def render(auth_service: AuthService) -> None:
                 </div>""",
                 unsafe_allow_html=True,
             )
-            selected_label = st.segmented_control(
-                "Vai trò",
-                [ROLE_LABELS[EMPLOYEE], ROLE_LABELS[ADMIN]],
-                default=ROLE_LABELS[EMPLOYEE],
-                width="stretch",
-                key="login_role",
-            )
             with st.form("login_form"):
-                employee_id = ""
-                if selected_label != ROLE_LABELS[ADMIN]:
-                    employee_id = st.text_input(
-                        "Tên đăng nhập", placeholder="Nhập mã nhân viên",
-                        help="Nhân viên dùng mã NV làm tên đăng nhập.",
-                    )
+                email = st.text_input("Email", placeholder="name@company.com")
                 password = st.text_input(
                     "Mật khẩu", type="password", placeholder="Nhập mật khẩu"
                 )
@@ -58,25 +50,66 @@ def render(auth_service: AuthService) -> None:
                     "Đăng nhập", type="primary", width="stretch", icon=":material/login:"
                 )
             if submitted:
-                role = ADMIN if selected_label == ROLE_LABELS[ADMIN] else EMPLOYEE
                 try:
-                    account = auth_service.login(role, password, employee_id.strip())
+                    account = auth_service.login(email.strip(), password)
                 except ValueError as exc:
                     st.error(str(exc))
                     return
                 if account:
-                    st.session_state.clear()
-                    st.session_state.api_token = account.get("token", "")
-                    st.session_state.authenticated = True
-                    st.session_state.role = role
-                    st.session_state.employee_id = employee_id.strip() if role == EMPLOYEE else None
-                    st.session_state.account_version = account.get("version")
-                    st.session_state.active_page = "Tổng quan"
-                    st.rerun()
+                    _establish_session(account, email)
                 st.error("Tên đăng nhập hoặc mật khẩu không chính xác")
+            with st.expander("Kích hoạt tài khoản hoặc đăng nhập bằng mã email"):
+                otp_email = st.text_input("Email tài khoản", key="otp_email")
+                otp_code = st.text_input("Mã xác thực", key="otp_code")
+                otp_purpose = st.selectbox(
+                    "Mục đích", ["invite", "email"],
+                    format_func=lambda value: "Kích hoạt lời mời" if value == "invite" else "Đăng nhập",
+                    key="otp_purpose",
+                )
+                new_password = st.text_input("Tạo mật khẩu (bắt buộc khi kích hoạt)",
+                                             type="password", key="invite_new_password")
+                confirm_password = st.text_input("Xác nhận mật khẩu",
+                                                 type="password", key="invite_confirm_password")
+                send_code, verify_code = st.columns(2)
+                if send_code.button("Gửi mã email", key="send_otp"):
+                    try:
+                        auth_service.request_otp(otp_email.strip())
+                        st.success("Nếu tài khoản hợp lệ, mã đã được gửi.")
+                    except (ValueError, RuntimeError) as exc:
+                        st.error(str(exc))
+                if verify_code.button("Xác thực", key="verify_otp"):
+                    try:
+                        account = auth_service.verify_otp(
+                            otp_email.strip(), otp_code.strip(), otp_purpose,
+                            new_password, confirm_password,
+                        )
+                        _establish_session(account, otp_email)
+                    except (ValueError, RuntimeError) as exc:
+                        st.error(str(exc))
+            with st.expander("Quên mật khẩu?"):
+                recover_email = st.text_input("Email khôi phục", key="recover_email")
+                if st.button("Gửi hướng dẫn đặt lại mật khẩu"):
+                    try:
+                        auth_service.recover(recover_email.strip())
+                        st.success("Nếu email tồn tại, mã khôi phục đã được gửi.")
+                    except (ValueError, RuntimeError) as exc:
+                        st.error(str(exc))
+                recovery_code = st.text_input("Mã khôi phục", key="recovery_code")
+                reset_password = st.text_input("Mật khẩu mới", type="password", key="recovery_password")
+                reset_confirmation = st.text_input("Xác nhận mật khẩu mới", type="password",
+                                                   key="recovery_confirmation")
+                if st.button("Đặt lại mật khẩu", key="finish_recovery"):
+                    try:
+                        account = auth_service.verify_otp(
+                            recover_email.strip(), recovery_code.strip(), "recovery",
+                            reset_password, reset_confirmation,
+                        )
+                        _establish_session(account, recover_email)
+                    except (ValueError, RuntimeError) as exc:
+                        st.error(str(exc))
 
 
-def render_account_controls(auth_service: AuthService, role: str) -> None:
+def render_account_controls(auth_service, role: str) -> None:
     with st.expander("Bảo mật · Đổi mật khẩu", icon=":material/lock:"):
         with st.form("change_password_form", clear_on_submit=True):
             current = st.text_input("Mật khẩu hiện tại", type="password")
@@ -85,13 +118,9 @@ def render_account_controls(auth_service: AuthService, role: str) -> None:
             change = st.form_submit_button("Cập nhật mật khẩu", width="stretch")
         if change:
             try:
-                if role == EMPLOYEE:
-                    auth_service.change_employee_password(st.session_state.employee_id, current, new, confirmation)
-                    st.session_state.account_version = auth_service.account(st.session_state.employee_id)["version"]
-                else:
-                    auth_service.change_password(role, current, new, confirmation)
+                auth_service.change_password(current, new, confirmation)
                 st.success("Đã đổi mật khẩu thành công.")
-            except ValueError as exc:
+            except (ValueError, RuntimeError) as exc:
                 st.error(str(exc))
 
     if st.button("Đăng xuất", icon=":material/logout:", width="stretch", key="logout"):
@@ -103,11 +132,3 @@ def render_account_controls(auth_service: AuthService, role: str) -> None:
                     pass
         st.session_state.clear()
         st.rerun()
-
-
-def force_password_change(auth_service: AuthService) -> None:
-    st.warning("Bạn cần đổi mật khẩu ban đầu trước khi sử dụng hệ thống.")
-    render_account_controls(auth_service, EMPLOYEE)
-    if not auth_service.account(st.session_state.employee_id)["must_change"]:
-        st.rerun()
-    st.stop()
