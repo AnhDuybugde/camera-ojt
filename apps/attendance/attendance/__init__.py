@@ -1,0 +1,1 @@
+"""Attendance business logic."""

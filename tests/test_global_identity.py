@@ -277,11 +277,11 @@ class BusinessSeparationTest(TestCase):
         states = business.update(0.0, {t.track_id for t in out})
         self.assertEqual(states[1], PersonBusinessState.WORKING)
 
-        # Person leaves: business goes AWAY_TEMP then POSSIBLY_OUT...
+        # Person leaves: business goes AWAY and stays AWAY...
         business.update(11.0, set())
-        self.assertEqual(business.state_of(1), PersonBusinessState.AWAY_TEMP)
+        self.assertEqual(business.state_of(1), PersonBusinessState.AWAY)
         business.update(61.0, set())
-        self.assertEqual(business.state_of(1), PersonBusinessState.POSSIBLY_OUT)
+        self.assertEqual(business.state_of(1), PersonBusinessState.AWAY)
 
         # ...but the Global ID reconnects when the same person returns.
         out = manager.update(
@@ -289,6 +289,4 @@ class BusinessSeparationTest(TestCase):
         )
         self.assertEqual(out[0].track_id, 1)
         states = business.update(70.0, {1})
-        self.assertEqual(states[1], PersonBusinessState.RETURNING)
-        states = business.update(74.0, {1})
         self.assertEqual(states[1], PersonBusinessState.WORKING)

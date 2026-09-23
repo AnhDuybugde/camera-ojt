@@ -69,10 +69,46 @@ class WriteQueue:
             ).fetchall()
         return [(r[0], r[1], json.loads(r[2]), r[3]) for r in rows]
 
+    def peek_kind(self, kind: str, limit: int = 100) -> list[tuple[int, str, dict, int]]:
+        """Read one consumer's rows without being blocked by other kinds."""
+        with sqlite3.connect(str(self.db_path)) as conn:
+            rows = conn.execute(
+                "SELECT id, kind, payload, attempts FROM pending_writes "
+                "WHERE kind = ? ORDER BY id ASC LIMIT ?",
+                (kind, limit),
+            ).fetchall()
+        return [(r[0], r[1], json.loads(r[2]), r[3]) for r in rows]
+
     def ack(self, row_id: int) -> None:
         with sqlite3.connect(str(self.db_path)) as conn:
             conn.execute("DELETE FROM pending_writes WHERE id = ?", (row_id,))
             conn.commit()
+
+    def quarantine(self, row_id: int, reason: str) -> None:
+        """Retain rejected payloads for reconciliation instead of dropping data."""
+        with sqlite3.connect(str(self.db_path)) as conn:
+            conn.execute("""CREATE TABLE IF NOT EXISTS rejected_writes (
+                id INTEGER PRIMARY KEY, kind TEXT, payload TEXT, created_at REAL,
+                attempts INTEGER, reason TEXT NOT NULL)""")
+            conn.execute("INSERT OR REPLACE INTO rejected_writes "
+                         "SELECT id,kind,payload,created_at,attempts,? FROM pending_writes WHERE id=?",
+                         (reason, row_id))
+            conn.execute("DELETE FROM pending_writes WHERE id=?", (row_id,))
+
+    def restore_mapped(self, mappings: dict[str, str]) -> int:
+        with sqlite3.connect(str(self.db_path)) as conn:
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='rejected_writes'").fetchone():
+                return 0
+            rows = conn.execute("SELECT id,payload FROM rejected_writes WHERE reason='unmapped_employee'").fetchall()
+            restored = 0
+            for row_id, payload in rows:
+                if json.loads(payload).get("person_id") not in mappings:
+                    continue
+                conn.execute("INSERT OR IGNORE INTO pending_writes "
+                             "SELECT id,kind,payload,created_at,attempts FROM rejected_writes WHERE id=?", (row_id,))
+                conn.execute("DELETE FROM rejected_writes WHERE id=?", (row_id,))
+                restored += 1
+            return restored
 
     def bump(self, row_id: int) -> None:
         with sqlite3.connect(str(self.db_path)) as conn:

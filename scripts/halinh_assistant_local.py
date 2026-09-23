@@ -48,10 +48,14 @@ from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
 
 from camera_tracking.config import load_config
+from camera_tracking.voice.query import HA_LINH_PROMPT, think, fast_answer
 from camera_tracking.voice.qa_tools import (
+    SEARCH_TOTAL_CHARS,
     TOOL_FUNCS,
+    build_search_context,
     build_tool_catalog,
     parse_router_json,
+    search_web_raw,
     with_scene,
 )
 from camera_tracking.voice.speaker_guard import (
@@ -69,25 +73,6 @@ from camera_tracking.voice.rtsp_voice_listener import (
 )
 from camera_tracking.voice.voice_trigger import normalize_trigger_text
 
-HA_LINH_PROMPT = """Bạn là Hà Linh, trợ lý giọng nói tiếng Việt cho hệ thống Camera-OJT.
-
-Quy tắc trả lời:
-* Trả lời trực tiếp câu hỏi của người dùng.
-* Chỉ trả lời tối đa 1-2 câu, ưu tiên 1 câu.
-* Giữ câu trả lời dưới 40 từ nếu có thể.
-* Không giải thích dài dòng, không lặp lại câu hỏi.
-* Không dùng Markdown, bullet point hoặc tiêu đề.
-* Dùng tiếng Việt tự nhiên, dễ nghe khi chuyển sang giọng nói.
-* Với câu hỏi đơn giản, chỉ đưa ra thông tin cần thiết.
-* TUYỆT ĐỐI không hỏi ngược lại người dùng dưới mọi hình thức: không câu
-hỏi làm rõ, không gợi ý hỏi tiếp, không đặt nhiều câu hỏi trong một lượt
-(hệ thống chưa có memory hội thoại).
-* Nếu thiếu thông tin, trả lời ngay với giả định hợp lý nhất và nói rõ
-giả định đó trong cùng 1 câu, không hỏi lại.
-* Nếu có dữ liệu từ tool/API, chỉ tóm tắt kết quả quan trọng nhất cho người dùng.
-* Không mô tả quá trình suy nghĩ hoặc xử lý của bạn.
-* Không nói bạn là AI, trừ khi người dùng hỏi trực tiếp.
-* Khi gọi tool, chỉ dùng kết quả tool để tạo câu trả lời cuối cùng."""
 
 # Wake: "Ha Linh oi" lam chinh; "Ha Linh"/"Linh oi" du phong.
 # Token-match tren text da normalize. "Ha" dung mot minh KHONG wake
@@ -126,24 +111,17 @@ def strip_wake_command(wake_text: str) -> str:
     return ""
 
 
-# Giao thuc router JSON 1-call: Gemini CHI hieu cau hoi, KHONG viet dap an.
+# Giao thuc router JSON: Gemini CHI hieu cau hoi, KHONG viet dap an.
 # - Cau tra loi truc tiep -> {"type":"direct",...,"text":"<cau tra loi>"}.
 # - Can tool -> {"type":"tool","tool":"<ten>","args":{...},"text":""}.
-# Backend chay tool local (tool tu format cau noi) -> TTS. 1 request/vong.
-ROUTER_PROTOCOL = """Bạn là bộ định tuyến câu hỏi tiếng Việt, trả về JSON MỘT DÒNG duy nhất, không thêm bất kỳ nội dung nào ngoài JSON:
-{"type":"direct|tool","tool":"<tên_tool hoặc null>","args":{},"text":"<câu trả lời ngắn nếu type=direct, ngược lại để rỗng>"}
+# Backend chay tool local (tool tu format cau noi) -> TTS.
+# Rieng web_search chay 2-call: router tao query -> backend goi Search API
+# ngoai (Tavily/Serper/Brave/Exa/SearXNG) lay JSON -> Gemini lan 2 tom tat
+# 1-2 cau de TTS (xem think()). Khong dung Grounding Search cua Gemini
+# nen khong vuong gioi han Free Tier.
 
-Luật:
-* type=direct: tự trả lời ngắn gọn 1-2 câu, dưới 40 từ, tiếng Việt tự nhiên để đọc thành tiếng, không Markdown. CẤM hỏi ngược lại (không câu hỏi làm rõ, không gợi ý hỏi tiếp).
-* type=tool: chỉ dùng tool trong danh sách dưới; điền đủ tham số bắt buộc; tham số tùy chọn không biết thì bỏ qua (tool có giá trị mặc định).
-* Không bịa tham số: nghe "mấy giờ" thì gọi get_current_time không tham số; nghe thiếu thông tin bắt buộc thì type=direct với câu trả lời tốt nhất theo giả định mặc định (nêu giả định), KHÔNG hỏi lại.
-* Ví dụ: "Python là gì" -> {"type":"direct","tool":null,"args":{},"text":"Python là ngôn ngữ lập trình phổ biến, dễ đọc và dùng nhiều cho AI."}
-* Ví dụ: "Đà Nẵng hôm nay bao nhiêu độ" -> {"type":"tool","tool":"get_weather","args":{"city":"Đà Nẵng"},"text":""}
+# Prompt tong hop ket qua search (Gemini lan 2): chi tom tat, khong router.
 
-Danh sách tool:
-"""
-
-ROUTER_SYSTEM = HA_LINH_PROMPT + "\n\n" + ROUTER_PROTOCOL + build_tool_catalog()
 
 FILLER_FILES = {
     "ready": "ready.wav",
@@ -307,7 +285,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rounds", type=int, default=0,
                         help="So vong hoi-dap (0 = lien tuc den Ctrl+C).")
     parser.add_argument("--model", default=None)
-    parser.add_argument("--max-tokens", type=int, default=100)
+    parser.add_argument("--max-tokens", type=int, default=300,
+                        help="Token toi da cho cau tong hop search (lan 2). "
+                             "Router JSON lan 1 luon 300.")
+    parser.add_argument("--router-tokens", type=int, default=300,
+                        help="Token toi da cho router JSON (lan 1).")
+    parser.add_argument("--search-tokens", type=int, default=0,
+                        help="Token toi da cho tong hop search (lan 2, 0 = "
+                             "theo --max-tokens).")
+    parser.add_argument("--search-results", type=int, default=5,
+                        help="So ket qua search toi da moi vong (1-10).")
+    import os as _os
+
+    try:
+        _search_chars_default = max(
+            1000, int((_os.getenv("SEARCH_MAX_CHARS") or "").strip() or 0)
+        ) if (_os.getenv("SEARCH_MAX_CHARS") or "").strip() else SEARCH_TOTAL_CHARS
+    except (TypeError, ValueError):
+        _search_chars_default = SEARCH_TOTAL_CHARS
+    parser.add_argument("--search-chars", type=int,
+                        default=_search_chars_default,
+                        help="Context search toi da (ky tu) nap cho Gemini "
+                             "lan 2 (mac dinh 6000 ~ 1500 token, hoac "
+                             "SEARCH_MAX_CHARS trong .env).")
     parser.add_argument("--tts-voice", default="maichi")
     parser.add_argument("--tts-device", default="cuda",
                         help="cuda (co GPU) hoac cpu.")
@@ -503,57 +503,8 @@ def capture_utterance(
     return bytes(buf) if started and buf else None
 
 
-def think(question: str, model: str, max_tokens: int,
-          use_search: bool = False) -> tuple[str, float, list[str]]:
-    """Router JSON 1-call duy nhat: Gemini chi hieu cau hoi.
 
-    - direct -> text trong JSON la dap an cuoi (khong goi them).
-    - tool   -> dispatch TOOL_FUNCS local; chinh tool format cau noi.
-    Khong bao gio goi Gemini lan 2/vong. Tra (dap, giay tool, tools).
-    """
-    import os
 
-    try:
-        from google import genai
-        from google.genai import types
-    except ImportError as error:
-        raise RuntimeError("chua cai google-genai: pip install google-genai") from error
-    api_key = os.getenv("GEMINI_API_KEY", "").strip().strip("'\"")
-    if not api_key:
-        raise RuntimeError("thieu GEMINI_API_KEY trong .env")
-    client = genai.Client(
-        api_key=api_key,
-        http_options={"retry_options": {"attempts": 1}})
-    config = types.GenerateContentConfig(
-        system_instruction=ROUTER_SYSTEM,
-        max_output_tokens=300,
-        temperature=0,
-        thinking_config=types.ThinkingConfig(thinking_budget=0),
-    )
-    response = client.models.generate_content(
-        model=model, contents=with_scene(question), config=config)
-    raw = (getattr(response, "text", "") or "").strip()
-    plan = parse_router_json(raw)
-    if plan["type"] == "direct" or not plan["tool"]:
-        return plan["text"], 0.0, []
-    name = str(plan["tool"])
-    args = plan["args"]
-    func = TOOL_FUNCS.get(name)
-    if not callable(func) or name.startswith("_"):
-        return f"Hàm {name} chưa hỗ trợ.", 0.0, [name]
-    t0 = time.monotonic()
-    try:
-        answer = func(**{k: v for k, v in args.items()})
-    except TypeError:
-        try:
-            answer = func()
-        except Exception as error:
-            answer = f"lỗi tool {name}: {error}"
-    except Exception as error:
-        answer = f"lỗi tool {name}: {error}"
-    tool_s = time.monotonic() - t0
-    print(f"[HaLinh-local] tool {name}({args}) -> {answer}", flush=True)
-    return str(answer), tool_s, [name]
 
 
 def main() -> None:
@@ -843,7 +794,9 @@ def main() -> None:
                         break
                     try:
                         answer, tool_s, used = think(
-                            utter, model, args.max_tokens, args.with_search)
+                            utter, model, args.max_tokens, args.with_search,
+                            args.router_tokens, args.search_tokens,
+                            args.search_results, args.search_chars)
                     except Exception as error:  # noqa: BLE001
                         print(f"[HaLinh-local] loi: {type(error).__name__}: "
                               f"{str(error)[:200]}", flush=True)
@@ -864,7 +817,9 @@ def main() -> None:
                     try:
                         ans, tls, used = think(
                             question, model, args.max_tokens,
-                            args.with_search)
+                            args.with_search, args.router_tokens,
+                            args.search_tokens, args.search_results,
+                            args.search_chars)
                         one.update(answer=ans, tool_s=tls, used=used)
                     except Exception as error:  # noqa: BLE001
                         one.update(error=error)

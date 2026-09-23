@@ -1,26 +1,27 @@
-"""Fuse room status from 2 channels + attendance.
+"""Fuse room status from 2 channels + attendance. Exactly 5 labels.
 
-Rules:
-- Channel A (room): seen -> "Working"; absent past away_grace -> "Away".
-- Reappear in channel B (door) after absent in A -> "Out of office"
-  (in_room=False). Only confirmed when there is B evidence *after* the
-  A-absence started and within leave_confirm_window_s (avoids label
-  flicker on detector misses).
-- Stable return to A -> "Working" (in_room=True).
-- RETURNING from business tracker -> "Returning".
-- Overlay shows only Global ID + name (if checked in) + EN label.
-  Never shows raw ByteTrack IDs. Labels are plain ASCII on purpose:
-  OpenCV Hershey fonts cannot render Vietnamese diacritics.
+Rules (bbox-center image zones):
+- Channel B OUT_OF_DOOR (center in R2) -> "Out of door" (in_room=False).
+  Fires just_left_office on the False->True edge of _was_out.
+- Channel B AT_DOOR (center in R3) -> "At door" (in_room=True).
+- Channel A WORKING (center outside R1) -> "Working" (in_room=True).
+- Absent from BOTH channels -> "Away"; still absent past
+  absent_fallback_s (default 900s = 15 min) -> "Out of door".
+  Any sighting in A or B resets the timer.
+- Anything undecided -> "Unknown".
+- Stable return to A after out (was_out and visible in A) -> just_returned.
+
+Overlay labels are plain ASCII on purpose: OpenCV Hershey fonts cannot
+render Vietnamese diacritics.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
 LABEL_WORKING = "Working"
-LABEL_AWAY_SEAT = "Away"
-LABEL_NEAR_SEAT = "Near seat"
-LABEL_OUT_OFFICE = "Out of office"
-LABEL_RETURNING = "Returning"
+LABEL_AWAY = "Away"
+LABEL_AT_DOOR = "At door"
+LABEL_OUT_OF_DOOR = "Out of door"
 LABEL_UNKNOWN = "Unknown"
 
 
@@ -39,19 +40,22 @@ class RoomPersonStatus:
 class RoomPresenceAggregator:
     """Gop ChannelBusinessTracker A/B + attendance names thanh label hien thi."""
 
-    leave_confirm_window_s: float = 300.0
-    # Fallback thực tế: vắng A quá lâu mà không có B (ra bằng cửa khuất)
-    # thì vẫn kết luận Out để dashboard khỏi kẹt "Away" cả ngày.
-    # 0 = tắt fallback, giữ behavior bảo thủ cũ.
+    leave_confirm_window_s: float = 300.0  # deprecated, ignored
+    # Absent from BOTH channels longer than this -> "Out of door".
+    # 0 = disabled (absent stays "Away"). Default 900s = 15 minutes.
     absent_fallback_s: float = 900.0
     _last_seen_b: dict[int, float] = field(default_factory=dict, init=False)
+    _last_seen: dict[int, float] = field(default_factory=dict, init=False)
     _absent_since: dict[int, float] = field(default_factory=dict, init=False)
+    _ever_seen: set[int] = field(default_factory=set, init=False)
     _was_out: dict[int, bool] = field(default_factory=dict, init=False)
 
     def forget(self, gid: int) -> None:
         """Drop per-ID memory (dead ghosts must not linger in the UI)."""
         self._last_seen_b.pop(gid, None)
+        self._last_seen.pop(gid, None)
         self._absent_since.pop(gid, None)
+        self._ever_seen.discard(gid)
         self._was_out.pop(gid, None)
 
     def update(
@@ -66,77 +70,86 @@ class RoomPresenceAggregator:
     ) -> dict[int, RoomPersonStatus]:
         for gid in present_b:
             self._last_seen_b[gid] = now_s
+        for gid in set(present_a) | set(present_b):
+            self._ever_seen.add(gid)
+            self._last_seen[gid] = now_s
+            self._absent_since.pop(gid, None)
         gids = (
             set(present_a) | set(present_b)
             | set(states_a) | set(states_b)
-            | set(self._last_seen_b) | set(self._was_out)
+            | set(self._last_seen_b) | set(self._absent_since)
+            | set(self._ever_seen) | set(self._was_out)
         )
         out: dict[int, RoomPersonStatus] = {}
         for gid in sorted(gids):
             state_a = states_a.get(gid, "UNKNOWN")
+            state_b = states_b.get(gid, "UNKNOWN")
             in_a = gid in present_a
-            if in_a:
-                self._absent_since.pop(gid, None)
-            else:
-                self._absent_since.setdefault(gid, now_s)
-            last_b = self._last_seen_b.get(gid)
-            absent_start = self._absent_since.get(gid, now_s)
-            # B evidence only counts when it happens after the A-absence
-            # started (not a stale sighting) and inside the confirm window.
-            seen_b_recently = (
-                last_b is not None
-                and last_b >= absent_start
-                and (now_s - last_b) <= self.leave_confirm_window_s
-            )
+            in_b = gid in present_b
             was_out = self._was_out.get(gid, False)
             name = names.get(gid)
+            if not in_a and not in_b:
+                # Absence counts from the last live sighting, not from the
+                # first absent frame (frames may skip while overloaded).
+                self._absent_since.setdefault(
+                    gid, self._last_seen.get(gid, now_s))
+            absent_for = now_s - self._absent_since.get(gid, now_s)
 
             just_left = False
             just_back = False
-            if in_a:
-                if was_out:
-                    just_back = True
-                # Visible in A, but the position-driven business state still
-                # rules: standing elsewhere while visible is Away/Near, not
-                # Working. (Presence-only fallback never yields these states
-                # together with in_a, so old behavior is preserved there.)
-                if state_a == "NEAR_SEAT":
-                    label, in_room, out_now = LABEL_NEAR_SEAT, True, False
-                elif state_a == "POSSIBLY_OUT" and seen_b_recently:
-                    if not was_out:
-                        just_left = True
-                    label, in_room, out_now = LABEL_OUT_OFFICE, False, True
-                elif state_a in ("AWAY_TEMP", "POSSIBLY_OUT"):
-                    label, in_room, out_now = LABEL_AWAY_SEAT, True, False
-                else:
-                    label, in_room, out_now = LABEL_WORKING, True, False
-            elif state_a == "RETURNING" or states_b.get(gid) == "RETURNING":
-                label, in_room, out_now = LABEL_RETURNING, True, False
-            elif state_a == "NEAR_SEAT":
-                label, in_room, out_now = LABEL_NEAR_SEAT, True, False
-            elif state_a == "AWAY_TEMP":
-                label, in_room, out_now = LABEL_AWAY_SEAT, True, False
-            elif state_a == "POSSIBLY_OUT" and seen_b_recently:
+            # Door-out wins outright, even over a simultaneous A sighting
+            # (overlap views): R2 means outside the glass.
+            if state_b == "OUT_OF_DOOR":
                 if not was_out:
                     just_left = True
-                label, in_room, out_now = LABEL_OUT_OFFICE, False, True
-            elif state_a == "POSSIBLY_OUT":
-                absent_for = now_s - absent_start
-                if (
-                    self.absent_fallback_s > 0
-                    and absent_for >= self.absent_fallback_s
-                ):
+                label, in_room, out_now = LABEL_OUT_OF_DOOR, False, True
+            elif state_b == "AT_DOOR" and (in_b or not in_a):
+                label, in_room, out_now = LABEL_AT_DOOR, True, False
+                if was_out and in_a:
+                    # At the door and visible inside again: treat as return.
+                    just_back = True
+                    out_now = False
+            elif in_a:
+                if was_out:
+                    just_back = True
+                if state_a == "WORKING":
+                    label, in_room, out_now = LABEL_WORKING, True, False
+                elif state_a == "AT_DOOR":
+                    label, in_room, out_now = LABEL_AT_DOOR, True, False
+                elif state_a == "OUT_OF_DOOR":
                     if not was_out:
                         just_left = True
-                    label, in_room, out_now = LABEL_OUT_OFFICE, False, True
+                    label, in_room, out_now = LABEL_OUT_OF_DOOR, False, True
+                elif state_a == "AWAY":
+                    label, in_room, out_now = LABEL_AWAY, True, False
                 else:
-                    # Absent long in A but no B evidence yet -> stay conservative:
-                    # still away from seat, do not conclude out of office.
-                    label, in_room, out_now = LABEL_AWAY_SEAT, True, False
-            elif gid in present_b and not in_a and was_out:
-                label, in_room, out_now = LABEL_OUT_OFFICE, False, True
+                    label, in_room, out_now = LABEL_UNKNOWN, True, False
+            elif state_a == "AT_DOOR" or (state_b == "AT_DOOR" and not in_b):
+                # Lingering door memory while absent: keep showing door
+                # until the channel absence timer flips it to AWAY.
+                label, in_room, out_now = LABEL_AT_DOOR, True, False
+            elif state_a == "AWAY" or state_b == "AWAY":
+                label, in_room, out_now = LABEL_AWAY, True, False
+            elif gid in self._ever_seen:
+                # Channel already pruned this ID (prune_after_s) but it was
+                # seen before: still Away, not Unknown. The timer below
+                # promotes it to Out of door after absent_fallback_s.
+                label, in_room, out_now = LABEL_AWAY, True, False
             else:
                 label, in_room, out_now = LABEL_UNKNOWN, True, False
+
+            # Absent from BOTH channels past the fallback window -> Out of
+            # door (same terminal state as R2). Fires just_left once.
+            # Door states decided above already mean out/door, skip them.
+            if (
+                not in_a and not in_b
+                and label not in (LABEL_OUT_OF_DOOR, LABEL_AT_DOOR)
+                and self.absent_fallback_s > 0
+                and absent_for >= self.absent_fallback_s
+            ):
+                if not was_out:
+                    just_left = True
+                label, in_room, out_now = LABEL_OUT_OF_DOOR, False, True
 
             self._was_out[gid] = out_now
             out[gid] = RoomPersonStatus(

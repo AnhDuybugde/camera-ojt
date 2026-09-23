@@ -8,13 +8,16 @@ import numpy as np
 from camera_tracking.domain import Track
 
 # Box + label color by room status (BGR). Same semantics as dashboard badges.
+# 5 live labels; legacy strings kept so old snapshots/DB rows still color.
 STATUS_COLORS: dict[str, tuple[int, int, int]] = {
     "Working": (40, 180, 40),       # green
-    "Near seat": (0, 200, 255),     # yellow
     "Away": (0, 200, 255),          # yellow
-    "Returning": (255, 150, 0),     # blue
-    "Out of office": (60, 60, 220),  # red
-    "Unknown": (60, 60, 220),       # red
+    "At door": (0, 200, 255),       # yellow (doorway, still in building)
+    "Out of door": (60, 60, 220),   # red
+    "Unknown": (200, 200, 200),     # grey
+    "Near seat": (0, 200, 255),     # legacy -> Away yellow
+    "Returning": (0, 200, 255),     # legacy -> Away yellow
+    "Out of office": (60, 60, 220),  # legacy -> Out of door red
 }
 _DEFAULT_TRACK_COLOR = (200, 200, 200)
 _HAND_CONNECTIONS = (

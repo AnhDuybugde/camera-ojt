@@ -9,13 +9,18 @@ from camera_tracking.workstate.channel_status import (
     PersonBusinessState,
 )
 from camera_tracking.workstate.consumer import WorkstateConsumer
+from camera_tracking.workstate.image_zones import (
+    classify_channel_a,
+    classify_channel_b,
+    load_channel_zones,
+    point_in_polygon,
+)
 from camera_tracking.workstate.reconcile import IdentityReconciler
 from camera_tracking.workstate.reid import OsnetEmbedding, cosine_similarity
 from camera_tracking.workstate.room_fusion import (
-    LABEL_AWAY_SEAT,
-    LABEL_NEAR_SEAT,
-    LABEL_OUT_OFFICE,
-    LABEL_RETURNING,
+    LABEL_AT_DOOR,
+    LABEL_AWAY,
+    LABEL_OUT_OF_DOOR,
     LABEL_UNKNOWN,
     LABEL_WORKING,
     RoomPersonStatus,
@@ -29,10 +34,9 @@ from camera_tracking.workstate.workstation import (
 )
 
 __all__ = [
-    "LABEL_AWAY_SEAT",
-    "LABEL_NEAR_SEAT",
-    "LABEL_OUT_OFFICE",
-    "LABEL_RETURNING",
+    "LABEL_AT_DOOR",
+    "LABEL_AWAY",
+    "LABEL_OUT_OF_DOOR",
     "LABEL_UNKNOWN",
     "LABEL_WORKING",
     "ChannelBusinessTracker",
@@ -47,5 +51,9 @@ __all__ = [
     "WorkstationState",
     "WorkstationZone",
     "ZoneObs",
+    "classify_channel_a",
+    "classify_channel_b",
     "cosine_similarity",
+    "load_channel_zones",
+    "point_in_polygon",
 ]

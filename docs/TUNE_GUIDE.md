@@ -110,7 +110,7 @@ File: `attendance`.
    Khi đã có ROI thật, giữ `move_ratio=0.0`.
 3. `grace_s=1.5, dwell_s=2.0, hysteresis 0.3`: phòng nhiễu biên (đi qua lại mép bàn hay flip)
    → tăng grace 2.5 + dwell 3.0. Muốn nhạy (ra khỏi ghế báo ngay) → giảm grace 1.0 + dwell 1.0.
-4. `away_grace_s=1.5, out_after_s=20.0` (CLI): người đi vệ sinh 5p hay bị `POSSIBLY_OUT` →
+4. `away_grace_s=1.5, out_after_s=20.0` (CLI): người đi vệ sinh 5p hay bị `AWAY` →
    tăng `out_after 45-60`. Muốn báo rời phòng nhanh → giảm 10-15.
 5. `room_fusion.leave_confirm_window_s=300, inroom_min_interval_s=3600`: đừng giảm
    `inroom_min` dưới 600 nếu không muốn spam Supabase.

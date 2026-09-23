@@ -1,4 +1,4 @@
-"""Test ChannelBusinessTracker: presence fallback + workstation ROI mode."""
+"""Test ChannelBusinessTracker: 5 states (UNKNOWN/WORKING/AWAY/AT_DOOR/OUT_OF_DOOR)."""
 from camera_tracking.workstate.channel_status import (
     ChannelBusinessTracker,
     PersonBusinessState,
@@ -47,9 +47,9 @@ def test_displaced_leave_seat_while_visible() -> None:
     assert _commit(tr, 2.0, SEAT_N) is PersonBusinessState.WORKING
     assert _commit(tr, 3.0, FAR_N) is PersonBusinessState.WORKING  # grace
     assert _commit(tr, 4.0, FAR_N) is PersonBusinessState.WORKING  # dwell
-    assert _commit(tr, 5.0, FAR_N) is PersonBusinessState.AWAY_TEMP
+    assert _commit(tr, 5.0, FAR_N) is PersonBusinessState.AWAY
     # Roaming to another far spot: stays AWAY.
-    assert _commit(tr, 6.0, FAR2_N) is PersonBusinessState.AWAY_TEMP
+    assert _commit(tr, 6.0, FAR2_N) is PersonBusinessState.AWAY
 
 
 def test_displaced_still_elsewhere_is_away() -> None:
@@ -60,8 +60,8 @@ def test_displaced_still_elsewhere_is_away() -> None:
     _commit(tr, 2.0, SEAT_N)
     _commit(tr, 5.0, FAR_N)
     _commit(tr, 6.0, FAR_N)
-    assert _commit(tr, 7.0, FAR_N) is PersonBusinessState.AWAY_TEMP
-    assert _commit(tr, 8.0, FAR_N) is PersonBusinessState.AWAY_TEMP
+    assert _commit(tr, 7.0, FAR_N) is PersonBusinessState.AWAY
+    assert _commit(tr, 8.0, FAR_N) is PersonBusinessState.AWAY
 
 
 def test_displaced_settle_new_spot_returns() -> None:
@@ -71,10 +71,11 @@ def test_displaced_settle_new_spot_returns() -> None:
     _commit(tr, 2.0, SEAT_N)
     _commit(tr, 5.0, FAR_N)
     _commit(tr, 6.0, FAR_N)
-    _commit(tr, 7.0, FAR_N)  # adopts FAR_N as the new anchor here
-    assert _commit(tr, 8.0, FAR_N) is PersonBusinessState.AWAY_TEMP
-    assert _commit(tr, 9.0, FAR_N) is PersonBusinessState.AWAY_TEMP
-    assert _commit(tr, 11.0, FAR_N) is PersonBusinessState.RETURNING
+    _commit(tr, 7.0, FAR_N)  # committed AWAY here
+    assert _commit(tr, 8.0, FAR_N) is PersonBusinessState.AWAY
+    assert _commit(tr, 9.0, FAR_N) is PersonBusinessState.AWAY
+    # Anchor adopted at the new spot -> back to WORKING directly (no RETURNING).
+    assert _commit(tr, 11.0, FAR_N) is PersonBusinessState.AWAY  # dwell pending
     assert _commit(tr, 13.0, FAR_N) is PersonBusinessState.WORKING
 
 
@@ -90,7 +91,7 @@ def test_displaced_flicker_keeps_working() -> None:
 def test_displaced_disabled_is_presence_only() -> None:
     tr = _moved(move_ratio=0.0)
     assert tr.update(0.0, {1}, {1: FAR_N})[1] is PersonBusinessState.WORKING
-    assert tr.update(5.0, set())[1] is PersonBusinessState.AWAY_TEMP
+    assert tr.update(5.0, set())[1] is PersonBusinessState.AWAY
 
 
 def test_presence_fallback_without_workstations() -> None:
@@ -98,10 +99,11 @@ def test_presence_fallback_without_workstations() -> None:
                                 return_stable_s=2.0)
     assert tr.update(0.0, {1})[1] is PersonBusinessState.WORKING
     assert tr.update(2.0, set())[1] is PersonBusinessState.WORKING
-    assert tr.update(4.0, set())[1] is PersonBusinessState.AWAY_TEMP
-    assert tr.update(30.0, set())[1] is PersonBusinessState.POSSIBLY_OUT
-    assert tr.update(31.0, {1})[1] is PersonBusinessState.RETURNING
-    assert tr.update(34.0, {1})[1] is PersonBusinessState.WORKING
+    assert tr.update(4.0, set())[1] is PersonBusinessState.AWAY
+    # Long absence stays AWAY (no POSSIBLY_OUT in 5-state mode)...
+    assert tr.update(30.0, set())[1] is PersonBusinessState.AWAY
+    # ...and reappearance flips straight back to WORKING (no RETURNING).
+    assert tr.update(31.0, {1})[1] is PersonBusinessState.WORKING
 
 
 def test_zone_at_core_becomes_working() -> None:
@@ -119,10 +121,10 @@ def test_zone_leave_seat_while_visible_is_away() -> None:
     _commit(tr, 2.0, SEAT)
     assert _commit(tr, 3.0, FAR) is PersonBusinessState.WORKING  # grace
     assert _commit(tr, 4.0, FAR) is PersonBusinessState.WORKING  # dwell
-    assert _commit(tr, 5.0, FAR) is PersonBusinessState.AWAY_TEMP
+    assert _commit(tr, 5.0, FAR) is PersonBusinessState.AWAY
     # Frozen in place far away: stays AWAY, never flips back by itself.
-    assert _commit(tr, 6.0, FAR) is PersonBusinessState.AWAY_TEMP
-    assert _commit(tr, 7.0, FAR) is PersonBusinessState.AWAY_TEMP
+    assert _commit(tr, 6.0, FAR) is PersonBusinessState.AWAY
+    assert _commit(tr, 7.0, FAR) is PersonBusinessState.AWAY
 
 
 def test_zone_flicker_under_grace_keeps_state() -> None:
@@ -135,14 +137,15 @@ def test_zone_flicker_under_grace_keeps_state() -> None:
     assert _commit(tr, 5.0, SEAT) is PersonBusinessState.WORKING
 
 
-def test_zone_near_seat() -> None:
+def test_zone_extended_collapses_to_working() -> None:
+    """No NEAR_SEAT in 5-state mode: extended area is WORKING."""
     tr = _zoned()
     _commit(tr, 0.0, SEAT)
     _commit(tr, 1.0, SEAT)
     _commit(tr, 2.0, SEAT)
     assert _commit(tr, 5.0, NEAR) is PersonBusinessState.WORKING  # grace
     assert _commit(tr, 6.0, NEAR) is PersonBusinessState.WORKING  # dwell
-    assert _commit(tr, 7.0, NEAR) is PersonBusinessState.NEAR_SEAT
+    assert _commit(tr, 7.0, NEAR) is PersonBusinessState.WORKING
 
 
 def test_zone_return_cycle() -> None:
@@ -152,21 +155,22 @@ def test_zone_return_cycle() -> None:
     _commit(tr, 2.0, SEAT)
     _commit(tr, 5.0, FAR)
     _commit(tr, 6.0, FAR)
-    assert _commit(tr, 7.0, FAR) is PersonBusinessState.AWAY_TEMP
-    assert _commit(tr, 8.0, SEAT) is PersonBusinessState.AWAY_TEMP  # grace
-    assert _commit(tr, 9.0, SEAT) is PersonBusinessState.AWAY_TEMP  # dwell
-    assert _commit(tr, 10.0, SEAT) is PersonBusinessState.RETURNING
+    assert _commit(tr, 7.0, FAR) is PersonBusinessState.AWAY
+    assert _commit(tr, 8.0, SEAT) is PersonBusinessState.AWAY  # grace
+    assert _commit(tr, 9.0, SEAT) is PersonBusinessState.AWAY  # dwell
+    # Back at seat: straight to WORKING, no RETURNING intermediate.
+    assert _commit(tr, 10.0, SEAT) is PersonBusinessState.WORKING
     assert _commit(tr, 12.0, SEAT) is PersonBusinessState.WORKING
 
 
-def test_zone_absence_still_times_out() -> None:
+def test_zone_absence_stays_away() -> None:
     tr = _zoned()
     _commit(tr, 0.0, SEAT)
     _commit(tr, 1.0, SEAT)
     _commit(tr, 2.0, SEAT)
     assert tr.update(3.0, set())[1] is PersonBusinessState.WORKING
-    assert tr.update(6.0, set())[1] is PersonBusinessState.AWAY_TEMP
-    assert tr.update(30.0, set())[1] is PersonBusinessState.POSSIBLY_OUT
+    assert tr.update(6.0, set())[1] is PersonBusinessState.AWAY
+    assert tr.update(30.0, set())[1] is PersonBusinessState.AWAY
 
 
 def test_prune_forgets_dead_ids() -> None:

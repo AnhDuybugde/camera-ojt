@@ -5,9 +5,9 @@ homography into floor meters. Motion, direction, pose or distance are NEVER
 conditions here; they may only modulate stabilizer timing elsewhere.
 
 Per person, one workstation has:
-- core ROI: desk/chair area -> AT_WORKSTATION
-- extended ROI: nearby area -> NEAR_WORKSTATION
-- outside extended -> AWAY_FROM_WORKSTATION
+- core ROI: desk/chair area -> WORKING
+- extended ROI: nearby area -> WORKING (collapsed, no near-seat state)
+- outside extended -> AWAY
 
 Assignment: whoever dwells in a core longer than assign_dwell_s owns it;
 an explicit person_id -> workstation map always wins (stable across

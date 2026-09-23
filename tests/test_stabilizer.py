@@ -1,8 +1,8 @@
 """Test StateStabilizer: raw -> stable -> committed separation."""
 from camera_tracking.workstate.stabilizer import StateStabilizer, WorkstationState
 
-AT = WorkstationState.AT_WORKSTATION
-AWAY = WorkstationState.AWAY_FROM_WORKSTATION
+AT = WorkstationState.WORKING
+AWAY = WorkstationState.AWAY
 
 
 def test_commit_needs_grace_plus_dwell() -> None:

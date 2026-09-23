@@ -157,6 +157,8 @@ class InsightFaceEmbedder:
         if self._app is not None:
             return self._app
         ensure_cuda_dlls()
+        if self.device_name == "cuda" and not self._cuda_provider_available():
+            raise RuntimeError("face_device=cuda requires onnxruntime-gpu and CUDAExecutionProvider.")
         try:
             from insightface.app import FaceAnalysis
         except ImportError as error:

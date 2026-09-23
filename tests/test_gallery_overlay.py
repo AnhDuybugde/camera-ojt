@@ -215,10 +215,13 @@ def test_status_colors_by_label() -> None:
 
     assert status_color("Working") == (40, 180, 40)
     assert status_color("Away") == (0, 200, 255)
+    assert status_color("At door") == (0, 200, 255)
+    assert status_color("Out of door") == (60, 60, 220)
+    assert status_color("Unknown") == (200, 200, 200)
+    # Legacy labels keep their old colors.
     assert status_color("Near seat") == (0, 200, 255)
     assert status_color("Out of office") == (60, 60, 220)
-    assert status_color("Unknown") == (60, 60, 220)
-    assert status_color("Returning") == (255, 150, 0)
+    assert status_color("Returning") == (0, 200, 255)
     assert status_color("nope") is None
     assert status_color(None) is None
 

@@ -2,8 +2,12 @@
 
 Hien co: get_weather (Open-Meteo, mien phi) + ~60 tool local/API-free
 khac (tien te, don vi, tin tuc, trang thai may, file whitelist, so lieu
-tracking truc tiep...). Them tool moi = them 1 ham + 1 function
-declaration trong router prompt cua scripts/halinh_assistant*.py.
+tracking truc tiep...) + web_search (search ngoai qua Function Calling:
+Gemini chi tao query, backend goi Tavily/Serper/Brave/Exa/SearXNG roi
+tra JSON ve xu ly local — khong dung Grounding Search cua Gemini nen
+khong vuong gioi han Free Tier). Them tool moi = them 1 ham + 1
+function declaration trong TOOL_DECLARATIONS duoi day (router prompt
+tu build qua build_tool_catalog()).
 """
 from __future__ import annotations
 
@@ -98,10 +102,14 @@ def get_weather(city: str | None = None) -> str:
 
 __all__ = [
     "DEFAULT_CITY",
+    "SEARCH_MAX_RESULTS",
+    "SEARCH_SNIPPET_CHARS",
+    "SEARCH_TOTAL_CHARS",
     "STUB_TOOLS",
     "TOOL_DECLARATIONS",
     "TOOL_FUNCS",
     "WEATHER_WORDS",
+    "build_search_context",
     "build_tool_catalog",
     "calculate",
     "geocode_city",
@@ -109,6 +117,8 @@ __all__ = [
     "get_current_time",
     "get_weather",
     "parse_router_json",
+    "search_web_raw",
+    "web_search",
 ]
 
 
@@ -1026,6 +1036,344 @@ def get_book_info(isbn: str | None = None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Web search ngoai qua Function Calling (Gemini Free Tier khong co
+# Grounding with Google Search → Gemini chi tao query, backend goi
+# Search API ben ngoai roi tra JSON ve xu ly local).
+#
+# Kien truc:
+#   User -> Gemini (router JSON: {"tool":"web_search","args":{"query":...}})
+#        -> Backend: search_web_raw(query) -> [{"title","url","content"}]
+#        -> Gemini lan 2 (synthesis, xem think() trong halinh_assistant*.py)
+#           hoac fallback: web_search() format san cau noi.
+#
+# Thu tu provider (provider nao co key/cau hinh thi dung truoc):
+#   1. Tavily  (TAVILY_API_KEY,  ~1000 credits/thang free, toi uu cho LLM)
+#   2. Serper  (SERPER_API_KEY,  ~2500 query free, giong Google nhất)
+#   3. Brave   (BRAVE_API_KEY,   ~$5 credit/thang free, index rieng)
+#   4. Exa     (EXA_API_KEY,     ~$20 signup + $10/thang, semantic/AI)
+#   5. SearXNG (SEARXNG_URL,     self-host, gan nhu 0 dong: /search?q=&format=json)
+#   6. Fallback free khong key: DuckDuckGo instant + Wikipedia opensearch
+#      (yeu hon tin tuc/gia ca realtime, nhung prototype chay ngay khong key).
+# ---------------------------------------------------------------------------
+
+SEARCH_MAX_RESULTS = 5
+SEARCH_SNIPPET_CHARS = 800
+SEARCH_TOTAL_CHARS = 6000
+SEARCH_TIMEOUT_S = 12.0
+
+
+def _http_post_json(url: str, payload: dict, headers: dict | None = None,
+                    timeout: float = SEARCH_TIMEOUT_S) -> dict | list:
+    """POST JSON -> dict/list (dung cho Tavily/Serper/Brave/Exa)."""
+    import os as _os
+
+    _ = _os.getenv("DUMMY_ENV_FOR_LINT", "")
+    body = json.dumps(payload).encode("utf-8")
+    req_headers = {"Content-Type": "application/json",
+                   "User-Agent": "camera-ojt-qa/1.0"}
+    if headers:
+        req_headers.update(headers)
+    request = urllib.request.Request(url, data=body, headers=req_headers,
+                                     method="POST")
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response)
+
+
+def _clean_snippet(text: object, limit: int = SEARCH_SNIPPET_CHARS) -> str:
+    """Gon snippet: xoa whitespace thua, cat o limit ky tu."""
+    import re as _re
+
+    cleaned = _re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(cleaned) > limit:
+        cleaned = cleaned[:limit].rsplit(" ", 1)[0] + "…"
+    return cleaned
+
+
+def _norm_results(items: list, limit: int) -> list[dict]:
+    """Chuan hoa ve [{"title","url","content"}] (bo muc rong)."""
+    out: list[dict] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        url = str(item.get("url") or "").strip()
+        content = _clean_snippet(item.get("content") or item.get("snippet")
+                                 or item.get("description") or "")
+        if not (title or content):
+            continue
+        out.append({"title": title[:200], "url": url[:500],
+                    "content": content})
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _search_tavily(query: str, num: int) -> list[dict] | None:
+    """Tavily Search API (toi uu LLM). None = chua cau hinh key."""
+    import os as _os
+
+    key = (_os.getenv("TAVILY_API_KEY") or "").strip().strip("'\"")
+    if not key:
+        return None
+    data = _http_post_json(
+        "https://api.tavily.com/search",
+        {"api_key": key, "query": query, "max_results": num,
+         "search_depth": "basic", "include_answer": False})
+    if not isinstance(data, dict):
+        raise RuntimeError("Tavily tra ve sai dinh dang")
+    return _norm_results([
+        {"title": r.get("title"), "url": r.get("url"),
+         "content": r.get("content") or r.get("snippet")}
+        for r in (data.get("results") or [])], num)
+
+
+def _search_serper(query: str, num: int) -> list[dict] | None:
+    """Serper (Google-style: organic + answerBox). None = chua co key."""
+    import os as _os
+
+    key = (_os.getenv("SERPER_API_KEY") or "").strip().strip("'\"")
+    if not key:
+        return None
+    data = _http_post_json(
+        "https://google.serper.dev/search",
+        {"q": query, "num": num, "hl": "vi", "gl": "vn"},
+        headers={"X-API-KEY": key})
+    if not isinstance(data, dict):
+        raise RuntimeError("Serper tra ve sai dinh dang")
+    items = list(data.get("organic") or [])
+    box = data.get("answerBox") or {}
+    if box.get("answer") or box.get("snippet"):
+        items.insert(0, {"title": box.get("title") or "Tóm tắt",
+                         "link": box.get("link") or "",
+                         "snippet": box.get("answer") or box.get("snippet")})
+    return _norm_results([
+        {"title": r.get("title"), "url": r.get("link"),
+         "content": r.get("snippet")}
+        for r in items], num)
+
+
+def _search_brave(query: str, num: int) -> list[dict] | None:
+    """Brave Search API (index rieng). None = chua co key."""
+    import os as _os
+
+    key = (_os.getenv("BRAVE_API_KEY") or "").strip().strip("'\"")
+    if not key:
+        return None
+    url = ("https://api.search.brave.com/res/v1/web/search?"
+           + urllib.parse.urlencode({"q": query, "count": num,
+                                     "country": "VN",
+                                     "search_lang": "vi"}))
+    request = urllib.request.Request(
+        url, headers={"Accept": "application/json",
+                      "X-Subscription-Token": key,
+                      "User-Agent": "camera-ojt-qa/1.0"})
+    with urllib.request.urlopen(request,
+                                timeout=SEARCH_TIMEOUT_S) as response:
+        data = json.load(response)
+    web = (data.get("web") or {}) if isinstance(data, dict) else {}
+    return _norm_results([
+        {"title": r.get("title"), "url": r.get("url"),
+         "content": r.get("description")}
+        for r in (web.get("results") or [])], num)
+
+
+def _search_exa(query: str, num: int) -> list[dict] | None:
+    """Exa semantic search. None = chua co key."""
+    import os as _os
+
+    key = (_os.getenv("EXA_API_KEY") or "").strip().strip("'\"")
+    if not key:
+        return None
+    data = _http_post_json(
+        "https://api.exa.ai/search",
+        {"query": query, "numResults": num,
+         "contents": {"text": {"maxCharacters": SEARCH_SNIPPET_CHARS}}},
+        headers={"x-api-key": key})
+    if not isinstance(data, dict):
+        raise RuntimeError("Exa tra ve sai dinh dang")
+    return _norm_results([
+        {"title": r.get("title"), "url": r.get("url"),
+         "content": r.get("text") or (r.get("contents") or {}).get("text", "")
+         if isinstance(r.get("contents"), dict) else r.get("text")}
+        for r in (data.get("results") or [])], num)
+
+
+def _search_searxng(query: str, num: int) -> list[dict] | None:
+    """SearXNG self-host (SEARXNG_URL, tuy chon SEARXNG_API_KEY)."""
+    import os as _os
+
+    base = (_os.getenv("SEARXNG_URL") or "").strip().rstrip("/")
+    if not base:
+        return None
+    secret = (_os.getenv("SEARXNG_API_KEY") or "").strip()
+    from urllib.parse import urlencode as _urlencode
+
+    params: dict[str, object] = {"q": query, "format": "json",
+                                 "pageno": 1, "language": "vi-VN"}
+    if secret:
+        params["api_key"] = secret
+    try:
+        data = _http_json(f"{base}/search?{_urlencode(params)}",
+                          timeout=SEARCH_TIMEOUT_S)
+    except Exception as error:
+        raise RuntimeError(f"không gọi được SearXNG: {error}") from error
+    results = (data.get("results") or []) if isinstance(data, dict) else []
+    return _norm_results([
+        {"title": r.get("title"), "url": r.get("url"),
+         "content": r.get("content")}
+        for r in results], num)
+
+
+def _search_free_fallback(query: str, num: int) -> list[dict]:
+    """Fallback 0-dong khong key: DuckDuckGo instant + Wikipedia opensearch."""
+    from urllib.parse import urlencode as _urlencode
+
+    items: list[dict] = []
+    # 1) DuckDuckGo instant answer (nhanh, JSON nhe).
+    try:
+        ddg = _http_json(
+            "https://api.duckduckgo.com/?"
+            + _urlencode({"q": query, "format": "json", "no_html": 1,
+                          "skip_disambig": 1, "t": "camera-ojt"}),
+            timeout=10.0)
+        if isinstance(ddg, dict):
+            abstract = str(ddg.get("AbstractText") or "").strip()
+            if abstract:
+                items.append({"title": str(ddg.get("Heading") or "Tóm tắt"),
+                              "url": str(ddg.get("AbstractURL") or ""),
+                              "content": abstract})
+            for topic in (ddg.get("RelatedTopics") or [])[:num]:
+                if isinstance(topic, dict) and topic.get("Text"):
+                    items.append({"title": str(topic.get("Text"))[:120],
+                                  "url": str(topic.get("FirstURL") or ""),
+                                  "content": str(topic.get("Text"))})
+    except Exception:
+        pass  # DDG hong -> van con Wikipedia ben duoi.
+    # 2) Wikipedia opensearch vi + en (on dinh nhat trong cac API free).
+    for lang in ("vi", "en"):
+        if len(items) >= num:
+            break
+        try:
+            data = _http_json(
+                f"https://{lang}.wikipedia.org/w/api.php?"
+                + _urlencode({"action": "opensearch", "search": query,
+                              "limit": num, "namespace": 0,
+                              "format": "json"}),
+                timeout=10.0)
+            if isinstance(data, list) and len(data) == 4:
+                for title, desc, link in zip(data[1], data[2], data[3]):
+                    items.append({"title": str(title),
+                                  "url": str(link),
+                                  "content": str(desc or title)})
+                    if len(items) >= num:
+                        break
+        except Exception:
+            continue
+    return _norm_results(items, num)
+
+
+def search_web_raw(query: str | None,
+                   num_results: int | str | None = SEARCH_MAX_RESULTS
+                   ) -> list[dict]:
+    """Tim kiem ngoai, tra JSON tho [{title, url, content}].
+
+    Thu tu: Tavily -> Serper -> Brave -> Exa -> SearXNG -> free fallback.
+    Raise RuntimeError khi query rong hoac tat ca provider deu hong.
+    """
+    keyword = (query or "").strip()
+    if len(keyword) < 2:
+        raise RuntimeError("từ khóa tìm kiếm cần ít nhất 2 ký tự")
+    try:
+        num = int(num_results)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        num = SEARCH_MAX_RESULTS
+    num = max(1, min(10, num))
+    errors: list[str] = []
+    for provider in (_search_tavily, _search_serper, _search_brave,
+                     _search_exa, _search_searxng):
+        try:
+            hits = provider(keyword, num)
+        except Exception as error:
+            errors.append(f"{provider.__name__}: {error}")
+            continue
+        if hits:  # None = chua cau hinh -> thu provider sau.
+            return hits
+        if hits is not None:  # [] = co key nhung 0 ket qua -> dung lai.
+            break
+    # Fallback free (khong bao gio None).
+    try:
+        free = _search_free_fallback(keyword, num)
+    except Exception as error:
+        errors.append(f"free_fallback: {error}")
+        free = []
+    if free:
+        return free
+    detail = ("; ".join(errors[:3]) + ". " if errors else "")
+    return [{"title": "Chưa cấu hình search API",
+             "url": "",
+             "content": (f"{detail}Chưa tìm được gì cho '{keyword}'. "
+                         "Thêm TAVILY_API_KEY hoặc SERPER_API_KEY vào .env "
+                         "để tìm tin tức/giá cả realtime.")}]
+
+
+def build_search_context(results: list | None,
+                         max_chars: int = SEARCH_TOTAL_CHARS) -> str:
+    """Gom [{title,url,content}] thanh context gon cho Gemini lan 2.
+
+    Cat moi snippet o SEARCH_SNIPPET_CHARS, tong cong khong qua max_chars
+    (mac dinh 6000 ~ 1500 token — nhe voi context 1M cua Gemini Flash
+    nhung van du cho TTS 1-2 cau).
+    """
+    try:
+        budget = max(1000, int(max_chars))
+    except (TypeError, ValueError):
+        budget = SEARCH_TOTAL_CHARS
+    blocks: list[str] = []
+    used = 0
+    for idx, item in enumerate(list(results or [])[:10], 1):
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()[:200]
+        url = str(item.get("url") or "").strip()[:300]
+        content = _clean_snippet(item.get("content") or "")
+        block = f"[{idx}] {title} ({url}): {content}".strip()
+        if len(block) + used > budget:
+            room = budget - used - 1
+            if room > 200:
+                block = block[:room].rsplit(" ", 1)[0] + "…"
+            else:
+                break
+        blocks.append(block)
+        used += len(block) + 1
+    return "\n".join(blocks)
+
+
+def web_search(query: str | None = None,
+               num_results: int | str | None = SEARCH_MAX_RESULTS) -> str:
+    """Tool Gemini: tim thong tin moi (gia, tin tuc, kien thuc) tren internet.
+
+    Tra cau noi gon san (fallback truc tiep cho TTS khi Gemini lan 2 hong).
+    Flow chinh: think() goi search_web_raw() lay JSON roi goi Gemini lan 2
+    de tom tat 1-2 cau (<40 tu); ham nay giu de tuong thich 1-call cu.
+    """
+    try:
+        num = int(num_results)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        num = SEARCH_MAX_RESULTS
+    hits = search_web_raw(query, num)
+    if len(hits) == 1 and not hits[0].get("url") and "Chưa cấu hình" in str(
+            hits[0].get("title")):
+        return (f"Hiện chưa tìm được gì cho '{(query or '').strip()}'. "
+                f"{hits[0].get('content')}")
+    shown = []
+    for idx, hit in enumerate(hits[:3], 1):
+        snippet = _clean_snippet(hit.get("content"), 220)
+        shown.append(f"Kết quả {idx}: {hit.get('title') or 'không tiêu đề'} "
+                     f"— {snippet}")
+    return " ".join(shown)[:1500]
+
+
+# ---------------------------------------------------------------------------
 # Tien ich he thong local (uuid, hash, json, timestamp)
 # ---------------------------------------------------------------------------
 
@@ -1743,6 +2091,12 @@ TOOL_DECLARATIONS: list[dict] = [
           {"name": _str_prop("Tên người cần chào.")}, ["name"]),
     _decl("take_snapshot", "Nhờ camera chụp 1 tấm hình.",
           {"camera": _str_prop("A hoặc B. Bỏ trống = A.")}),
+    _decl("web_search", "Tìm thông tin mới trên internet (giá, tin tức, kiến thức). "
+           "Dùng khi câu hỏi cần dữ liệu realtime hoặc ngoài kiến thức có sẵn.",
+          {"query": _str_prop("Từ khóa tìm kiếm tiếng Anh/Việt, ví dụ "
+                              "'Bitcoin price today USD'."),
+           "num_results": _str_prop("Số kết quả 1-10, bỏ trống = 5.")},
+          ["query"]),
 ]
 
 STUB_TOOLS = frozenset({
@@ -1953,4 +2307,5 @@ TOOL_FUNCS = {
     "get_stt_latency": get_stt_latency,
     "request_greet": request_greet,
     "take_snapshot": take_snapshot,
+    "web_search": web_search,
 }

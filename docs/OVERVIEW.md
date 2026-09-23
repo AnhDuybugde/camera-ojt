@@ -80,7 +80,7 @@ Ba file cầu nối duy nhất giữa mắt và miệng (đều trong `output/qa
 | ID toàn cục | **OSNet x0_25** (ReID body, CUDA FP16) + Hungarian | Giữ Global ID ổn định xuyên tracklet / mất dấu lâu / xuyên camera | Event-driven (chỉ extract embedding khi track mới / mất rồi về / cross-camera); gallery **8 mẫu/ID**; trọng số appearance 0.70 / spatial 0.05 / time 0.15 / channel 0.10; ngưỡng match 0.70 (precision-first: thà bỏ sót còn hơn gán nhầm) |
 | Mặt + điểm danh | **InsightFace buffalo_s** (CUDA) | Nhận diện nhân viên, chấm công | Chạy async (`FaceWorker`), once-per-track, không block frame chính; gallery `data/images`, accept 0.70, tối đa 10 prototype/người; 2 track cùng mặt gộp về 1 GID (reconcile) |
 | Tay | **MediaPipe Hands** (CPU, gated fps thấp) | Vẫy 5 ngón (wave) / giơ tay (palm) để chào | Wave = palm 5 ngón giữ + lắc đủ đảo chiều; `wave_cooldown_s` / `palm_cooldown_s` = 10s |
-| Trạng thái làm việc | Thuật toán vị trí + thời gian (không model) | WORKING / AWAY / RETURNING theo ROI bàn | `away-grace 5s`, `out-after 60s`, `return-stable 2s`; chưa đo ROI thật thì chỉ dùng hiện diện |
+| Trạng thái làm việc | Thuật toán vị trí + thời gian (không model) | WORKING / AWAY / AT_DOOR / OUT_OF_DOOR theo zone R1/R2/R3 | `away-grace 5s`; zone R1/R2/R3 theo tam bbox, grace/dwell chong flicker |
 
 ---
 

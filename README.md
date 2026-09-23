@@ -1,200 +1,110 @@
-# Camera OJT
+# Camera OJT — Unified Camera Platform
 
-Điểm danh và theo dõi trạng thái nhân viên bằng camera:
+Điểm danh có hướng qua cửa, theo dõi hiện diện và trợ lý tiếng Việt. Imou,
+webcam và video replay dùng chung pipeline. Giao diện chính là Streamlit;
+backend sở hữu nhận diện, nghiệp vụ, đồng bộ và đăng ký khuôn mặt.
 
-- **Nhìn**: YOLO phát hiện người → ByteTrack → Global Identity (OSNet ReID) giữ ID xuyên camera; InsightFace `buffalo_s` nhận diện khuôn mặt để điểm danh; MediaPipe phát hiện vẫy/giơ tay để chào.
-- **Nghe–nói**: trợ lý voice “Hà Linh” (mic RTSP + loa camera P2P, STT faster-whisper, hiểu lệnh bằng Gemini, nói bằng ZeroTTS).
-- **Hiện**: React + Vite (live MJPEG, check-in kiosk, quản trị) + Supabase (tùy chọn, offline vẫn chạy nhờ hàng đợi local).
+## Chạy
 
-## 1. Yêu cầu
-
-- Git, Python 3.10+ (đã kiểm thử 3.10–3.12), Node.js 20+ và npm.
-- `ffmpeg` trong PATH (mic RTSP, TTS, loa).
-- Camera RTSP (Imou) hoặc webcam/video để thử. NVIDIA GPU khuyến nghị (chạy CPU vẫn được nhưng chậm).
-- Linux và Windows đều chạy được. Lệnh dưới đây là Linux/macOS; trên Windows PowerShell thay `cp` bằng `Copy-Item`, `source .venv/bin/activate` bằng `.venv\Scripts\Activate.ps1`.
-
-## 2. Lấy code
-
-```bash
-git clone https://github.com/AnhDuybugde/camera-ojt.git
-cd camera-ojt
-```
-
-Máy đã có repo thì cập nhật nhánh `main`:
-
-```bash
-git fetch origin
-git switch main
-git pull --ff-only origin main
-```
-
-## 3. Cài backend Python
+Python 3.10+, FFmpeg. Cài PyTorch đúng thiết bị trước khi cài project.
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -e ".[face,store,reid,voice,dev]"
-# hoặc: pip install -r requirements.txt  (tương đương dòng trên)
+python -m pip install -U 'setuptools>=69,<80' wheel
+# Máy CPU:
+python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -c constraints.txt -e '.[ui,face,reid,voice,dev]'
 ```
 
-`reid` (OSNet) là bắt buộc ở production — pipeline dừng rõ ràng nếu không tải được, không tự hạ cấp. Muốn dùng CUDA thì cài PyTorch đúng driver **trước**:
+Model và dữ liệu cá nhân không nằm trên GitHub. Có thể dùng wheel InsightFace
+trong `apps/attendance/vendor/` nếu môi trường không build được extension gốc.
+Giữ `.env` thật ở gốc repo; dùng `.env.example` làm danh sách cấu hình.
 
 ```bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-python -c "import torch; print('CUDA:', torch.cuda.is_available())"
+camera-ojt doctor
+# Chạy backend + giao diện + hai luồng Imou:
+camera-ojt run
+# Máy chưa dùng được GPU:
+camera-ojt run --device cpu
+# Webcam (một kênh):
+camera-ojt run --profile webcam --device cpu
+# Chỉ quản trị dữ liệu, không mở camera/mic:
+camera-ojt run --no-camera
 ```
 
-Lần chạy đầu cần mạng để tải `yolo26s.pt` (Ultralytics) và `buffalo_s` (InsightFace). File `.engine` (TensorRT) và `.pt` **không commit** — máy mới tự tải lại.
+Giao diện: **http://127.0.0.1:8501**. API nghiệp vụ: `127.0.0.1:8767`.
+Luồng hình: `127.0.0.1:8765`. Ctrl+C dừng các tiến trình con.
+`camera-ojt run` tự tạo token nội bộ cho các tiến trình, không đưa token đó xuống
+trình duyệt; ảnh trực tiếp dùng URL ký có thời hạn.
 
-## 4. Cấu hình `.env`
+Mật khẩu hiện có được giữ nguyên. Khi tạo mới admin, dùng `CAMERA_ADMIN_PASSWORD`
+hoặc lấy mật khẩu khởi tạo ở `apps/attendance/data/bootstrap-accounts.json`.
+Tài khoản nhân viên mới có mật khẩu tạm riêng trong `employee-invitations.json`
+cùng thư mục; quản trị có thể reset trên UI. Các file này có quyền đọc hạn chế
+và không được commit. Nhân viên phải đổi mật khẩu trước khi sử dụng.
+
+## Dữ liệu nhận diện và đồng bộ
 
 ```bash
-cp .env.example .env
+# Sao lưu SQLite nhất quán, rồi áp dụng migration local bổ sung:
+python tools/migrate_local.py
+# Kiểm kê bộ ảnh gán nhãn (không thay đổi dữ liệu):
+python tools/import_enrollment.py
+# Nhập toàn bộ mẫu hợp lệ, giữ ảnh và metadata nguồn:
+python tools/import_enrollment.py --apply --device cpu
+# Migration cloud, cần psycopg2/psycopg2-binary và CONNECT_STRING:
+python tools/migrate_cloud.py --apply
+python tools/sync_cloud.py
 ```
 
-Mở `.env` và điền giá trị thật (xem chú thích trong file mẫu):
+Gallery dùng chung `employee_id`, model/version và checksum ảnh. Các vector
+khác model không được trộn. Mẫu vận hành không tự động sửa gallery mặc định.
+Các mẫu đăng ký mới trên UI được xử lý ở backend và cập nhật gallery runtime.
 
-| Biến | Dùng cho | Bắt buộc khi nào |
-|---|---|---|
-| `IMOU_IP`, `IMOU_USER`, `IMOU_PASSWORD` | RTSP hình + mic camera | Chạy bản camera |
-| `IMOU_DEVICE_ID`, `IMOU_CAMERA_PASSWORD` | Loa camera qua P2P VisualTalk | Chào/nói ra loa (`--greet`, `--halinh`) |
-| `GEMINI_API_KEY` (`GEMINI_MODEL` tùy chọn) | Trợ lý Hà Linh | Chạy `--halinh` (mặc định bật) |
-| `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `SUPABASE_ANON_KEY` | Lưu điểm danh online | Khi muốn đồng bộ cloud |
+Sự kiện ra/vào cần quan sát chuỗi **trong phòng → cửa → ngoài phòng**, hoặc
+chiều ngược lại. Mặc định dùng camera B và vùng R2/R3 hiện có. Với webcam hoặc
+góc camera khác, cần cấu hình vùng đúng trước khi dùng điểm danh thật. Mất dấu
+không tự tạo check-out. Danh tính không chắc được đưa vào trang **Hệ thống AI &
+Trợ lý → Sự kiện cần xác nhận danh tính**.
 
-Kênh loa (`voice.p2p_channel`, `voice.p2p_channel_b`) nằm trong `config/default.yaml`, không cần `.env`. Supabase là tùy chọn: nếu dùng thì chạy `supabase/schema.sql` trong SQL Editor, tạo 2 bucket `face-crops`, `enrolled-faces`, rồi bật `store.supabase_enabled: true` trong config. Không bao giờ đưa `SUPABASE_SERVICE_KEY` vào frontend.
+SQLite giữ sự kiện và outbox trước khi gửi. Supabase giữ bản quản trị tập trung,
+đồng bộ hồ sơ, lịch, điểm danh, audit và embedding có phiên bản. Sửa đồng thời
+tạo xung đột trên trang quản trị; quản trị chọn bản cloud hoặc local. Mất điện
+khôi phục sau restart; muốn tiếp tục ghi hình khi mất điện cần nguồn dự phòng.
 
-## 5. Cài frontend
+Gemini xử lý câu hỏi, Tavily tìm kiếm ngoài. Cần `GEMINI_API_KEY`,
+`GEMINI_MODEL`, `TAVILY_API_KEY` để chạy các chức năng tương ứng. Câu hỏi đơn
+giản hỗ trợ trả lời local. Lỗi nhà cung cấp không dừng điểm danh.
+
+## Cấu trúc
+
+```text
+apps/attendance/       Streamlit và nghiệp vụ đang chuyển tiếp
+src/camera_tracking/   API, runtime chung, vision, voice và lưu trữ
+config/               Cấu hình camera/model/vùng, không chứa bí mật
+migrations/supabase/   Migration cloud có phiên bản
+tools/                Import, migration, đồng bộ, kiểm tra publish
+scripts/              Entry point tương thích và công cụ camera
+tests/                Kiểm thử nghiệp vụ và nhận diện
+var/                  Embedding, backup, báo cáo local — không commit
+```
+
+`ai-mind-attendance` là đường dẫn tương thích tới `apps/attendance`.
+Dashboard React đã được thay thế. Các script `run_workstate*.py` vẫn hoạt động,
+nhưng lệnh `camera-ojt run` quản lý đầy đủ backend và UI.
+
+## Kiểm chứng và giới hạn
 
 ```bash
-cp dashboard/.env.example dashboard/.env
-cd dashboard && npm install && cd ..
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q tests/test_unified_platform.py
+python tools/smoke_ui.py
+camera-ojt replay --source-a path/to/video-a.mp4 --source-b path/to/video-b.mp4 \
+  --device cpu --identity-log var/predictions.csv
+python scripts/evaluate_replay.py --truth annotations.csv --predictions var/predictions.csv
 ```
 
-Biến chính trong `dashboard/.env` (mặc định đã đúng khi chạy local):
-
-```dotenv
-VITE_STREAM_URL=http://localhost:8765
-VITE_KIOSK_CHANNEL=A
-VITE_CONTROL_URL=http://localhost:8766
-```
-
-## 6. Tạo file chào (WAV)
-
-File WAV trong `output/` **không commit** — máy mới tự tạo lại:
-
-```bash
-source .venv/bin/activate
-python scripts/build_greeting_wavs.py --voice maichi
-```
-
-Chạy lại mỗi khi thêm/sửa nhân viên hoặc đổi câu chào.
-
-## 7. Chạy
-
-**Bản camera** (2 cam Imou + voice Hà Linh, triển khai thật) — terminal 1:
-
-```bash
-source .venv/bin/activate
-python scripts/run_workstate.py --greet
-```
-
-**Bản local** (webcam + mic/loa laptop, dev không cần camera):
-
-```bash
-python scripts/run_workstate_local.py --display
-```
-
-**Dashboard** — terminal 2:
-
-```bash
-cd dashboard && npm run dev   # thường là http://localhost:5173
-```
-
-Cổng mặc định: camera/MJPEG `:8765`, điều khiển pipeline `:8766`. Backend `run_workstate*.py` mặc định tự bật voice Hà Linh ở subprocess riêng (crash tự restart 3 lần); tắt bằng `--no-halinh`. Muốn tắt supervisor nhúng thì thêm `--no-supervisor`.
-
-## 8. Đăng ký nhân viên
-
-1. Mở dashboard → `Đăng ký nhân viên`.
-2. Nhập mã nhân viên duy nhất + họ tên.
-3. Chụp/tải ảnh **một khuôn mặt**, rõ, đủ sáng, gần chính diện.
-4. Đồng ý xử lý dữ liệu khuôn mặt → đăng ký.
-5. Đứng trước Channel A 1–2 giây để kiểm tra nhận diện/check-in.
-
-Gallery nằm ở `data/images/` + `data/images/registry.json` — là dữ liệu cá nhân, **bị `.gitignore`**, máy mới phải đăng ký lại (hoặc chuyển qua kênh bảo mật có sự đồng ý). Không đăng ký cùng một khuôn mặt cho nhiều mã.
-
-## 9. Chạy từ máy khác trong LAN
-
-Máy gắn camera:
-
-```bash
-python scripts/run_workstate.py --stream-host 0.0.0.0
-```
-
-Máy chạy dashboard sửa `dashboard/.env`:
-
-```dotenv
-VITE_STREAM_URL=http://<IP_MAY_CAMERA>:8765
-```
-
-Khởi động lại `npm run dev`; mở firewall cổng `8765` nếu cần.
-
-## 10. Lệnh hữu ích
-
-```bash
-# Tracking nhưng tắt nhận diện mặt
-python scripts/run_workstate.py --no-face --display
-# Tắt voice Hà Linh (chỉ tracking + chào tay)
-python scripts/run_workstate.py --no-halinh
-# Webcam thay RTSP
-python scripts/run_workstate.py --source-a 0 --source-b 1 --display
-# Nhẹ GPU/CPU hơn
-python scripts/run_workstate.py --imgsz 640
-# Voice rời (debug, không cần pipeline)
-python scripts/halinh_assistant.py              # bản camera
-python scripts/halinh_assistant_local.py        # bản laptop
-# Test loa P2P trực tiếp
-python scripts/test_imou_p2p_voice.py --greeting unknown
-# Benchmark model, không mở RTSP
-python scripts/benchmark_inference.py --device cuda --frames 30
-# Kiểm thử backend
-python -m pytest -q
-# Build frontend production
-cd dashboard && npm run build
-```
-
-## 11. Xử lý lỗi thường gặp
-
-**Không mở được camera A/B** — kiểm tra `IMOU_IP`/user/password trong `.env`, máy và camera cùng mạng, RTSP đã bật; thử `--source-a/--source-b` với video/webcam.
-
-**Đăng ký xong vẫn Unknown** — log phải có `Face gallery: N nguoi` với `N > 0`; không chạy `--no-face`; đứng gần, nhìn chính diện, tránh ngược sáng; không dùng một mặt cho hai mã.
-
-**Dashboard không có hình** — mở `http://localhost:8765/status.json`; kiểm tra `VITE_STREAM_URL` rồi khởi động lại Vite; cổng bận thì đổi `--stream-port`.
-
-**Hà Linh không trả lời** — thiếu `GEMINI_API_KEY` trong `.env`; kiểm tra mic RTSP (`IMOU_*`) và loa P2P (`IMOU_DEVICE_ID` + `IMOU_CAMERA_PASSWORD`); hết quota Gemini thì loa báo và tự thử lại sau 60s.
-
-## Kiến trúc rút gọn
-
-```mermaid
-flowchart LR
-    A[Camera A/B] --> B[YOLO person detection]
-    B --> C[ByteTrack]
-    C --> D[Global Identity - OSNet]
-    C --> E[InsightFace]
-    E --> F[Employee matching]
-    D --> G[Workstate and room presence]
-    F --> H[Attendance]
-    G --> I[Supabase/local queue]
-    H --> I
-    D --> J[MJPEG API]
-    F --> J
-    J --> K[React dashboard]
-```
-
-Entry point production là `scripts/run_workstate.py` (camera) và `scripts/run_workstate_local.py` (laptop). `scripts/run_pipeline.py` chỉ là demo một camera. Contract Global ID, face consensus và replay benchmark ở `docs/IDENTITY_ARCHITECTURE.md`; tổng quan voice + chống spam ở `docs/OVERVIEW.md`; tune ngưỡng ở `docs/TUNE_GUIDE.md`; loa P2P ở `docs/P2P_TALK.md`.
-
-## Bảo mật dữ liệu
-
-- Không commit `.env`, service key, mật khẩu RTSP, ảnh khuôn mặt, WAV chào tên riêng, file `.engine`/`.pt`.
-- Chỉ thu thập ảnh khi nhân viên đã đồng ý; giới hạn quyền Supabase; xóa ảnh không cần thiết định kỳ.
-- Global ID chỉ là ID theo dõi tạm thời; `employee_id` sau face matching mới là danh tính chấm công.
+Zero false assignments trên holdout, tỷ lệ nhận đúng và độ trễ là **cổng nghiệm
+thu cần đo**, không phải kết quả đã được chứng minh trên mọi tình huống thực tế.
+Xem [trạng thái triển khai](docs/IMPLEMENTATION.md),
+[kiến trúc](docs/UNIFIED_PLATFORM.md) và [backlog](docs/ROADMAP.md).

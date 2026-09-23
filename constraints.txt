@@ -1,0 +1,10 @@
+# Validated CPU enrollment/UI environment; model performance is calibrated separately.
+setuptools>=69,<80
+numpy==1.26.4
+opencv-python==4.10.0.84
+opencv-python-headless==4.10.0.84
+onnx==1.19.1
+ml-dtypes==0.5.4
+protobuf>=6.31,<7
+streamlit==1.64.0
+insightface==0.7.3

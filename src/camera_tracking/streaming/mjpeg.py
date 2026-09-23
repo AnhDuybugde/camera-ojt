@@ -7,6 +7,7 @@ Global-ID labels and is served with CORS `*` for dashboard polling.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -17,9 +18,13 @@ class MjpegStreamer:
     """Thread-safe MJPEG server. Call start() once, push() per frame."""
 
     def __init__(self, host: str = "127.0.0.1", port: int = 8765) -> None:
+        self._access_key = os.getenv("CAMERA_INTERNAL_TOKEN", "")
+        if host not in {"127.0.0.1", "localhost", "::1"} and not self._access_key:
+            raise ValueError("CAMERA_INTERNAL_TOKEN is required to expose the camera API on a network")
         self.host = host
         self.port = port
         self._frames: dict[str, bytes] = {}
+        self._frame_at: dict[str, float] = {}
         self._status: dict = {"cameras": [], "people": []}
         self._attendance_pending: Callable[[], list[dict]] = list
         self._attendance_send: Callable[[], dict] = lambda: {"sent": 0}
@@ -27,6 +32,11 @@ class MjpegStreamer:
             "ok": False,
             "status": 503,
             "message": "Enrollment is unavailable.",
+        }
+        self._assistant_ask: Callable[[dict], dict] = lambda _payload: {
+            "ok": False,
+            "status": 503,
+            "message": "Trợ lý Hà Linh chưa sẵn sàng.",
         }
         self._lock = threading.Lock()
         self._server: ThreadingHTTPServer | None = None
@@ -41,6 +51,7 @@ class MjpegStreamer:
             return
         with self._lock:
             self._frames[name] = bytes(jpeg_bytes)
+            self._frame_at[name] = time.monotonic()
 
     def set_status(self, payload: dict) -> None:
         with self._lock:
@@ -57,9 +68,19 @@ class MjpegStreamer:
     def set_enrollment_action(self, register: Callable[[dict], dict]) -> None:
         self._enrollment_register = register
 
+    def set_assistant_action(self, ask: Callable[[dict], dict]) -> None:
+        """Register the dashboard text-assistant handler.
+
+        API keys and provider calls remain in the camera backend; dashboards
+        only send a question and receive the synthesized answer.
+        """
+        self._assistant_ask = ask
+
     def snapshot(self) -> tuple[dict[str, bytes], dict]:
         with self._lock:
-            return dict(self._frames), dict(self._status)
+            live = {name: frame for name, frame in self._frames.items()
+                    if time.monotonic() - self._frame_at.get(name, 0) < 5.0}
+            return live, dict(self._status)
 
     def start(self) -> bool:
         """Start serving in a daemon thread. False when the port is busy."""
@@ -74,7 +95,14 @@ class MjpegStreamer:
                 pass
 
             def _send_cors(self) -> None:
-                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Origin", os.getenv("CAMERA_UI_ORIGIN", "http://localhost:8501"))
+
+            def _authorized(self):
+                from camera_tracking.api.access import authorized
+                if authorized(self.path, self.headers.get("Authorization", ""), streamer._access_key):
+                    return True
+                self._send_json({"ok": False, "message": "Authentication required"}, 403)
+                return False
 
             def _send_json(self, payload: dict, status: int = 200) -> None:
                 body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -93,8 +121,10 @@ class MjpegStreamer:
                 self.end_headers()
 
             def do_POST(self) -> None:
+                if not self._authorized():
+                    return
                 path = self.path.split("?", 1)[0]
-                if path != "/enrollment/register":
+                if path not in ("/enrollment/register", "/assistant/ask"):
                     self.send_response(404)
                     self.end_headers()
                     return
@@ -102,7 +132,8 @@ class MjpegStreamer:
                     content_length = int(self.headers.get("Content-Length", "0"))
                 except ValueError:
                     content_length = 0
-                if content_length <= 0 or content_length > 8 * 1024 * 1024:
+                max_bytes = 8 * 1024 * 1024 if path == "/enrollment/register" else 16 * 1024
+                if content_length <= 0 or content_length > max_bytes:
                     self._send_json({
                         "ok": False,
                         "message": "Dữ liệu ảnh không hợp lệ hoặc vượt quá 8 MB.",
@@ -112,7 +143,10 @@ class MjpegStreamer:
                     payload = json.loads(self.rfile.read(content_length))
                     if not isinstance(payload, dict):
                         raise TypeError("payload must be an object")
-                    result = dict(streamer._enrollment_register(payload))
+                    action = (streamer._enrollment_register
+                              if path == "/enrollment/register"
+                              else streamer._assistant_ask)
+                    result = dict(action(payload))
                     status = int(result.pop("status", 201 if result.get("ok") else 400))
                     self._send_json(result, status)
                 except (json.JSONDecodeError, TypeError, UnicodeDecodeError, ValueError):
@@ -127,6 +161,8 @@ class MjpegStreamer:
                     }, 500)
 
             def do_GET(self) -> None:
+                if not self._authorized():
+                    return
                 path = self.path.split("?", 1)[0]
                 if path in ("/cam_a.mjpg", "/cam_b.mjpg"):
                     name = "cam_a" if "cam_a" in path else "cam_b"

@@ -156,7 +156,9 @@ class FaceConfig(StrictModel):
     consensus_hits: int = Field(default=2, ge=1)
     consensus_window_s: float = Field(default=3.0, gt=0)
     gallery_accept_threshold: float = Field(default=0.70, ge=0, le=1)
-    gallery_max_prototypes: int = Field(default=10, ge=1)
+    gallery_max_prototypes: int = Field(default=29, ge=1)
+    gallery_auto_update: bool = False
+    embedding_db: Path = Path("apps/attendance/data/database.db")
     min_face_px: int = Field(default=40, ge=8)
     min_face_score: float = Field(default=0.5, ge=0, le=1)
     min_blur_variance: float = Field(default=40.0, ge=0)
@@ -403,7 +405,17 @@ class StoreConfig(StrictModel):
     face_max_side_px: int = Field(default=512, ge=64)
 
 
+class DoorConfig(StrictModel):
+    enabled: bool = True
+    channel: Literal["A", "B"] = "B"
+    dwell_s: float = Field(default=0.3, ge=0.1)
+    max_gap_s: float = Field(default=2.0, gt=0)
+    # Legacy face-trigger attendance remains an explicit compatibility option.
+    legacy_face_attendance: bool = False
+
+
 class AppConfig(StrictModel):
+    door: DoorConfig = Field(default_factory=DoorConfig)
     camera: CameraConfig = Field(default_factory=CameraConfig)
     detection: DetectionConfig = Field(default_factory=DetectionConfig)
     tracking: TrackingConfig = Field(default_factory=TrackingConfig)

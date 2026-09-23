@@ -163,6 +163,7 @@ class IdentityRecord:
     last_good_embedding: np.ndarray | None = None
     # True khi lần observe gần nhất bị nghi hijack/che khuất.
     occluded: bool = False
+    generation: int = 0
     # Face anchor: GID vừa được face điểm cao xác nhận -> "khóa" tạm thời.
     face_anchor_employee: str | None = None
     face_anchor_score: float = 0.0
@@ -266,6 +267,11 @@ class GlobalIdentityManager:
                 suspect = self._is_occlusion_suspect(
                     track, tracks, record, frame_shape, channel
                 )
+                if suspect and record.employee_id is not None:
+                    # Appearance alone cannot preserve an employee label through
+                    # an overlap. Keep the track, require a fresh face to name it.
+                    self.unbind_employee(record.global_id)
+                    record.generation += 1
                 locked = self._is_face_locked(record, now_s)
                 # Named GID (đã có employee) luôn verify: số người có tên ít
                 # nên tốn thêm ReID mỗi frame là chấp nhận được, đổi lại bắt
@@ -288,6 +294,7 @@ class GlobalIdentityManager:
                         suspect or locked or record.employee_id
                     ):
                         record.occluded = True
+                        record.generation += 1
                         if key in self._tracklet_to_gid:
                             del self._tracklet_to_gid[key]
                         pending.append(track)
@@ -306,14 +313,17 @@ class GlobalIdentityManager:
                     # Appearance đổi rõ trong khi vị trí vẫn gần -> khả năng
                     # cao là người khác đã che/nhận box -> pending.
                     record.occluded = True
+                    record.generation += 1
                     if key in self._tracklet_to_gid:
                         del self._tracklet_to_gid[key]
                     pending.append(track)
                     continue
                 assignments[track.track_id] = gid
                 claimed_gids.add(gid)
-                self._observe(record, channel, track, embedding, now_s,
+                self._observe(record, channel, track, None if suspect else embedding, now_s,
                               score=1.0)
+                if suspect:
+                    record.occluded = True
             else:
                 if key in self._tracklet_to_gid:
                     # Tracklet drifted too far: drop the shortcut so the global
@@ -667,6 +677,7 @@ class GlobalIdentityManager:
                         record.occluded = False
                     else:
                         record.occluded = True
+                        record.generation += 1
                 else:
                     record.gallery.append(normalized)
                     record.last_good_embedding = normalized

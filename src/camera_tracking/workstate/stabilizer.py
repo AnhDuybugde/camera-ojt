@@ -19,10 +19,18 @@ from enum import Enum
 
 
 class WorkstationState(str, Enum):
-    AT_WORKSTATION = "AT_WORKSTATION"
-    NEAR_WORKSTATION = "NEAR_WORKSTATION"
-    AWAY_FROM_WORKSTATION = "AWAY_FROM_WORKSTATION"
+    """Stabilizer-level states. Exactly 5, mirroring PersonBusinessState.
+
+    WORKING covers both workstation core and extended areas (the old
+    NEAR_WORKSTATION collapsed into WORKING); AWAY covers both zone-away
+    and absence-away (the old AWAY_FROM_WORKSTATION).
+    """
+
     UNKNOWN = "UNKNOWN"
+    WORKING = "WORKING"
+    AWAY = "AWAY"
+    AT_DOOR = "AT_DOOR"
+    OUT_OF_DOOR = "OUT_OF_DOOR"
 
 
 @dataclass

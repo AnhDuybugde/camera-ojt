@@ -47,6 +47,7 @@ create table if not exists public.room_status_daily (
   last_enter_at timestamptz,
   updated_at timestamptz not null default now(),
   edited_by text,
+  merged_into integer,
   primary key (date, global_id)
 );
 

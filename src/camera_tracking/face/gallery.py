@@ -27,6 +27,9 @@ class EnrolledPerson:
 @dataclass(slots=True)
 class FaceGallery:
     people: list[EnrolledPerson] = field(default_factory=list)
+    _signature: tuple = field(default=(), repr=False)
+    _matrix: np.ndarray | None = field(default=None, repr=False)
+    _owners: list[int] = field(default_factory=list, repr=False)
 
     def __len__(self) -> int:
         return len(self.people)
@@ -51,14 +54,30 @@ class FaceGallery:
         """Rank employees, using their best trusted prototype."""
         if query is None:
             return []
-        ranked: list[tuple[EnrolledPerson, float]] = []
-        for person in self.people:
-            samples = ([person.embedding] if person.embedding is not None else [])
-            samples.extend(person.prototypes)
-            if samples:
-                ranked.append(
-                    (person, max(cosine_similarity(query, sample) for sample in samples))
-                )
+        query = np.asarray(query, dtype=np.float32).ravel()
+        norm = float(np.linalg.norm(query))
+        if norm <= 1e-12 or not np.isfinite(query).all():
+            return []
+        signature = (query.size, tuple((id(p), id(p.embedding), tuple(map(id, p.prototypes)))
+                                      for p in self.people))
+        if signature != self._signature:
+            rows, owners = [], []
+            for index, person in enumerate(self.people):
+                for sample in ([person.embedding] if person.embedding is not None else []) + person.prototypes:
+                    sample = np.asarray(sample, dtype=np.float32).ravel()
+                    length = float(np.linalg.norm(sample))
+                    if sample.size == query.size and length > 1e-12 and np.isfinite(sample).all():
+                        rows.append(sample / length)
+                        owners.append(index)
+            self._matrix = np.stack(rows) if rows else None
+            self._owners, self._signature = owners, signature
+        if self._matrix is None:
+            return []
+        scores = self._matrix @ (query / norm)
+        best = {}
+        for owner, score in zip(self._owners, scores):
+            best[owner] = max(best.get(owner, -1.0), float(score))
+        ranked = [(self.people[index], score) for index, score in best.items()]
         return sorted(ranked, key=lambda item: item[1], reverse=True)
 
     def add_prototype(
@@ -130,7 +149,10 @@ def load_gallery(
     embedder: FaceEmbedder | None,
     name_map: dict[str, str] | None = None,
     employee_map: dict[str, str] | None = None,
-    max_seed_prototypes: int = 10,
+    max_seed_prototypes: int = 29,
+    sample_store=None,
+    model_version: str = "",
+    refresh_samples: bool = False,
 ) -> FaceGallery:
     """Load enrolled faces with multi-image support.
 
@@ -154,8 +176,8 @@ def load_gallery(
     registry_employees = {
         person_id: value["employee_id"] for person_id, value in registry.items()
     }
-    name_map = {**registry_names, **(name_map or {})}
-    employee_map = {**registry_employees, **(employee_map or {})}
+    name_map = {**(name_map or {}), **registry_names}
+    employee_map = {**(employee_map or {}), **registry_employees}
     # Gom theo person_id từ cả 2 layout.
     buckets: dict[str, list[Path]] = {}
     for path in sorted(root.iterdir()):
@@ -171,17 +193,30 @@ def load_gallery(
         )
         if images:
             buckets.setdefault(path.name, []).extend(images)
+    persisted = {}
+    if sample_store is not None and not refresh_samples:
+        for employee, vector, _ in sample_store.samples(model_version):
+            persisted.setdefault(employee, []).append(vector)
     for person_id in sorted(buckets):
         paths = buckets[person_id]
         display_name = name_map.get(person_id, person_id)
         employee_id = employee_map.get(person_id)
         session_meta = _load_session_meta(paths)
-        embedding, extra = _embed_best(
-            paths, embedder,
-            max_extra=max(0, max_seed_prototypes - 1),
-            session_meta=session_meta,
-        )
-        prototypes = _load_prototypes(root, person_id)
+        trusted = persisted.get(employee_id or person_id)
+        if trusted:
+            embedding, extra = trusted[0], trusted[1:]
+        else:
+            embedding, extra = _embed_best(
+                paths, embedder,
+                max_extra=max(0, max_seed_prototypes - 1),
+                session_meta=session_meta,
+                sample_store=sample_store,
+                employee_id=employee_id or person_id,
+                model_version=model_version,
+            )
+        # Old .npy files have no model/version provenance and may contain
+        # self-learned observations. Rebuild trusted samples from source images.
+        prototypes = []
         # Ảnh enroll phụ (ngoài ảnh tốt nhất) thành seed prototypes ngay.
         for vector in extra:
             _append_seed_prototype(
@@ -259,8 +294,11 @@ def _embed_best(
     paths: list[Path],
     embedder: FaceEmbedder | None,
     *,
-    max_extra: int = 9,
+    max_extra: int = 28,
     session_meta: dict[str, dict] | None = None,
+    sample_store=None,
+    employee_id: str = "",
+    model_version: str = "",
 ) -> tuple[np.ndarray | None, list[np.ndarray]]:
     """Chọn embedding tốt nhất làm chính, các frame đa dạng làm seed.
 
@@ -277,6 +315,13 @@ def _embed_best(
     for path in paths:
         if path.name.startswith("session_") and path.suffix == ".json":
             continue
+        meta = session_meta.get(path.name, {})
+        checksum = sample_store.checksum(path) if sample_store is not None else ""
+        cached = (sample_store.get(employee_id, checksum, model_version)
+                  if sample_store is not None else None)
+        if cached is not None:
+            scored.append((float(meta.get("quality", 0)), str(meta.get("pose", "")), cached))
+            continue
         img = _read_image(path)
         if img is None:
             continue
@@ -291,6 +336,9 @@ def _embed_best(
                     dets = embedder.detect_embed(padded)
                 except RuntimeError:
                     dets = []
+        # An enrollment label cannot disambiguate two faces in the same image.
+        if len(dets) != 1:
+            continue
         for det in dets:
             width = det.bbox[2] - det.bbox[0]
             height = det.bbox[3] - det.bbox[1]
@@ -310,6 +358,11 @@ def _embed_best(
                 pose,
                 np.asarray(det.embedding, dtype=np.float32),
             ))
+            if sample_store is not None:
+                if not model_version:
+                    raise ValueError("model_version is required for persistent embeddings")
+                sample_store.put(employee_id, checksum, model_version, path.name,
+                                 det.embedding, meta)
     if not scored:
         return None, []
     scored.sort(key=lambda item: item[0], reverse=True)

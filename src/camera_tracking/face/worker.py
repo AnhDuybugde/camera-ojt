@@ -45,6 +45,7 @@ class FaceJob:
     now_s: float
     # Lower sorts first: foreground unknown, background unknown, known recheck.
     priority: tuple[float, ...] = (2.0, 0.0, 0.0)
+    generation: int = 0
     enqueued_at: float = field(default_factory=time.monotonic)
 
 
@@ -70,6 +71,7 @@ class FaceResult:
     wall_iso: str
     time_tag: str
     now_s: float
+    generation: int = 0
 
 
 class FaceWorker:
@@ -90,7 +92,7 @@ class FaceWorker:
         self._jobs: queue.PriorityQueue[_PrioritizedJob] = queue.PriorityQueue(
             maxsize=self.max_queue)
         self._job_sequence = 0
-        self._results: queue.Queue[FaceResult] = queue.Queue()
+        self._results: queue.Queue[FaceResult] = queue.Queue(maxsize=self.max_queue * 2)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         # Once-per-track: gid đã có kết quả known thì không enqueue lại
@@ -228,6 +230,9 @@ class FaceWorker:
                     continue
                 observations = self._run_job(job)
                 self.jobs_processed += 1
+                if time.monotonic() - job.enqueued_at > self.max_job_age_s:
+                    self.jobs_expired += 1
+                    continue
                 for obs in observations:
                     try:
                         self._results.put_nowait(obs)
@@ -302,6 +307,7 @@ class FaceWorker:
                 wall_iso=job.wall_iso,
                 time_tag=job.time_tag,
                 now_s=job.now_s,
+                generation=job.generation,
             ))
         # Giữ face_marks tương thích: detection bbox đang tương đối theo crop,
         # main loop sẽ cộng offset person (x1,y1) khi vẽ.
