@@ -108,6 +108,10 @@ def _registration_camera_source() -> int | str:
 @dataclass(frozen=True)
 class Settings:
     base_dir: Path = BASE_DIR
+    production_mode: bool = os.getenv("APP_ENV", "development").strip().lower() == "production"
+    session_idle_timeout_minutes: int = max(
+        5, _int("SESSION_IDLE_TIMEOUT_MINUTES", 30)
+    )
     database_url: str = os.getenv("DATABASE_URL", "").strip()
     database_path: Path = BASE_DIR / "data" / "database.db"
     face_data_dir: Path = BASE_DIR / "data" / "faces"

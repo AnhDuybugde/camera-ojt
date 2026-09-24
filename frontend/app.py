@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import time
 from pathlib import Path
 
 import streamlit as st
@@ -48,12 +49,25 @@ db = get_db(4)
 get_daily_attendance_worker()
 auth_service = get_auth_service(2)
 role = st.session_state.get("role")
+session_expired = False
+if st.session_state.get("authenticated"):
+    now = time.time()
+    last_activity = float(st.session_state.get("_last_activity_at") or now)
+    idle_limit = settings.session_idle_timeout_minutes * 60
+    if now - last_activity > idle_limit:
+        st.session_state.clear()
+        role = None
+        session_expired = True
+    else:
+        st.session_state._last_activity_at = now
 if role == EMPLOYEE and st.session_state.get("authenticated"):
     account = auth_service.account(st.session_state.get("employee_id", ""))
     if not account or account["version"] != st.session_state.get("account_version"):
         st.session_state.clear()
         role = None
 if not st.session_state.get("authenticated") or role not in {EMPLOYEE, ADMIN}:
+    if session_expired:
+        st.warning("Phiên đăng nhập đã hết hạn do không hoạt động.")
     login.render(auth_service)
     st.stop()
 
@@ -159,10 +173,14 @@ elif page == "Registration":
             if rows:
                 with st.expander("Tài khoản nhân viên · Đặt lại mật khẩu"):
                     selected = st.selectbox("Mã nhân viên", [r["employee_id"] for r in rows], key="reset_account")
-                    confirm = st.checkbox("Xác nhận đặt lại mật khẩu về 123 và yêu cầu đổi mật khẩu")
+                    confirm = st.checkbox("Xác nhận tạo mật khẩu tạm mới và yêu cầu đổi mật khẩu")
                     if st.button("Đặt lại mật khẩu", disabled=not confirm):
-                        auth_service.reset_employee_password(selected, actor_role=role)
-                        st.success("Đã đặt lại mật khẩu. Phiên đăng nhập cũ sẽ hết hiệu lực.")
+                        temporary_password = auth_service.reset_employee_password(
+                            selected, actor_role=role
+                        )
+                        st.success("Đã tạo mật khẩu tạm. Phiên đăng nhập cũ sẽ hết hiệu lực.")
+                        st.code(temporary_password, language=None)
+                        st.caption("Hãy chuyển mật khẩu này qua kênh riêng; hệ thống không hiển thị lại.")
     if registration_section == "Đăng ký khuôn mặt":
         register_face.render(db, get_detector(), get_recognizer(), role)
 elif page == "Work Schedule":

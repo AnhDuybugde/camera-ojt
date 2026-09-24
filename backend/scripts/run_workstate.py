@@ -83,7 +83,7 @@ except (ImportError, OSError) as error:
     print(f"CUDA runtime discovery skipped: {error}", file=sys.stderr)
 from camera_tracking.domain import Frame, Track, TrackEvent
 from camera_tracking.gesture.focus import ForegroundSelector
-from camera_tracking.runtime import StageMetrics
+from camera_tracking.runtime import StageMetrics, summarize_presence
 from camera_tracking.tracking import (
     ByteTrackTracker,
     DailyIdentityStore,
@@ -968,6 +968,9 @@ def main() -> None:
     os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "fatal")
     args = parse_args()
     config = load_config(args.config)
+    occupancy_stale_s = _runtime_env_float(
+        "OCCUPANCY_STALE_SECONDS", 120.0, 5.0
+    )
 
     source_a = normalize_source(
         args.source_a
@@ -1204,6 +1207,11 @@ def main() -> None:
     face_cfg = face_cfg_early
     face_threshold = face_cfg.match_threshold
     use_face = bool(face_cfg.enabled and not args.no_face and face_cfg.channels)
+    production_mode = os.getenv("APP_ENV", "development").strip().lower() == "production"
+    attendance_automation_enabled = os.getenv(
+        "ATTENDANCE_AUTOMATION_ENABLED",
+        "false" if production_mode else "true",
+    ).strip().lower() in {"1", "true", "yes", "on"}
     face_embedder = shared_face_embedder
     face_matcher = face_gallery = attendance = face_consumer = None
     face_roster: list[dict[str, object]] = []
@@ -1305,12 +1313,18 @@ def main() -> None:
                     continue
                 gid_to_person[restored_gid] = restored.employee_id
                 gid_to_display[restored_gid] = person.display_name
-            attendance = FaceAttendanceService(
-                debounce_hits=config.attendance.debounce_hits,
-                window_s=config.attendance.window_s,
-                active_hour_start=config.attendance.active_hour_start,
-                active_hour_end=config.attendance.active_hour_end,
-            )
+            if attendance_automation_enabled:
+                attendance = FaceAttendanceService(
+                    debounce_hits=config.attendance.debounce_hits,
+                    window_s=config.attendance.window_s,
+                    active_hour_start=config.attendance.active_hour_start,
+                    active_hour_end=config.attendance.active_hour_end,
+                )
+            else:
+                print(
+                    "Attendance automation: MONITOR-ONLY. Face recognition remains "
+                    "active, but automatic biometric writes are disabled."
+                )
             print(f"Face gallery: {len(face_gallery)} nguoi tu {face_cfg.gallery_dir} "
                   f"| threshold={face_threshold} margin={face_cfg.min_margin} "
                   f"consensus={face_cfg.consensus_hits} "
@@ -2667,6 +2681,9 @@ def main() -> None:
             people = list(canonical.values())
         except Exception:
             people = []
+        presence = summarize_presence(
+            people, stale_after_s=occupancy_stale_s
+        )
         try:
             day = day_str
             att = ([{"name": r.display_name, "time": r.wall_time}
@@ -2712,7 +2729,11 @@ def main() -> None:
             "uptime_s": now_s,
             "camera_a": _stream_state(stream_a, True),
             "camera_b": _stream_state(stream_b, True),
-            "count": int(sum(1 for person in people if person.get("in_room"))),
+            "count": presence.active_count,
+            "count_logical": presence.logical_count,
+            "count_visible": presence.visible_count,
+            "count_stale": presence.stale_count,
+            "occupancy_stale_after_s": presence.stale_after_s,
             "count_a": int(count_a.value),
             "count_b": int(count_b.value),
             "people": people,
@@ -3605,19 +3626,39 @@ def main() -> None:
                         }
                         for record in attendance.records_for_day(day_str)
                     ]
+                    presence = summarize_presence(
+                        live_people,
+                        aliases=gid_alias,
+                        stale_after_s=occupancy_stale_s,
+                    )
+                    metric_snapshot = metrics.snapshot()
+                    detection_mean_ms = metric_snapshot.get(
+                        "detection", {}
+                    ).get("mean_ms")
+                    loop_mean_ms = metric_snapshot.get(
+                        "loop_total", {}
+                    ).get("mean_ms")
                     streamer.set_status({
                         "people": live_people,
                         "employee_roster": face_roster,
                         "attendance_today": attendance_today,
                         "recent_events": list(recent_events),
                         "pending_attendance": pending_attendance(),
-                        "count": len({
-                            int(gid_alias.get(gid, gid))
-                            for gid, state in room_status_now.items()
-                            if state.in_room
-                        }),
+                        "count": presence.active_count,
+                        "count_logical": presence.logical_count,
+                        "count_visible": presence.visible_count,
+                        "count_stale": presence.stale_count,
+                        "occupancy_stale_after_s": presence.stale_after_s,
                         "count_a": count_a.value,
                         "count_b": count_b.value,
+                        "inference_ms": detection_mean_ms,
+                        "loop_fps": (
+                            1000.0 / loop_mean_ms
+                            if loop_mean_ms and loop_mean_ms > 0
+                            else None
+                        ),
+                        "runtime_metrics": metric_snapshot,
+                        "status_generated_at": time.time(),
                         "audio_events": zone_observer.active_events(now_s),
                         "zone_status": zone_observer.status(),
                         "gesture_events": [

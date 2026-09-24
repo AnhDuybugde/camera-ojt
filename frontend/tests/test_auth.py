@@ -75,12 +75,34 @@ def test_individual_accounts_reset_and_lockout(tmp_path):
     assert auth.login(EMPLOYEE, "password123", "NV001")["must_change"] == 0
     with pytest.raises(PermissionDenied):
         auth.reset_employee_password("NV001", actor_role=EMPLOYEE)
-    auth.reset_employee_password("NV001", actor_role=ADMIN)
-    assert auth.login(EMPLOYEE, "123", "NV001")["must_change"] == 1
+    temporary_password = auth.reset_employee_password("NV001", actor_role=ADMIN)
+    assert temporary_password != "123"
+    assert auth.login(EMPLOYEE, temporary_password, "NV001")["must_change"] == 1
+    assert not auth._verify("123", auth.account("NV001")["password_hash"])
     for _ in range(5):
         assert auth.login(EMPLOYEE, "wrong", "NV001") is None
     with pytest.raises(ValueError):
-        auth.login(EMPLOYEE, "123", "NV001")
+        auth.login(EMPLOYEE, temporary_password, "NV001")
+
+
+def test_production_requires_strong_bootstrap_credentials(tmp_path, monkeypatch):
+    monkeypatch.delenv("ADMIN_BOOTSTRAP_PASSWORD", raising=False)
+    monkeypatch.delenv("EMPLOYEE_BOOTSTRAP_PASSWORD", raising=False)
+    with pytest.raises(RuntimeError, match="BOOTSTRAP_PASSWORD"):
+        AuthService(Database(tmp_path / "production-missing.db"), production=True)
+
+
+def test_production_bootstrap_credentials_are_environment_driven(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("ADMIN_BOOTSTRAP_PASSWORD", "Admin-Deploy-2026!")
+    monkeypatch.setenv("EMPLOYEE_BOOTSTRAP_PASSWORD", "Employee-Start-2026!")
+    db = Database(tmp_path / "production.db")
+    db.add_employee({"employee_id": "NV001", "full_name": "A"})
+    auth = AuthService(db, production=True)
+    assert auth.authenticate(ADMIN, "Admin-Deploy-2026!")
+    assert auth.login(EMPLOYEE, "Employee-Start-2026!", "NV001") is not None
+    assert not auth.authenticate(ADMIN, "456")
 
 
 def test_owner_enforced_at_storage(tmp_path):

@@ -90,6 +90,17 @@ cd ..
 Launcher tắt greeting legacy của model để tránh hai giọng nói đồng thời;
 “Bé Xinh” là audio output duy nhất. Log nằm trong `logs/`.
 
+Kiểm tra dịch vụ mà không đọc dữ liệu nhân viên:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8765/healthz
+Invoke-RestMethod http://127.0.0.1:8765/readyz
+```
+
+`readyz` chỉ trả HTTP 200 khi trạng thái model và ít nhất một frame camera còn
+mới. Khi chuẩn bị triển khai thật, làm theo [PRODUCTION_DEPLOYMENT.md](PRODUCTION_DEPLOYMENT.md)
+và [SECURITY.md](SECURITY.md); chỉ phát hành nếu preflight strict trả mã `0`.
+
 ## Kiểm thử
 
 ```powershell

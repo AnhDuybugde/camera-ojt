@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 
 import streamlit as st
 
@@ -70,6 +71,7 @@ def render(auth_service: AuthService) -> None:
                     st.session_state.role = role
                     st.session_state.employee_id = employee_id.strip() if role == EMPLOYEE else None
                     st.session_state.account_version = account.get("version")
+                    st.session_state._last_activity_at = time.time()
                     st.session_state.active_page = "Tổng quan"
                     st.rerun()
                 st.error("Tên đăng nhập hoặc mật khẩu không chính xác")

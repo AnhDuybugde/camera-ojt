@@ -38,13 +38,68 @@ This adds `attendance_daily.check_out_at`, `room_status_daily.merged_into`, and 
 
 ## 5. Counting semantics
 
-`count_a` and `count_b` are camera-local visible-box counts. `count` is the canonical in-room count derived from global IDs and must be used by the conversational agent when answering “how many people are in the room?”.
+`count_a` and `count_b` are camera-local visible-box counts. `count` is the
+fresh canonical in-room count and must be used by the conversational agent when
+answering “how many people are in the room?”. The API also exposes:
 
-## 6. Remaining release blockers
+- `count_visible`: unique identities visible in the current camera frames.
+- `count_logical`: canonical identities still marked in-room before freshness filtering.
+- `count_stale`: logical tracks older than `OCCUPANCY_STALE_SECONDS`.
+
+This prevents an old track from inflating the live occupancy while preserving
+enough information for audit and tuning.
+
+## 6. Authentication and sessions
+
+Set `APP_ENV=production` in both `backend/.env` and `frontend/.env`. New auth
+databases require strong values for `ADMIN_BOOTSTRAP_PASSWORD` and
+`EMPLOYEE_BOOTSTRAP_PASSWORD`. Existing accounts must be rotated through the
+admin interface; the production preflight detects the known legacy passwords
+without printing any hash or secret.
+
+Password resets now create a one-time random temporary password rather than
+resetting every employee to the same value. Authenticated UI sessions expire
+after `SESSION_IDLE_TIMEOUT_MINUTES` (30 by default).
+
+## 7. Health and observability
+
+- `GET /healthz`: process liveness; does not include employee or image data.
+- `GET /readyz`: returns HTTP 200 only when status and at least one camera frame
+  are fresh; otherwise HTTP 503.
+- `GET /status.json`: includes `inference_ms`, `loop_fps`, `runtime_metrics` and
+  `status_generated_at` for diagnosis.
+
+Use `/readyz` for a reverse-proxy health check. Do not use `/status.json` for a
+public health probe because it contains operational/person data.
+
+## 8. Safe biometric rollout
+
+Production defaults to `ATTENDANCE_AUTOMATION_ENABLED=false`. In this mode face
+recognition and the observation dashboard continue running, but the backend does
+not create automatic attendance records. This is the safe deployment mode until
+a real, measured liveness/anti-spoof strategy is wired into the backend gate.
+
+Declaring a provider name in an environment variable is not an integration. Do
+not enable automatic biometric writes until spoof tests, false-accept/false-reject
+measurements, consent, retention and manual correction workflows have passed.
+
+## 9. Release gate
+
+Before every release run:
+
+```powershell
+cd D:\team-integration\backend
+.\.venv\Scripts\python.exe scripts\preflight_production.py --strict
+```
+
+Exit code `0` is the release gate. CI also runs backend tests, frontend tests and
+the React dashboard build on every push and pull request.
+
+## 10. Remaining release blockers
 
 Before biometric attendance is considered production-ready:
 
-1. Integrate a real liveness/anti-spoof provider and fail closed when attendance requires it.
+1. Integrate a real liveness/anti-spoof provider before enabling automatic attendance.
 2. Move CHECK-IN/CHECK-OUT/RETURN/TEMP_OUT into one backend attendance lifecycle service.
 3. Calibrate face thresholds on deployment-camera data; do not copy thresholds between sites.
 4. Put the local services behind authenticated TLS reverse proxy/VPN.

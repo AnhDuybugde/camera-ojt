@@ -72,3 +72,30 @@ def test_attendance_send_rejects_untrusted_browser_origin() -> None:
         assert calls == 0
     finally:
         streamer.stop()
+
+
+def test_health_and_readiness_reflect_fresh_pipeline_state() -> None:
+    streamer = MjpegStreamer(host="127.0.0.1", port=0)
+    assert streamer.start() is True
+    try:
+        assert streamer._server is not None  # noqa: SLF001 - integration test
+        port = streamer._server.server_port  # noqa: SLF001
+
+        code, body = _request(f"http://127.0.0.1:{port}/healthz")
+        assert code == 200
+        assert body == {"ok": True, "service": "camera-stream"}
+
+        code, body = _request(f"http://127.0.0.1:{port}/readyz")
+        assert code == 503
+        assert body["ok"] is False
+        assert body["status_fresh"] is False
+
+        streamer.push("cam_a", b"jpeg")
+        streamer.set_status({"count": 1})
+        code, body = _request(f"http://127.0.0.1:{port}/readyz")
+        assert code == 200
+        assert body["ok"] is True
+        assert body["cameras"]["cam_a"]["live"] is True
+        assert body["cameras"]["cam_b"]["live"] is False
+    finally:
+        streamer.stop()

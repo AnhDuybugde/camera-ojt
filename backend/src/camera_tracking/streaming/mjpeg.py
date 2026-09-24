@@ -39,7 +39,9 @@ class MjpegStreamer:
         self.host = host
         self.port = port
         self._frames: dict[str, bytes] = {}
+        self._frame_updated_at_s: dict[str, float] = {}
         self._status: dict = {"cameras": [], "people": []}
+        self._status_updated_at_s = 0.0
         self._attendance_pending: Callable[[], list[dict]] = list
         self._attendance_send: Callable[[], dict] = lambda: {"sent": 0}
         self._enrollment_register: Callable[[dict], dict] = lambda _payload: {
@@ -60,10 +62,12 @@ class MjpegStreamer:
             return
         with self._lock:
             self._frames[name] = bytes(jpeg_bytes)
+            self._frame_updated_at_s[name] = time.monotonic()
 
     def set_status(self, payload: dict) -> None:
         with self._lock:
             self._status = dict(payload)
+            self._status_updated_at_s = time.monotonic()
 
     def set_attendance_actions(
         self,
@@ -79,6 +83,44 @@ class MjpegStreamer:
     def snapshot(self) -> tuple[dict[str, bytes], dict]:
         with self._lock:
             return dict(self._frames), dict(self._status)
+
+    def health_snapshot(
+        self,
+        *,
+        max_status_age_s: float = 10.0,
+        max_frame_age_s: float = 10.0,
+    ) -> dict:
+        """Return freshness-based health without leaking frame or person data."""
+        now = time.monotonic()
+        with self._lock:
+            status_age_s = (
+                max(0.0, now - self._status_updated_at_s)
+                if self._status_updated_at_s > 0
+                else None
+            )
+            camera_ages = {
+                name: (
+                    max(0.0, now - self._frame_updated_at_s[name])
+                    if name in self._frame_updated_at_s
+                    else None
+                )
+                for name in ("cam_a", "cam_b")
+            }
+        status_fresh = status_age_s is not None and status_age_s <= max_status_age_s
+        cameras = {
+            name: {
+                "live": age is not None and age <= max_frame_age_s,
+                "age_s": None if age is None else round(age, 3),
+            }
+            for name, age in camera_ages.items()
+        }
+        any_camera_fresh = any(item["live"] for item in cameras.values())
+        return {
+            "ok": bool(status_fresh and any_camera_fresh),
+            "status_fresh": status_fresh,
+            "status_age_s": None if status_age_s is None else round(status_age_s, 3),
+            "cameras": cameras,
+        }
 
     def start(self) -> bool:
         """Start serving in a daemon thread. False when the port is busy."""
@@ -180,6 +222,11 @@ class MjpegStreamer:
                             for n in ("cam_a", "cam_b")
                         ],
                     })
+                elif path == "/healthz":
+                    self._send_json({"ok": True, "service": "camera-stream"})
+                elif path == "/readyz":
+                    health = streamer.health_snapshot()
+                    self._send_json(health, 200 if health["ok"] else 503)
                 elif path == "/attendance/pending":
                     self._send_json({
                         "pending": streamer._attendance_pending(),

@@ -11,14 +11,16 @@ from __future__ import annotations
 
 import argparse
 import os
+import sqlite3
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 from camera_tracking.config import load_config
 
 ROOT = Path(__file__).resolve().parents[1]
+FRONTEND_ROOT = ROOT.parent / "frontend"
 
 
 class Report:
@@ -61,6 +63,91 @@ def _writable_parent(path: Path) -> bool:
         return False
 
 
+def _strong_password(password: str) -> bool:
+    if len(password) < 12 or len(password.encode("utf-8")) > 72:
+        return False
+    groups = (
+        any(char.islower() for char in password),
+        any(char.isupper() for char in password),
+        any(char.isdigit() for char in password),
+        any(not char.isalnum() for char in password),
+    )
+    return sum(groups) >= 3 and password.lower() not in {
+        "123", "456", "password", "admin", "admin123"
+    }
+
+
+def _matches_known_weak_password(password_hash: str, bcrypt_module) -> bool:
+    try:
+        encoded_hash = str(password_hash).encode("ascii")
+        return any(
+            bcrypt_module.checkpw(candidate.encode("utf-8"), encoded_hash)
+            for candidate in ("123", "456", "password", "admin", "admin123")
+        )
+    except (TypeError, ValueError, UnicodeEncodeError):
+        return True
+
+
+def _check_frontend_auth(report: Report, *, strict: bool) -> None:
+    """Detect unsafe bootstrap/runtime auth settings without printing secrets."""
+    env_path = FRONTEND_ROOT / ".env"
+    values = dotenv_values(env_path) if env_path.exists() else {}
+    app_env = str(values.get("APP_ENV") or os.getenv("APP_ENV", "development"))
+    if app_env.strip().lower() == "production":
+        report.pass_("Frontend APP_ENV=production")
+    elif strict:
+        report.blocker("Frontend APP_ENV must be production for a strict release")
+    else:
+        report.warning("Frontend is not in production mode")
+
+    database_url = str(values.get("DATABASE_URL") or "sqlite:///data/database.db")
+    if not database_url.startswith("sqlite:///"):
+        report.warning("Frontend auth DB is remote; verify password rotation externally")
+        return
+    raw_path = database_url.removeprefix("sqlite:///")
+    db_path = Path(raw_path)
+    if not db_path.is_absolute():
+        db_path = FRONTEND_ROOT / db_path
+    if not db_path.exists():
+        bootstrap = [
+            str(values.get(name) or os.getenv(name, ""))
+            for name in ("ADMIN_BOOTSTRAP_PASSWORD", "EMPLOYEE_BOOTSTRAP_PASSWORD")
+        ]
+        if all(_strong_password(password) for password in bootstrap):
+            report.pass_("Strong frontend bootstrap passwords are configured")
+        elif strict:
+            report.blocker(
+                "Frontend auth DB is absent and strong bootstrap passwords are missing"
+            )
+        else:
+            report.warning("Frontend auth DB is absent; configure strong bootstrap passwords")
+        return
+
+    try:
+        import bcrypt
+
+        with sqlite3.connect(db_path) as connection:
+            hashes = [
+                row[0]
+                for table in ("auth_settings", "employee_accounts")
+                for row in connection.execute(f"SELECT password_hash FROM {table}")
+            ]
+        weak_accounts = sum(
+            1
+            for password_hash in hashes
+            if _matches_known_weak_password(password_hash, bcrypt)
+        )
+    except (ImportError, sqlite3.Error, TypeError, ValueError) as error:
+        report.warning(f"Could not audit frontend password hashes: {type(error).__name__}")
+        return
+    if weak_accounts and strict:
+        report.blocker(f"Frontend contains {weak_accounts} account(s) with weak passwords")
+    elif weak_accounts:
+        report.warning(f"Frontend contains {weak_accounts} account(s) with weak passwords")
+    else:
+        report.pass_(f"No known weak password found across {len(hashes)} frontend accounts")
+
+
 def run(config_path: Path, *, strict: bool) -> int:
     report = Report()
     load_dotenv(ROOT / ".env")
@@ -81,6 +168,16 @@ def run(config_path: Path, *, strict: bool) -> int:
         report.pass_("backend/.env exists")
     else:
         report.blocker("backend/.env missing")
+
+    app_env = os.getenv("APP_ENV", "development").strip().lower()
+    if app_env == "production":
+        report.pass_("Backend APP_ENV=production")
+    elif strict:
+        report.blocker("Backend APP_ENV must be production for a strict release")
+    else:
+        report.warning("Backend is not in production mode")
+
+    _check_frontend_auth(report, strict=strict)
 
     camera_keys = ("IMOU_IP", "IMOU_USER", "IMOU_PASSWORD")
     missing_camera = [key for key in camera_keys if not _has_env(key)]
@@ -120,10 +217,14 @@ def run(config_path: Path, *, strict: bool) -> int:
             report.blocker(f"Face recognition enabled but gallery is empty/missing: {gallery}")
 
         if config.face.consensus_hits < 2:
-            report.warning(
+            message = (
                 "face.consensus_hits=1 is aggressive for biometric attendance; "
                 "calibrate on deployment-camera data before release"
             )
+            if strict and _env_enabled("ATTENDANCE_AUTOMATION_ENABLED"):
+                report.blocker(message)
+            else:
+                report.warning(message)
         else:
             report.pass_(f"Face temporal consensus: {config.face.consensus_hits} hits")
 
@@ -169,14 +270,21 @@ def run(config_path: Path, *, strict: bool) -> int:
     else:
         report.blocker("Production DB migration is missing")
 
-    # There is no production anti-spoof provider wired into backend attendance yet.
-    if strict:
+    automatic_attendance = _env_enabled("ATTENDANCE_AUTOMATION_ENABLED")
+    liveness_provider = os.getenv("BIOMETRIC_LIVENESS_PROVIDER", "").strip()
+    if automatic_attendance and strict:
         report.blocker(
-            "Biometric liveness/anti-spoof is not wired into the backend attendance gate"
+            "Automatic biometric attendance cannot pass strict release yet: "
+            "the backend liveness/anti-spoof gate is not implemented"
+        )
+    elif automatic_attendance:
+        report.warning(
+            "Automatic biometric attendance is enabled before the backend liveness gate "
+            f"is implemented (declared provider: {liveness_provider or 'none'})"
         )
     else:
-        report.warning(
-            "Liveness/anti-spoof is still a release blocker for automatic biometric attendance"
+        report.pass_(
+            "Automatic biometric attendance is disabled (safe monitor-only mode)"
         )
 
     print(

@@ -27,6 +27,38 @@ if (-not (Test-Path -LiteralPath (Join-Path $backend ".env"))) {
 New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 
+function Wait-ServiceEndpoint {
+    param(
+        [Parameter(Mandatory = $true)][string]$Uri,
+        [Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process,
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if ($Process.HasExited) {
+            return $false
+        }
+        try {
+            $response = Invoke-WebRequest -Uri $Uri -UseBasicParsing -TimeoutSec 2
+            if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300) {
+                return $true
+            }
+        }
+        catch {
+            # Model loading and camera connection are allowed to take time.
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    return $false
+}
+
+function Stop-StartedProcess {
+    param([System.Diagnostics.Process]$Process)
+    if ($null -ne $Process -and -not $Process.HasExited) {
+        Stop-Process -Id $Process.Id -ErrorAction SilentlyContinue
+    }
+}
+
 $backendProcess = Start-Process `
     -FilePath $backendPython `
     -ArgumentList @(
@@ -45,7 +77,13 @@ $backendProcess = Start-Process `
     -RedirectStandardError (Join-Path $logDir "backend.err.log") `
     -PassThru
 
-Start-Sleep -Seconds 2
+if (-not (Wait-ServiceEndpoint `
+    -Uri "http://127.0.0.1:$StreamPort/healthz" `
+    -Process $backendProcess `
+    -TimeoutSeconds 180)) {
+    Stop-StartedProcess -Process $backendProcess
+    throw "Backend failed to become healthy. Check $logDir\backend.err.log and backend.out.log."
+}
 
 $audioEnabled = $true
 $audioSuppressedByChat = $false
@@ -118,6 +156,17 @@ $uiProcess = Start-Process `
     -RedirectStandardError (Join-Path $logDir "frontend.err.log") `
     -PassThru
 
+if (-not (Wait-ServiceEndpoint `
+    -Uri "http://127.0.0.1:$UiPort/_stcore/health" `
+    -Process $uiProcess `
+    -TimeoutSeconds 60)) {
+    Stop-StartedProcess -Process $uiProcess
+    Stop-StartedProcess -Process $chatProcess
+    Stop-StartedProcess -Process $audioProcess
+    Stop-StartedProcess -Process $backendProcess
+    throw "Frontend failed to become healthy. Check $logDir\frontend.err.log."
+}
+
 @{
     started_at = (Get-Date).ToString("o")
     backend = $backendProcess.Id
@@ -129,6 +178,7 @@ $uiProcess = Start-Process `
 Write-Host "Integrated system started."
 Write-Host "UI:      http://$UiHost`:$UiPort"
 Write-Host "Model:   http://127.0.0.1:$StreamPort/status.json"
+Write-Host "Health:  http://127.0.0.1:$StreamPort/readyz"
 Write-Host "Be Xinh greeting: $(if ($audioEnabled) { 'enabled' } elseif ($audioSuppressedByChat) { 'disabled while voice chat is active' } else { 'disabled by dashboard' })"
 Write-Host "Voice chat: $(if ($null -ne $chatProcess) { 'enabled (Gemini 3.5 Flash)' } else { 'disabled - add GEMINI_API_KEY' })"
 Write-Host "Logs:    $logDir"

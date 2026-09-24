@@ -419,6 +419,20 @@ def _tracking_backend_fragment(base_url: str) -> None:
     metric_b.metric("Camera B", count_b)
     metric_total.metric("Tổng hiện diện", count_total)
     metric_checked.metric("Đã check-in", len(checked_ids))
+    stale_count = int(payload.get("count_stale") or 0)
+    logical_count = int(payload.get("count_logical") or count_total)
+    visible_count = int(payload.get("count_visible") or 0)
+    if stale_count:
+        st.caption(
+            f"Camera đang thấy {visible_count} người; {stale_count}/{logical_count} "
+            "track cũ đã được loại khỏi tổng hiện diện để tránh đếm dư."
+        )
+    inference_ms = payload.get("inference_ms")
+    loop_fps = payload.get("loop_fps")
+    if inference_ms is not None or loop_fps is not None:
+        inference_text = "—" if inference_ms is None else f"{float(inference_ms):.1f} ms"
+        fps_text = "—" if loop_fps is None else f"{float(loop_fps):.1f} FPS"
+        st.caption(f"Hiệu năng model: suy luận {inference_text} · vòng xử lý {fps_text}")
 
     present_tab, checkin_tab, states_tab = st.tabs([
         "Đang hiện diện", "Check-in hôm nay", "Ý nghĩa trạng thái"
