@@ -6,13 +6,23 @@ from types import SimpleNamespace
 from scripts.be_xinh_live_assistant import _build_live_config, _send_audio_turn
 
 
-def test_live_config_uses_selected_voice() -> None:
-    config = _build_live_config("Leda")
+def test_native_live_config_uses_selected_voice() -> None:
+    config = _build_live_config("native", "Leda")
     selected = config["speech_config"]["voice_config"]["prebuilt_voice_config"]
 
     assert config["response_modalities"] == ["AUDIO"]
     assert selected["voice_name"] == "Leda"
+    assert config["speech_config"]["language_code"] == "vi-VN"
     assert config["system_instruction"]
+
+
+def test_zerotts_live_config_keeps_audio_for_output_transcript() -> None:
+    config = _build_live_config("zerotts", "Leda")
+
+    assert config["response_modalities"] == ["AUDIO"]
+    assert config["output_audio_transcription"] == {}
+    assert config["input_audio_transcription"]["language_codes"] == ["vi-VN"]
+    assert "Bé Xinh" in config["input_audio_transcription"]["custom_vocabulary"]
 
 
 def test_presegmented_audio_uses_explicit_activity_boundaries() -> None:

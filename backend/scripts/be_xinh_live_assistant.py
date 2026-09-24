@@ -4,9 +4,9 @@ Flow
 ----
 1. A tiny/local STT loop listens only for the wake phrase "Bé Xinh ơi".
 2. One Gemini Live session is opened for a conversation window.
-3. Subsequent user turns are sent as 16 kHz PCM directly to Gemini; no command
-   STT and no ZeroTTS are required on the realtime path.
-4. Gemini's native 24 kHz PCM is forwarded to IMOU VisualTalk chunk-by-chunk.
+3. Subsequent user turns are sent as 16 kHz PCM directly to Gemini Live.
+4. By default, Gemini returns text and ZeroTTS reads it with the Hạ My voice;
+   native Gemini 24 kHz audio remains available as a low-latency fallback.
 5. Local camera/runtime tools are executed through Live function calling.
 
 The existing ``be_xinh_assistant.py`` remains the classic fallback path.
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import os
 from pathlib import Path
 import sys
@@ -39,6 +40,7 @@ try:
     from halinh_assistant import (
         BE_XINH_PHRASES,
         WAKE_STT_PROMPT,
+        active_voice_volume,
         acquire_chat_lock,
         capture_utterance,
         is_wake,
@@ -49,6 +51,7 @@ except ModuleNotFoundError:  # imported as scripts.be_xinh_live_assistant in tes
     from scripts.halinh_assistant import (
         BE_XINH_PHRASES,
         WAKE_STT_PROMPT,
+        active_voice_volume,
         acquire_chat_lock,
         capture_utterance,
         is_wake,
@@ -64,7 +67,8 @@ Phong cách giọng nói:
   Kể cả khi bản chép lời nhận nhầm thành ngôn ngữ khác, vẫn trả lời bằng tiếng Việt;
   chỉ đổi ngôn ngữ khi người dùng yêu cầu thật rõ ràng.
 - Phát âm rõ, nhịp vừa phải, có cảm xúc nhưng không lên giọng quá mức, không nói kiểu em bé.
-- Mặc định trả lời gọn trong 1-2 câu. Có thể dùng nhẹ các từ "nè", "nhé", "ạ" khi hợp ngữ cảnh,
+- Mặc định chỉ trả lời một câu rõ ràng, khoảng 8-20 từ; chỉ dài hơn khi người dùng
+  yêu cầu giải thích. Có thể dùng nhẹ các từ "nè", "nhé", "ạ" khi hợp ngữ cảnh,
   nhưng không chèn vào mọi câu và không dùng tiếng cảm thán gây ồn.
 - Thay đổi cách mở đầu và kết thúc để không lặp máy móc. Không liên tục nói
   "Bé Xinh có thể giúp gì" hoặc tự giới thiệu lại trong cùng một phiên.
@@ -80,25 +84,35 @@ hoặc trạng thái chấm công. Không dùng Markdown trong lời nói. Tự 
 """
 
 
-def _build_live_config(voice_name: str) -> dict:
-    """Build the Live session config with an explicit, configurable voice."""
-    return {
+def _build_live_config(output_mode: str, voice_name: str) -> dict:
+    """Build a Gemini Live config for native audio or ZeroTTS output."""
+    config = {
+        # The current conversational Live model only accepts AUDIO. In
+        # ZeroTTS mode we discard its PCM, keep output_audio_transcription,
+        # and let Hạ My read that text without making a second Gemini call.
         "response_modalities": ["AUDIO"],
         "system_instruction": LIVE_SYSTEM,
-        "speech_config": {
-            "voice_config": {
-                "prebuilt_voice_config": {
-                    "voice_name": voice_name,
-                },
-            },
+        # Bias the recognizer toward Vietnamese and project-specific names.
+        # This is still Gemini Live audio understanding, not a second STT API.
+        "input_audio_transcription": {
+            "language_codes": ["vi-VN"],
+            "custom_vocabulary": [
+                "Bé Xinh", "chấm công", "Camera A", "Camera B", "IMOU",
+            ],
         },
         "tools": [{"function_declarations": TOOL_DECLARATIONS}],
-        "input_audio_transcription": {},
-        "output_audio_transcription": {},
         "realtime_input_config": {
             "automatic_activity_detection": {"disabled": True},
         },
+        "speech_config": {
+            "voice_config": {
+                "prebuilt_voice_config": {"voice_name": voice_name},
+            },
+            "language_code": "vi-VN",
+        },
+        "output_audio_transcription": {},
     }
+    return config
 
 
 def parse_args() -> argparse.Namespace:
@@ -220,8 +234,9 @@ async def _send_audio_turn(session, pcm: bytes, types) -> None:
 
 
 async def _receive_turn(session, speaker: CameraCheckInAnnouncer, types,
-                        timeout_s: float = 12.0) -> tuple[str, str, float]:
-    """Receive one Live turn, stream native audio, and service tool calls.
+                        timeout_s: float = 12.0, *,
+                        stream_native_audio: bool = True) -> tuple[str, str, float]:
+    """Receive one Live turn and service native audio/text plus tool calls.
 
     Có timeout: mic ồn/yếu khiến Live im luôn thì không treo turn vĩnh
     viễn mà trả turn rỗng để caller về wake mode cho người dùng gọi lại.
@@ -229,7 +244,7 @@ async def _receive_turn(session, speaker: CameraCheckInAnnouncer, types,
     stream = None
     user_text = ""
     assistant_text = ""
-    first_audio_at: float | None = None
+    first_output_at: float | None = None
     started = time.monotonic()
     try:
         async with asyncio.timeout(timeout_s):
@@ -246,9 +261,9 @@ async def _receive_turn(session, speaker: CameraCheckInAnnouncer, types,
                         mime = str(getattr(inline, "mime_type", "") or "")
                         if inline_data and (not mime or mime.startswith("audio/")):
                             audio_chunks.append(bytes(inline_data))
-                for audio_chunk in audio_chunks:
+                for audio_chunk in audio_chunks if stream_native_audio else []:
                     if stream is None:
-                        first_audio_at = time.monotonic()
+                        first_output_at = time.monotonic()
                         stream = speaker.open_pcm_stream(input_sample_rate=24_000)
                     stream.write(audio_chunk)
 
@@ -271,6 +286,17 @@ async def _receive_turn(session, speaker: CameraCheckInAnnouncer, types,
                         user_text = str(in_tx.text).strip()
                     if out_tx is not None and getattr(out_tx, "text", None):
                         assistant_text += str(out_tx.text)
+                        if first_output_at is None:
+                            first_output_at = time.monotonic()
+                    # TEXT response mode exposes the answer through model-turn
+                    # parts instead of output_audio_transcription.
+                    model_turn = getattr(content, "model_turn", None)
+                    for part in getattr(model_turn, "parts", None) or []:
+                        part_text = getattr(part, "text", None)
+                        if part_text:
+                            assistant_text += str(part_text)
+                            if first_output_at is None:
+                                first_output_at = time.monotonic()
                     if bool(getattr(content, "interrupted", False)) and stream is not None:
                         stream.close(abort=True)
                         stream = None
@@ -282,8 +308,83 @@ async def _receive_turn(session, speaker: CameraCheckInAnnouncer, types,
     finally:
         if stream is not None:
             stream.close()
-    latency = (first_audio_at - started) if first_audio_at is not None else (time.monotonic() - started)
+    latency = (
+        first_output_at - started
+        if first_output_at is not None
+        else time.monotonic() - started
+    )
     return user_text, assistant_text.strip(), latency
+
+
+async def _speak_zerotts(
+    text: str,
+    tts,
+    speaker: CameraCheckInAnnouncer,
+    output_dir: Path,
+    voice_name: str,
+) -> tuple[float, float]:
+    """Stream Hạ My to IMOU immediately, then cache the completed waveform."""
+    from camera_tracking.voice.speaker_guard import mark_speaker_busy
+
+    key = hashlib.sha1(f"{voice_name}\0{text}".encode("utf-8")).hexdigest()[:16]
+    wav = output_dir / f"be_xinh_live_{key}.wav"
+    speaker.gain = active_voice_volume()
+
+    def _stream_or_play_cached() -> tuple[float, float]:
+        started = time.monotonic()
+        if wav.is_file():
+            speaker.play_file_sync(wav)
+            elapsed = time.monotonic() - started
+            return 0.0, elapsed
+
+        import numpy as np
+        import soundfile as sf
+
+        model = tts._load()
+        pcm_stream = None
+        audio_parts: list[np.ndarray] = []
+        first_audio_s: float | None = None
+        try:
+            # ZeroTTS can rarely miss its end token and continue toward the
+            # library default of 1,500 frames. Bound it from the answer length
+            # so one unlucky sample cannot monopolize CPU for minutes.
+            max_frames = max(28, min(90, int(len(text) * 0.95) + 12))
+            for audio in model.synthesize_stream(
+                text,
+                voice=voice_name,
+                max_frames=max_frames,
+                first_chunk_frames=4,
+                max_chunk_frames=8,
+            ):
+                samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+                if not samples.size:
+                    continue
+                audio_parts.append(samples)
+                pcm = (
+                    np.clip(samples, -1.0, 1.0) * 32767.0
+                ).astype("<i2").tobytes()
+                if pcm_stream is None:
+                    pcm_stream = speaker.open_pcm_stream(
+                        input_sample_rate=int(model.sample_rate)
+                    )
+                pcm_stream.write(pcm)
+                if first_audio_s is None:
+                    first_audio_s = time.monotonic() - started
+        finally:
+            if pcm_stream is not None:
+                pcm_stream.close()
+
+        if audio_parts:
+            sf.write(
+                str(wav), np.concatenate(audio_parts), int(model.sample_rate)
+            )
+        total_s = time.monotonic() - started
+        return first_audio_s or total_s, total_s
+
+    first_audio_s, total_s = await asyncio.to_thread(_stream_or_play_cached)
+    # Keep the next RTSP capture from consuming the camera's short echo tail.
+    mark_speaker_busy(hold_s=0.8)
+    return first_audio_s, total_s
 
 
 async def run_live(args: argparse.Namespace) -> int:
@@ -317,40 +418,91 @@ async def run_live(args: argparse.Namespace) -> int:
     turn_wait_s = max(3.0, float(args.turn_wait_s))
     client = genai.Client(api_key=api_key)
 
+    output_mode = os.getenv("BE_XINH_LIVE_OUTPUT", "zerotts").strip().lower()
+    if output_mode not in {"zerotts", "native"}:
+        print(
+            f"[Bé Xinh Live] BE_XINH_LIVE_OUTPUT={output_mode!r} không hợp lệ; "
+            "dùng zerotts.", flush=True,
+        )
+        output_mode = "zerotts"
     voice_name = os.getenv("BE_XINH_LIVE_VOICE", "Leda").strip() or "Leda"
-    live_config = _build_live_config(voice_name)
+    zerotts_voice = os.getenv("BE_XINH_ZEROTTS_VOICE", "hamy").strip() or "hamy"
+    zerotts_device = os.getenv("BE_XINH_ZEROTTS_DEVICE", "cpu").strip() or "cpu"
+    try:
+        zerotts_threads = max(
+            1, int(os.getenv("BE_XINH_ZEROTTS_THREADS", "12"))
+        )
+    except ValueError:
+        zerotts_threads = 12
+    tts = None
+    answer_dir = ROOT / "output" / "be_xinh_live_answers"
+    if output_mode == "zerotts":
+        from camera_tracking.voice.zerotts_tts import ZeroTTSBackend
+
+        print(
+            f"[Bé Xinh Live] đang nạp ZeroTTS voice={zerotts_voice} "
+            f"device={zerotts_device}...", flush=True,
+        )
+        tts = ZeroTTSBackend(
+            device=zerotts_device,
+            voice=zerotts_voice,
+            num_threads=zerotts_threads,
+        )
+        await asyncio.to_thread(tts._load)
+        answer_dir.mkdir(parents=True, exist_ok=True)
+
+    live_config = _build_live_config(output_mode, voice_name)
+    active_voice = zerotts_voice if output_mode == "zerotts" else voice_name
     print(
-        f"[Bé Xinh Live] READY | model={model} | voice={voice_name} "
+        f"[Bé Xinh Live] READY | model={model} | output={output_mode} "
+        f"| voice={active_voice} "
         f"| session idle={idle_s:.0f}s"
     )
 
     try:
+        retry_pcm: bytes | None = None
+        connect_retries = 0
         while True:
-            pcm = await asyncio.to_thread(
-                capture_utterance, mic_input, voice_cfg,
-                prompt="[Bé Xinh Live] gọi 'Bé Xinh ơi'...",
-                end_silence_ms=550, max_len_s=5.0, max_wait_s=None,
-                meter_s=4.0, respect_speaker_busy=not args.full_duplex,
-            )
-            if not pcm:
-                continue
-            wake_text = await asyncio.to_thread(wake, pcm)
-            if not wake_text or not is_wake(wake_text):
-                continue
+            if retry_pcm is not None:
+                pcm = retry_pcm
+                retry_pcm = None
+                wake_text = "Bé Xinh ơi"
+                print(
+                    f"[Bé Xinh Live] thử kết nối lại "
+                    f"({connect_retries}/2), giữ nguyên câu vừa nói...",
+                    flush=True,
+                )
+            else:
+                pcm = await asyncio.to_thread(
+                    capture_utterance, mic_input, voice_cfg,
+                    prompt="[Bé Xinh Live] gọi 'Bé Xinh ơi'...",
+                    end_silence_ms=700, max_len_s=8.0, max_wait_s=None,
+                    meter_s=4.0, respect_speaker_busy=not args.full_duplex,
+                )
+                if not pcm:
+                    continue
+                wake_text = await asyncio.to_thread(wake, pcm)
+                if not wake_text or not is_wake(wake_text):
+                    continue
+                connect_retries = 0
             print(f"[Bé Xinh Live] WAKE: {wake_text}", flush=True)
             mark_turn()
             conversation_started = time.monotonic()
+            session_opened = False
             try:
                 async with client.aio.live.connect(model=model, config=live_config) as session:
-                    # If the wake sentence already contains a command, let Live hear
-                    # the original audio so names/intonation are preserved.
-                    pending_pcm = pcm if strip_wake_command(wake_text) else None
+                    session_opened = True
+                    # Always let Live hear the entire wake utterance. Tiny local
+                    # Whisper may recognize only "Bé Xinh ơi" and miss the
+                    # question that follows; dropping this PCM was the main cause
+                    # of wake succeeding while the actual question disappeared.
+                    pending_pcm = pcm
                     while True:
                         if pending_pcm is None:
                             pending_pcm = await asyncio.to_thread(
                                 capture_utterance, mic_input, voice_cfg,
                                 prompt="[Bé Xinh Live] đang nghe...",
-                                end_silence_ms=450, max_len_s=12.0,
+                                end_silence_ms=750, max_len_s=15.0,
                                 max_wait_s=turn_wait_s,
                                 respect_speaker_busy=not args.full_duplex,
                             )
@@ -366,7 +518,8 @@ async def run_live(args: argparse.Namespace) -> int:
                         pending_pcm = _agc_pcm(raw_pcm)
                         await _send_audio_turn(session, pending_pcm, types)
                         user_text, assistant_text, response_latency = await _receive_turn(
-                            session, speaker, types
+                            session, speaker, types,
+                            stream_native_audio=output_mode == "native",
                         )
                         if not user_text and not assistant_text:
                             # Safety net for weak/noisy camera microphones:
@@ -389,15 +542,35 @@ async def run_live(args: argparse.Namespace) -> int:
                                     turn_complete=True,
                                 )
                                 user_text, assistant_text, response_latency = (
-                                    await _receive_turn(session, speaker, types)
+                                    await _receive_turn(
+                                        session, speaker, types,
+                                        stream_native_audio=output_mode == "native",
+                                    )
                                 )
-                        total = time.monotonic() - sent_at
                         if user_text:
                             print(f"[Bé Xinh Live] bạn: {user_text}", flush=True)
                         if assistant_text:
                             print(f"[Bé Xinh Live] Bé Xinh: {assistant_text}", flush=True)
+                            if output_mode == "zerotts" and tts is not None:
+                                try:
+                                    first_hamy_s, hamy_total_s = await _speak_zerotts(
+                                        assistant_text, tts, speaker,
+                                        answer_dir, zerotts_voice,
+                                    )
+                                    print(
+                                        f"[Bé Xinh Live] Hạ My first-audio="
+                                        f"{first_hamy_s:.2f}s | stream="
+                                        f"{hamy_total_s:.2f}s", flush=True,
+                                    )
+                                except Exception as error:  # noqa: BLE001
+                                    print(
+                                        f"[Bé Xinh Live] Hạ My/loa lỗi: "
+                                        f"{type(error).__name__}: {error}",
+                                        flush=True,
+                                    )
+                        total = time.monotonic() - sent_at
                         print(
-                            f"[Bé Xinh Live] first-audio={response_latency:.2f}s | "
+                            f"[Bé Xinh Live] first-output={response_latency:.2f}s | "
                             f"turn={total:.2f}s", flush=True,
                         )
                         if not user_text and not assistant_text:
@@ -407,6 +580,16 @@ async def run_live(args: argparse.Namespace) -> int:
                         conversation_started = time.monotonic()
                         pending_pcm = None
             except Exception as error:  # noqa: BLE001
+                if (
+                    not session_opened
+                    and isinstance(error, (TimeoutError, OSError))
+                    and connect_retries < 2
+                ):
+                    connect_retries += 1
+                    retry_pcm = pcm
+                    await asyncio.sleep(0.8 * connect_retries)
+                    continue
+                connect_retries = 0
                 print(f"[Bé Xinh Live] session lỗi: {type(error).__name__}: {error}", flush=True)
                 print("[Bé Xinh Live] về wake mode; classic assistant vẫn là fallback.", flush=True)
             finally:

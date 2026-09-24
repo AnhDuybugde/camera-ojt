@@ -22,6 +22,7 @@ import numpy as np
 
 DEFAULT_MODEL = "zeroweight-ai/ZeroTTS"
 DEFAULT_VOICE = "maichi"
+_WINDOWS_DLL_HANDLES: list[object] = []
 
 
 def _expose_nvidia_libs() -> None:
@@ -35,6 +36,35 @@ def _expose_nvidia_libs() -> None:
     import sys
 
     try:
+        if os.name == "nt":
+            # PyTorch Windows wheels already bundle the CUDA 12/cuDNN 9 DLLs
+            # required by onnxruntime-gpu. Register torch/lib explicitly;
+            # merely importing torch or changing PATH after process start is
+            # not reliable with Python 3.8+'s secure DLL search behavior.
+            site_packages = Path(sys.prefix) / "Lib" / "site-packages"
+            candidates = [site_packages / "torch" / "lib"]
+            nvidia_root = site_packages / "nvidia"
+            if nvidia_root.is_dir():
+                candidates.extend(
+                    path for package in nvidia_root.iterdir()
+                    for path in (package / "bin", package / "lib")
+                    if path.is_dir()
+                )
+            dll_dirs = [path for path in candidates if path.is_dir()]
+            if not dll_dirs:
+                return
+            global _WINDOWS_DLL_HANDLES
+            for dll_dir in dll_dirs:
+                try:
+                    _WINDOWS_DLL_HANDLES.append(os.add_dll_directory(str(dll_dir)))
+                except (AttributeError, OSError):
+                    pass
+            current = os.environ.get("PATH", "")
+            os.environ["PATH"] = os.pathsep.join(
+                [*(str(path) for path in dll_dirs), current]
+            )
+            return
+
         roots = [Path(sys.prefix) / "lib",
                   Path(sys.prefix) / "lib64",
                   Path(sys.prefix) / "lib" / "python3.10" / "site-packages"]
@@ -84,6 +114,7 @@ class ZeroTTSBackend:
     model: str = DEFAULT_MODEL
     voice: str = DEFAULT_VOICE
     device: str = "cpu"
+    num_threads: int = 0
     _tts: object = field(default=None, init=False, repr=False)
 
     def _load(self):  # type: ignore[no-untyped-def]
@@ -106,7 +137,14 @@ class ZeroTTSBackend:
                     providers = [p for p in wanted if p in available] or providers
                 except ImportError:
                     pass
-            self._tts = ZeroTTS.from_pretrained(self.model, providers=providers)
+            kwargs = {"providers": providers}
+            if providers == ["CPUExecutionProvider"]:
+                import os
+
+                threads = self.num_threads or min(12, max(1, os.cpu_count() or 4))
+                kwargs["intra_op_num_threads"] = threads
+                kwargs["codec_intra_op_num_threads"] = threads
+            self._tts = ZeroTTS.from_pretrained(self.model, **kwargs)
         return self._tts
 
     def list_voices(self) -> list[str]:
