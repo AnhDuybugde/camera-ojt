@@ -42,12 +42,12 @@ class AttendanceService:
                 "SELECT * FROM attendance WHERE employee_id=? AND date=?",
                 (employee_id, day),
             )
+            work_session = work_session_at(
+                now, settings.morning_end_time, settings.afternoon_start_time
+            )
             # An open daily attendance record must remain eligible for CHECK-OUT.
             # Otherwise, validate the session active at the recognition time.
             if not (existing and existing["check_in"] and not existing["check_out"]):
-                work_session = work_session_at(
-                    now, settings.morning_end_time, settings.afternoon_start_time
-                )
                 if work_session is None:
                     return AttendanceResult(
                         "BREAK", "Đang trong giờ nghỉ trưa - Không chấm công"
@@ -78,10 +78,17 @@ class AttendanceService:
                     "SELECT * FROM attendance WHERE employee_id=? AND date=?", (employee_id, day)
                 ).fetchone()
                 inserted = False
-                morning = self.db.get_work_schedule(employee_id, day, "MORNING")
-                first_session = "MORNING" if morning and morning["work_status"] == "ON" else "AFTERNOON"
-                status = scheduled_check_in_status(first_session, now)
+                # Grade lateness against the session in which the face was
+                # actually recognized. A 14:09 check-in belongs to the
+                # afternoon session and is therefore on time (cutoff 14:15),
+                # even when the employee also registered an ON morning shift.
+                status = (
+                    scheduled_check_in_status(work_session, now)
+                    if (row is None or row["check_in"] is None) and work_session is not None
+                    else None
+                )
                 if row is None:
+                    assert status is not None
                     cursor = conn.execute(
                         """INSERT INTO attendance
                            (employee_id, employee_name, department, date, check_in, check_out,
@@ -103,6 +110,7 @@ class AttendanceService:
                 elif row is None:
                     raise RuntimeError("Could not read the concurrent attendance record")
                 elif row["check_in"] is None:
+                    assert status is not None
                     result = conn.execute(
                         """UPDATE attendance SET check_in=?,status=?,presence_status='PRESENT',
                            sync_status='PENDING',updated_at=? WHERE id=? AND check_in IS NULL""",

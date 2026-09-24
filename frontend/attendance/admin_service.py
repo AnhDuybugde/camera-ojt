@@ -8,7 +8,7 @@ from sqlalchemy.exc import IntegrityError as SQLAlchemyIntegrityError
 from collections.abc import Callable
 from datetime import date, datetime
 
-from attendance.attendance_rules import check_in_status
+from attendance.daily_service import scheduled_check_in_status
 from auth.permissions import require_permission
 from config import settings
 from database.db import Database
@@ -51,10 +51,16 @@ class AttendanceAdminService:
         override = status_override.strip().upper() if status_override else None
         if override and override not in ATTENDANCE_STATUSES:
             raise ValueError("Trạng thái attendance không hợp lệ.")
-        automatic_status = (
-            check_in_status(datetime.fromisoformat(normalized_check_in), settings.late_threshold)
-            if normalized_check_in else "ABSENT"
-        )
+        if normalized_check_in:
+            check_in_time = datetime.fromisoformat(normalized_check_in)
+            session = (
+                "AFTERNOON"
+                if check_in_time.time() >= settings.afternoon_start_time
+                else "MORNING"
+            )
+            automatic_status = scheduled_check_in_status(session, check_in_time)
+        else:
+            automatic_status = "ABSENT"
         final_status = override or automatic_status
         timestamp = iso_now()
 

@@ -56,3 +56,14 @@ def test_admin_override_requires_reason_and_employee_is_denied(tmp_path: Path) -
     )
     assert updated["status"] == "ABSENT"
 
+
+def test_admin_edit_uses_afternoon_late_cutoff(tmp_path: Path) -> None:
+    db = Database(tmp_path / "admin.db")
+    attendance_id = _record(db)
+    updated = AttendanceAdminService(db).update_attendance(
+        attendance_id, actor_role="ADMIN", work_date="2026-09-14",
+        check_in="2026-09-14T14:15:00", check_out=None,
+        reason="Kiểm tra mốc ca chiều",
+    )
+
+    assert updated["status"] == "ON_TIME"

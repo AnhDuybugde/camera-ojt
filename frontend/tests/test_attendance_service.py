@@ -30,3 +30,26 @@ def test_unknown_employee_does_not_create_record(tmp_path: Path) -> None:
     db, service = make_service(tmp_path)
     assert service.record("MISSING").action == "ERROR"
     assert db.list_attendance() == []
+
+
+def test_afternoon_checkin_uses_afternoon_late_cutoff(tmp_path: Path) -> None:
+    db = Database(tmp_path / "attendance.db")
+    db.add_employee({"employee_id": "NV001", "full_name": "Nguyen Van A"})
+    day = "2026-09-14"
+    db.save_work_schedules([
+        ("NV001", day, "MORNING", "ON"),
+        ("NV001", day, "AFTERNOON", "ON"),
+    ])
+    service = AttendanceService(db)
+
+    assert service.record("NV001", datetime(2026, 9, 14, 14, 15)).record["status"] == "ON_TIME"
+
+
+def test_afternoon_checkin_after_1415_is_late(tmp_path: Path) -> None:
+    db = Database(tmp_path / "attendance.db")
+    db.add_employee({"employee_id": "NV001", "full_name": "Nguyen Van A"})
+    day = "2026-09-14"
+    db.save_work_schedule("NV001", day, "ON", "AFTERNOON")
+    service = AttendanceService(db)
+
+    assert service.record("NV001", datetime(2026, 9, 14, 14, 16)).record["status"] == "LATE"
