@@ -47,6 +47,7 @@ try:
         active_voice_volume,
         acquire_chat_lock,
         capture_utterance,
+        fast_answer,
         is_wake,
         release_chat_lock,
         strip_wake_command,
@@ -58,6 +59,7 @@ except ModuleNotFoundError:  # imported as scripts.be_xinh_live_assistant in tes
         active_voice_volume,
         acquire_chat_lock,
         capture_utterance,
+        fast_answer,
         is_wake,
         release_chat_lock,
         strip_wake_command,
@@ -75,7 +77,7 @@ Phong cách giọng nói:
   Kể cả khi bản chép lời nhận nhầm thành ngôn ngữ khác, vẫn trả lời bằng tiếng Việt;
   chỉ đổi ngôn ngữ khi người dùng yêu cầu thật rõ ràng.
 - Phát âm rõ, nhịp vừa phải, có cảm xúc nhưng không lên giọng quá mức, không nói kiểu em bé.
-- Mặc định chỉ trả lời một câu rõ ràng, khoảng 8-20 từ; chỉ dài hơn khi người dùng
+- Mặc định chỉ trả lời một câu rõ ràng, khoảng 6-12 từ; chỉ dài hơn khi người dùng
   yêu cầu giải thích. Có thể dùng nhẹ các từ "nè", "nhé", "ạ" khi hợp ngữ cảnh,
   nhưng không chèn vào mọi câu và không dùng tiếng cảm thán gây ồn.
 - Thay đổi cách mở đầu và kết thúc để không lặp máy móc. Không liên tục nói
@@ -125,6 +127,33 @@ class LaptopSpeaker:
                 raise RuntimeError(f"ffplay thoát với mã {code}")
         finally:
             self._process = None
+
+    def open_mp3_stream(self) -> subprocess.Popen:
+        """Open ffplay stdin so Edge MP3 chunks are audible immediately."""
+        volume = max(10, min(100, round(float(self.gain) * 100)))
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        self._process = subprocess.Popen(
+            [
+                self.ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet",
+                "-volume", str(volume), "-f", "mp3", "-i", "pipe:0",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=flags,
+        )
+        return self._process
+
+    def finish_mp3_stream(self, process: subprocess.Popen) -> None:
+        try:
+            if process.stdin is not None and not process.stdin.closed:
+                process.stdin.close()
+            code = process.wait(timeout=20)
+            if code != 0:
+                raise RuntimeError(f"ffplay stream thoát với mã {code}")
+        finally:
+            if self._process is process:
+                self._process = None
 
     def cancel_playback(self) -> None:
         process = self._process
@@ -418,7 +447,8 @@ async def _send_audio_turn(session, pcm: bytes, types) -> None:
 
 async def _receive_turn(session, speaker: CameraCheckInAnnouncer, types,
                         timeout_s: float = 18.0, *,
-                        stream_native_audio: bool = True) -> tuple[str, str, float]:
+                        stream_native_audio: bool = True,
+                        on_assistant_text=None) -> tuple[str, str, float]:
     """Receive one Live turn and service native audio/text plus tool calls.
 
     Có timeout: mic ồn/yếu khiến Live im luôn thì không treo turn vĩnh
@@ -480,7 +510,10 @@ async def _receive_turn(session, speaker: CameraCheckInAnnouncer, types,
                         if in_tx is not None and getattr(in_tx, "text", None):
                             user_text = str(in_tx.text).strip()
                         if out_tx is not None and getattr(out_tx, "text", None):
-                            assistant_text += str(out_tx.text)
+                            delta = str(out_tx.text)
+                            assistant_text += delta
+                            if on_assistant_text is not None:
+                                on_assistant_text(delta)
                             model_output_seen = True
                             if first_output_at is None:
                                 first_output_at = time.monotonic()
@@ -488,9 +521,18 @@ async def _receive_turn(session, speaker: CameraCheckInAnnouncer, types,
                         # parts instead of output_audio_transcription.
                         model_turn = getattr(content, "model_turn", None)
                         for part in getattr(model_turn, "parts", None) or []:
+                            # Native-audio models may expose an internal
+                            # reasoning part before the final spoken answer.
+                            # It must never be logged, concatenated or sent to
+                            # Hạ My as user-facing speech.
+                            if bool(getattr(part, "thought", False)):
+                                continue
                             part_text = getattr(part, "text", None)
                             if part_text:
-                                assistant_text += str(part_text)
+                                delta = str(part_text)
+                                assistant_text += delta
+                                if on_assistant_text is not None:
+                                    on_assistant_text(delta)
                                 model_output_seen = True
                                 if first_output_at is None:
                                     first_output_at = time.monotonic()
@@ -567,16 +609,21 @@ async def _speak_edge_hamy(
     speaker: CameraCheckInAnnouncer,
     output_dir: Path,
     voice_name: str,
+    rate: str = "+18%",
 ) -> tuple[float, float]:
     """Generate Microsoft's Vietnamese HoaiMy voice quickly and cache it."""
     import edge_tts
     from camera_tracking.voice.speaker_guard import mark_speaker_busy
 
-    key = hashlib.sha1(f"{voice_name}\0{text}".encode("utf-8")).hexdigest()[:16]
+    key = hashlib.sha1(
+        f"{voice_name}\0{rate}\0{text}".encode("utf-8")
+    ).hexdigest()[:16]
     audio_path = output_dir / f"be_xinh_edge_{key}.mp3"
     synth_started = time.monotonic()
     if not audio_path.is_file():
-        await edge_tts.Communicate(text, voice=voice_name).save(str(audio_path))
+        await edge_tts.Communicate(
+            text, voice=voice_name, rate=rate
+        ).save(str(audio_path))
     synth_s = time.monotonic() - synth_started
 
     speaker.gain = active_voice_volume()
@@ -585,6 +632,176 @@ async def _speak_edge_hamy(
     play_s = time.monotonic() - play_started
     mark_speaker_busy(hold_s=0.8)
     return synth_s, play_s
+
+
+async def _stream_edge_hamy_laptop(
+    text: str,
+    speaker: LaptopSpeaker,
+    output_dir: Path,
+    voice_name: str,
+    rate: str = "+18%",
+) -> tuple[float, float]:
+    """Stream Edge MP3 to laptop ffplay while caching the completed audio."""
+    import edge_tts
+    from camera_tracking.voice.speaker_guard import mark_speaker_busy
+
+    key = hashlib.sha1(
+        f"{voice_name}\0{rate}\0{text}".encode("utf-8")
+    ).hexdigest()[:16]
+    audio_path = output_dir / f"be_xinh_edge_{key}.mp3"
+    speaker.gain = active_voice_volume()
+    started = time.monotonic()
+    if audio_path.is_file() and audio_path.stat().st_size > 0:
+        await asyncio.to_thread(speaker.play_file_sync, audio_path)
+        total = time.monotonic() - started
+        mark_speaker_busy(hold_s=0.5)
+        return 0.0, total
+
+    partial = audio_path.with_suffix(".mp3.part")
+    process = speaker.open_mp3_stream()
+    first_audio_at: float | None = None
+    try:
+        with partial.open("wb") as cache:
+            async for event in edge_tts.Communicate(
+                text, voice=voice_name, rate=rate
+            ).stream():
+                if event.get("type") != "audio":
+                    continue
+                data = bytes(event.get("data") or b"")
+                if not data:
+                    continue
+                if first_audio_at is None:
+                    first_audio_at = time.monotonic()
+                cache.write(data)
+                if process.stdin is None:
+                    raise RuntimeError("ffplay stream không có stdin")
+                process.stdin.write(data)
+                process.stdin.flush()
+        await asyncio.to_thread(speaker.finish_mp3_stream, process)
+        partial.replace(audio_path)
+    except Exception:
+        partial.unlink(missing_ok=True)
+        speaker.cancel_playback()
+        raise
+    total = time.monotonic() - started
+    first = (first_audio_at - started) if first_audio_at is not None else total
+    mark_speaker_busy(hold_s=0.5)
+    return first, total
+
+
+async def _synthesize_edge_hamy_file(
+    text: str,
+    output_dir: Path,
+    voice_name: str,
+    rate: str,
+) -> Path:
+    """Synthesize one later speech segment while the first is playing."""
+    import edge_tts
+
+    key = hashlib.sha1(
+        f"{voice_name}\0{rate}\0{text}".encode("utf-8")
+    ).hexdigest()[:16]
+    target = output_dir / f"be_xinh_edge_{key}.mp3"
+    if target.is_file() and target.stat().st_size > 0:
+        return target
+    partial = target.with_suffix(".mp3.part")
+    try:
+        await edge_tts.Communicate(
+            text, voice=voice_name, rate=rate
+        ).save(str(partial))
+        partial.replace(target)
+    except Exception:
+        partial.unlink(missing_ok=True)
+        raise
+    return target
+
+
+class EdgeSpeechPipeline:
+    """Start Hạ My from partial Live transcription without overlapping audio."""
+
+    def __init__(
+        self,
+        speaker: LaptopSpeaker,
+        output_dir: Path,
+        voice_name: str,
+        rate: str,
+    ) -> None:
+        self.speaker = speaker
+        self.output_dir = output_dir
+        self.voice_name = voice_name
+        self.rate = rate
+        self.started_at = time.monotonic()
+        self.buffer = ""
+        self.first_task: asyncio.Task | None = None
+        self.first_task_started_at: float | None = None
+        self.later_tasks: list[asyncio.Task] = []
+
+    @staticmethod
+    def _cut(text: str, target: int) -> tuple[str, str]:
+        if len(text) <= target:
+            return text.strip(), ""
+        cut = text.rfind(" ", 0, target + 1)
+        if cut < max(12, target // 2):
+            cut = target
+        return text[:cut].strip(), text[cut:].lstrip()
+
+    def push(self, delta: str) -> None:
+        value = str(delta or "")
+        if not value:
+            return
+        self.buffer += value
+        normalized = self.buffer.strip()
+        sentence_end = bool(re.search(r"[.!?…]\s*$", normalized))
+        if self.first_task is None and (
+            len(normalized) >= 34 or (sentence_end and len(normalized) >= 16)
+        ):
+            chunk, self.buffer = self._cut(normalized, 44)
+            self.first_task_started_at = time.monotonic()
+            self.first_task = asyncio.create_task(
+                _stream_edge_hamy_laptop(
+                    chunk, self.speaker, self.output_dir,
+                    self.voice_name, self.rate,
+                )
+            )
+        elif self.first_task is not None and len(normalized) >= 64:
+            chunk, self.buffer = self._cut(normalized, 72)
+            self.later_tasks.append(asyncio.create_task(
+                _synthesize_edge_hamy_file(
+                    chunk, self.output_dir, self.voice_name, self.rate,
+                )
+            ))
+
+    async def finish(self) -> tuple[float, float] | None:
+        remaining = self.buffer.strip()
+        self.buffer = ""
+        if self.first_task is None:
+            if not remaining:
+                return None
+            self.first_task_started_at = time.monotonic()
+            self.first_task = asyncio.create_task(
+                _stream_edge_hamy_laptop(
+                    remaining, self.speaker, self.output_dir,
+                    self.voice_name, self.rate,
+                )
+            )
+        elif remaining:
+            self.later_tasks.append(asyncio.create_task(
+                _synthesize_edge_hamy_file(
+                    remaining, self.output_dir, self.voice_name, self.rate,
+                )
+            ))
+
+        first_audio_s, _ = await self.first_task
+        if self.first_task_started_at is not None:
+            first_audio_s += self.first_task_started_at - self.started_at
+        self.speaker.gain = active_voice_volume()
+        from camera_tracking.voice.speaker_guard import mark_speaker_busy
+
+        for task in self.later_tasks:
+            path = await task
+            await asyncio.to_thread(self.speaker.play_file_sync, path)
+            mark_speaker_busy(hold_s=0.3)
+        return first_audio_s, time.monotonic() - self.started_at
 
 
 async def run_live(args: argparse.Namespace) -> int:
@@ -646,6 +863,10 @@ async def run_live(args: argparse.Namespace) -> int:
     )
     command_stt = _command_transcriber(command_model, stt_lang)
     model = args.model or os.getenv("GEMINI_LIVE_MODEL", "").strip() or "gemini-3.8-live"
+    fast_model = os.getenv(
+        "BE_XINH_FAST_LIVE_MODEL",
+        "gemini-2.5-flash-native-audio-latest",
+    ).strip()
     fallback_models = [
         item.strip()
         for item in os.getenv(
@@ -654,7 +875,9 @@ async def run_live(args: argparse.Namespace) -> int:
         ).split(",")
         if item.strip()
     ]
-    model_chain = list(dict.fromkeys([model, *fallback_models]))
+    # Avoid a failed 3.8 websocket round trip after every restart. The local
+    # deployment has verified quota on the fast 2.5 native-audio endpoint.
+    model_chain = list(dict.fromkeys([fast_model, model, *fallback_models]))
     model_index = 0
     idle_s = args.conversation_idle_s or float(os.getenv("BE_XINH_CONVERSATION_IDLE_SECONDS", "45"))
     turn_wait_s = max(3.0, float(args.turn_wait_s))
@@ -679,6 +902,7 @@ async def run_live(args: argparse.Namespace) -> int:
         os.getenv("BE_XINH_EDGE_VOICE", "vi-VN-HoaiMyNeural").strip()
         or "vi-VN-HoaiMyNeural"
     )
+    edge_rate = os.getenv("BE_XINH_EDGE_RATE", "+18%").strip() or "+18%"
     zerotts_device = os.getenv("BE_XINH_ZEROTTS_DEVICE", "cpu").strip() or "cpu"
     try:
         zerotts_threads = max(
@@ -772,7 +996,8 @@ async def run_live(args: argparse.Namespace) -> int:
                 pcm = await asyncio.to_thread(
                     capture_utterance, mic_input, voice_cfg,
                     prompt="[Bé Xinh Live] mời bạn nói câu hỏi...",
-                    end_silence_ms=1200, max_len_s=15.0,
+                    end_silence_ms=(650 if audio_mode == "laptop" else 1200),
+                    max_len_s=15.0,
                     max_wait_s=turn_wait_s,
                     respect_speaker_busy=not args.full_duplex,
                 )
@@ -800,7 +1025,8 @@ async def run_live(args: argparse.Namespace) -> int:
                             pending_pcm = await asyncio.to_thread(
                                 capture_utterance, mic_input, voice_cfg,
                                 prompt="[Bé Xinh Live] đang nghe...",
-                                end_silence_ms=1200, max_len_s=15.0,
+                                end_silence_ms=(650 if audio_mode == "laptop" else 1200),
+                                max_len_s=15.0,
                                 max_wait_s=turn_wait_s,
                                 respect_speaker_busy=not args.full_duplex,
                             )
@@ -814,11 +1040,22 @@ async def run_live(args: argparse.Namespace) -> int:
                         sent_at = time.monotonic()
                         raw_pcm = pending_pcm
                         local_text = ""
+                        edge_pipeline = None
+                        edge_pipeline_result = None
                         if command_stt is not None:
                             local_text = (
                                 await asyncio.to_thread(command_stt, raw_pcm)
                             ).strip()
-                        if local_text:
+                        instant_answer = fast_answer(local_text) if local_text else None
+                        if instant_answer:
+                            print(
+                                "[Bé Xinh Live] local-fast: bỏ qua Gemini.",
+                                flush=True,
+                            )
+                            user_text = local_text
+                            assistant_text = instant_answer
+                            response_latency = time.monotonic() - sent_at
+                        elif local_text:
                             print(
                                 f"[Bé Xinh Live] Zipformer: {local_text}",
                                 flush=True,
@@ -839,10 +1076,20 @@ async def run_live(args: argparse.Namespace) -> int:
                                 )
                             pending_pcm = _agc_pcm(raw_pcm)
                             await _send_audio_turn(session, pending_pcm, types)
-                        user_text, assistant_text, response_latency = await _receive_turn(
-                            session, speaker, types,
-                            stream_native_audio=output_mode == "native",
-                        )
+                        if not instant_answer:
+                            if output_mode == "edge" and isinstance(
+                                speaker, LaptopSpeaker
+                            ):
+                                edge_pipeline = EdgeSpeechPipeline(
+                                    speaker, answer_dir, edge_voice, edge_rate
+                                )
+                            user_text, assistant_text, response_latency = await _receive_turn(
+                                session, speaker, types,
+                                stream_native_audio=output_mode == "native",
+                                on_assistant_text=(
+                                    edge_pipeline.push if edge_pipeline else None
+                                ),
+                            )
                         if local_text and not user_text:
                             user_text = local_text
                         if not local_text and not user_text and not assistant_text:
@@ -869,8 +1116,13 @@ async def run_live(args: argparse.Namespace) -> int:
                                     await _receive_turn(
                                         session, speaker, types,
                                         stream_native_audio=output_mode == "native",
+                                        on_assistant_text=(
+                                            edge_pipeline.push if edge_pipeline else None
+                                        ),
                                     )
                                 )
+                        if edge_pipeline is not None:
+                            edge_pipeline_result = await edge_pipeline.finish()
                         if user_text:
                             print(f"[Bé Xinh Live] bạn: {user_text}", flush=True)
                         if assistant_text:
@@ -894,13 +1146,36 @@ async def run_live(args: argparse.Namespace) -> int:
                                     )
                             elif output_mode == "edge":
                                 try:
-                                    tts_s, play_s = await _speak_edge_hamy(
-                                        assistant_text, speaker, answer_dir, edge_voice
-                                    )
-                                    print(
-                                        f"[Bé Xinh Live] HoaiMy TTS={tts_s:.2f}s "
-                                        f"| loa={play_s:.2f}s", flush=True,
-                                    )
+                                    if edge_pipeline_result is not None:
+                                        first_s, total_s = edge_pipeline_result
+                                        print(
+                                            f"[Bé Xinh Live] HoaiMy overlap "
+                                            f"first-audio={first_s:.2f}s "
+                                            f"| total={total_s:.2f}s",
+                                            flush=True,
+                                        )
+                                    elif isinstance(speaker, LaptopSpeaker):
+                                        first_s, total_s = await (
+                                            _stream_edge_hamy_laptop(
+                                                assistant_text, speaker,
+                                                answer_dir, edge_voice, edge_rate,
+                                            )
+                                        )
+                                        print(
+                                            f"[Bé Xinh Live] HoaiMy stream "
+                                            f"first-audio={first_s:.2f}s "
+                                            f"| total={total_s:.2f}s",
+                                            flush=True,
+                                        )
+                                    else:
+                                        tts_s, play_s = await _speak_edge_hamy(
+                                            assistant_text, speaker, answer_dir,
+                                            edge_voice, edge_rate,
+                                        )
+                                        print(
+                                            f"[Bé Xinh Live] HoaiMy TTS={tts_s:.2f}s "
+                                            f"| loa={play_s:.2f}s", flush=True,
+                                        )
                                 except Exception as error:  # noqa: BLE001
                                     print(
                                         f"[Bé Xinh Live] HoaiMy/loa lỗi: "

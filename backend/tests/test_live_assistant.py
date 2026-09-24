@@ -108,3 +108,34 @@ def test_tool_result_waits_for_final_spoken_answer(monkeypatch) -> None:
 
     assert session.sent
     assert answer == "Đây là kết quả thật."
+
+
+def test_internal_thought_is_never_spoken() -> None:
+    response = SimpleNamespace(
+        data=None,
+        tool_call=None,
+        server_content=SimpleNamespace(
+            input_transcription=None,
+            output_transcription=SimpleNamespace(text="Hôm nay là thứ Năm."),
+            model_turn=SimpleNamespace(parts=[
+                SimpleNamespace(text="Private reasoning", thought=True),
+            ]),
+            interrupted=False,
+            turn_complete=True,
+        ),
+    )
+
+    class _Session:
+        async def receive(self):
+            yield response
+
+    spoken = []
+    _, answer, _ = asyncio.run(_receive_turn(
+        _Session(), SimpleNamespace(), SimpleNamespace,
+        stream_native_audio=False,
+        on_assistant_text=spoken.append,
+    ))
+
+    assert answer == "Hôm nay là thứ Năm."
+    assert "reasoning" not in answer
+    assert spoken == ["Hôm nay là thứ Năm."]
