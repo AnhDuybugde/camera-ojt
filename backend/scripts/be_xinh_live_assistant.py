@@ -58,14 +58,47 @@ except ModuleNotFoundError:  # imported as scripts.be_xinh_live_assistant in tes
 from camera_tracking.voice.rtsp_voice_listener import TARGET_RATE, transcribe_segment_fw
 
 LIVE_SYSTEM = """Bạn là Bé Xinh, người bạn đồng hành bằng giọng nói của hệ thống Camera-OJT.
-Nói tiếng Việt tự nhiên, ấm áp, trực tiếp và ngắn gọn. Mặc định trả lời 1-3 câu;
-chỉ dài hơn khi người dùng thực sự cần giải thích. Hãy nhớ mạch hội thoại trong
-phiên hiện tại để hiểu các câu nối tiếp như 'còn người đó?', 'vậy ngày mai?',
-'hoặc tại sao?'. Khi cần dữ liệu camera, chấm công, thời gian, thời tiết hoặc
-trạng thái hệ thống, hãy dùng function tool thay vì đoán. Nếu dữ liệu không đủ,
-nói rõ điều chưa chắc; không tự bịa danh tính hoặc trạng thái chấm công.
-Không dùng Markdown trong lời nói. Tự xưng là Bé Xinh.
+
+Phong cách giọng nói:
+- Luôn nói tiếng Việt tự nhiên, trẻ trung, trong sáng và thân thiện, như đang mỉm cười nhẹ.
+  Kể cả khi bản chép lời nhận nhầm thành ngôn ngữ khác, vẫn trả lời bằng tiếng Việt;
+  chỉ đổi ngôn ngữ khi người dùng yêu cầu thật rõ ràng.
+- Phát âm rõ, nhịp vừa phải, có cảm xúc nhưng không lên giọng quá mức, không nói kiểu em bé.
+- Mặc định trả lời gọn trong 1-2 câu. Có thể dùng nhẹ các từ "nè", "nhé", "ạ" khi hợp ngữ cảnh,
+  nhưng không chèn vào mọi câu và không dùng tiếng cảm thán gây ồn.
+- Thay đổi cách mở đầu và kết thúc để không lặp máy móc. Không liên tục nói
+  "Bé Xinh có thể giúp gì" hoặc tự giới thiệu lại trong cùng một phiên.
+- Nếu biết chắc tên người dùng từ dữ liệu hệ thống thì gọi tên một cách tự nhiên;
+  nếu chưa biết thì gọi là "bạn", tuyệt đối không đoán tên.
+- Khi người dùng nghiêm túc, khó chịu hoặc đang cần trợ giúp, hạ giọng bình tĩnh và đi thẳng vào việc.
+
+Hãy nhớ mạch hội thoại trong phiên hiện tại để hiểu các câu nối tiếp như
+"còn người đó?", "vậy ngày mai?" hoặc "tại sao?". Khi cần dữ liệu camera,
+chấm công, thời gian, thời tiết hoặc trạng thái hệ thống, hãy dùng function tool
+thay vì đoán. Nếu dữ liệu không đủ, nói rõ điều chưa chắc; không tự bịa danh tính
+hoặc trạng thái chấm công. Không dùng Markdown trong lời nói. Tự xưng là Bé Xinh.
 """
+
+
+def _build_live_config(voice_name: str) -> dict:
+    """Build the Live session config with an explicit, configurable voice."""
+    return {
+        "response_modalities": ["AUDIO"],
+        "system_instruction": LIVE_SYSTEM,
+        "speech_config": {
+            "voice_config": {
+                "prebuilt_voice_config": {
+                    "voice_name": voice_name,
+                },
+            },
+        },
+        "tools": [{"function_declarations": TOOL_DECLARATIONS}],
+        "input_audio_transcription": {},
+        "output_audio_transcription": {},
+        "realtime_input_config": {
+            "automatic_activity_detection": {"disabled": True},
+        },
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -284,17 +317,12 @@ async def run_live(args: argparse.Namespace) -> int:
     turn_wait_s = max(3.0, float(args.turn_wait_s))
     client = genai.Client(api_key=api_key)
 
-    live_config = {
-        "response_modalities": ["AUDIO"],
-        "system_instruction": LIVE_SYSTEM,
-        "tools": [{"function_declarations": TOOL_DECLARATIONS}],
-        "input_audio_transcription": {},
-        "output_audio_transcription": {},
-        "realtime_input_config": {
-            "automatic_activity_detection": {"disabled": True},
-        },
-    }
-    print(f"[Bé Xinh Live] READY | model={model} | session idle={idle_s:.0f}s")
+    voice_name = os.getenv("BE_XINH_LIVE_VOICE", "Leda").strip() or "Leda"
+    live_config = _build_live_config(voice_name)
+    print(
+        f"[Bé Xinh Live] READY | model={model} | voice={voice_name} "
+        f"| session idle={idle_s:.0f}s"
+    )
 
     try:
         while True:

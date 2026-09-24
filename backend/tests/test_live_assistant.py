@@ -3,7 +3,16 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
-from scripts.be_xinh_live_assistant import _send_audio_turn
+from scripts.be_xinh_live_assistant import _build_live_config, _send_audio_turn
+
+
+def test_live_config_uses_selected_voice() -> None:
+    config = _build_live_config("Leda")
+    selected = config["speech_config"]["voice_config"]["prebuilt_voice_config"]
+
+    assert config["response_modalities"] == ["AUDIO"]
+    assert selected["voice_name"] == "Leda"
+    assert config["system_instruction"]
 
 
 def test_presegmented_audio_uses_explicit_activity_boundaries() -> None:
