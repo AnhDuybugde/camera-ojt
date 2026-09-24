@@ -1,0 +1,38 @@
+/* Stitch references: lich su diem danh + chinh sua cham cong. Page scoped. */
+.st-key-attendance_history_page [data-baseweb="tab-list"] {gap:8px;border-bottom:1px solid #e2e8f0;background:transparent;}
+.st-key-attendance_history_page [data-baseweb="tab"] {height:44px;padding:8px 18px;color:#64748b;font-weight:500;}
+.st-key-attendance_history_page [data-baseweb="tab"][aria-selected="true"] {color:#4f46e5;font-weight:650;background:#eef2ff;border-radius:8px 8px 0 0;}
+.st-key-attendance_history_page [data-baseweb="tab-highlight"] {background:#4f46e5;height:2px;}
+.st-key-attendance_history_page .ds-table {border:1px solid #e2e8f0;border-radius:16px;box-shadow:0 2px 4px #0f172a06;background:#fff;overflow:hidden;}
+.st-key-attendance_history_page .ds-table th {height:50px;padding:14px 16px;background:#f8fafc;color:#475569;font-size:11px;letter-spacing:.045em;text-transform:uppercase;border-right:0;border-bottom:1px solid #e2e8f0;}
+.st-key-attendance_history_page .ds-table td {height:76px;padding:16px;border-right:0;border-bottom:1px solid #f1f5f9;vertical-align:middle;}
+.st-key-attendance_history_page .ds-table tbody tr:hover td {background:#f8fafc;}
+.st-key-attendance_history_page .ds-avatar {width:40px;height:40px;flex:0 0 40px;border-radius:50%;background:#4f46e5;color:#fff;font-size:13px;}
+.st-key-attendance_history_page .ds-employee-cell {gap:12px;}
+.st-key-attendance_history_page .ds-person-name {white-space:normal!important;text-overflow:unset!important;overflow:visible!important;overflow-wrap:anywhere!important;font-size:13px;line-height:1.5!important;font-weight:600;}
+.st-key-attendance_history_page .ds-person small {font-size:11px;color:#64748b;margin-top:3px;}
+.st-key-attendance_history_page .ds-cell-text {font-size:12px;color:#334155;}
+.st-key-attendance_history_page td:nth-child(2) .ds-cell-text {padding:4px 7px;background:#f1f5f9;border:1px solid #e2e8f0;border-radius:5px;font-family:monospace;font-size:11px;}
+.st-key-attendance_history_page td:nth-child(5), .st-key-attendance_history_page td:nth-child(6) {font-variant-numeric:tabular-nums;font-family:monospace;}
+.st-key-attendance_history_page .ds-badge-list {display:flex;gap:6px;flex-wrap:wrap;}
+.st-key-attendance_history_page .ds-badge {border-radius:999px;padding:4px 9px;font-size:11px;line-height:1.4;white-space:normal;}
+.st-key-attendance_history_page .ds-badge::before {content:"";width:5px;height:5px;border-radius:50%;background:currentColor;display:inline-block;margin-right:5px;flex-shrink:0;}
+.st-key-history_record_card, .st-key-history_edit_card {background:white;border:1px solid #e2e8f0;border-radius:16px;padding:22px;box-shadow:0 2px 4px #0f172a05;}
+.history-snapshot {display:grid;grid-template-columns:1.3fr .8fr 1.2fr 1fr;gap:18px;background:#f8fafc;border:1px solid #f1f5f9;border-radius:12px;padding:18px;align-items:center;}
+.history-snapshot > div + div {border-left:1px solid #e2e8f0;padding-left:16px;}
+.history-snapshot small {display:block;font-size:11px;color:#64748b;margin-bottom:5px;}
+.history-snapshot b {display:block;font-size:12px;font-weight:600;color:#1e293b;overflow-wrap:anywhere;}
+.history-identity {display:flex;gap:10px;align-items:center;}
+.history-identity small {margin:4px 0 0;}
+.history-avatar {display:flex;align-items:center;justify-content:center;border-radius:50%;width:40px;height:40px;flex-shrink:0;background:linear-gradient(135deg,#2563eb,#6366f1);color:white;font-size:12px;font-weight:650;}
+.history-edit-heading {font-size:16px;font-weight:700;color:#0f172a;border-bottom:1px solid #f1f5f9;padding-bottom:16px;margin-bottom:6px;}
+.history-edit-heading::before {content:"";display:inline-block;width:8px;height:8px;background:#2563eb;border-radius:50%;margin-right:10px;}
+.st-key-history_checkin_card, .st-key-history_checkout_card {border:1px solid #e2e8f0;border-radius:12px;padding:15px;background:#f8fafc;}
+.st-key-history_checkout_card {background:#f8fbff;border-color:#bfdbfe;}
+.st-key-history_edit_card [data-baseweb="input"], .st-key-history_record_card [data-baseweb="select"] > div, .st-key-history_edit_card [data-baseweb="select"] > div {border-radius:10px;min-height:42px;}
+.st-key-history_edit_card textarea {border-radius:10px;font-size:13px;}
+.st-key-history_edit_card [data-testid="stWidgetLabel"] p {font-size:12px;font-weight:550;color:#334155;}
+.st-key-history_save_bar {background:#f8fafc;border-top:1px solid #e2e8f0;padding:16px;margin-top:6px;border-radius:0 0 10px 10px;}
+.st-key-history_save_bar button {border-radius:10px;min-height:42px;}
+@media(max-width:1400px) {.history-snapshot{grid-template-columns:1fr 1fr;}.st-key-attendance_history_page .ds-table td{padding:13px 12px;}.history-snapshot > div:nth-child(3){border-left:0;padding-left:0;}}
+@media(max-width:700px) {.history-snapshot{grid-template-columns:1fr;}.history-snapshot > div + div{border-left:0;padding-left:0;border-top:1px solid #e2e8f0;padding-top:10px;}.st-key-history_record_card,.st-key-history_edit_card{padding:14px;}.st-key-attendance_history_page [data-baseweb="tab"]{padding:8px 10px;}}

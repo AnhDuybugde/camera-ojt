@@ -1,5 +1,6 @@
 # Python 3.10-3.12 recommended
 streamlit>=1.37,<2
+Pillow>=10,<13
 opencv-python>=4.9,<5
 # Local pure-Python wheel keeps FaceAnalysis/ArcFace while avoiding InsightFace's
 # unused mesh-renderer C++ extension, which otherwise requires Visual C++ Build Tools.
@@ -13,3 +14,5 @@ python-dotenv>=1.0,<2
 bcrypt>=4.1,<5
 ultralytics>=8.3,<9
 pytest>=8.0,<9
+SQLAlchemy>=2.0,<2.1
+psycopg[binary]>=3.2,<4

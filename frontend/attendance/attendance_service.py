@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import logging
+import json
 import threading
 from dataclasses import dataclass
 from datetime import datetime
 from collections.abc import Callable
 
-from attendance.attendance_rules import can_check_out, check_in_status, work_session_at
+from attendance.attendance_rules import can_check_out, work_session_at
+from attendance.daily_service import DailyAttendanceService, scheduled_check_in_status
 from config import settings
 from database.db import Database
 
@@ -27,6 +29,7 @@ class AttendanceService:
         self.on_change = on_change
         self._last_seen: dict[str, datetime] = {}
         self._lock = threading.RLock()
+        self.daily = DailyAttendanceService(db, on_change=on_change)
 
     def record(self, employee_id: str, now: datetime | None = None) -> AttendanceResult:
         now = now or datetime.now()
@@ -42,10 +45,6 @@ class AttendanceService:
             # An open daily attendance record must remain eligible for CHECK-OUT.
             # Otherwise, validate the session active at the recognition time.
             if not (existing and existing["check_in"] and not existing["check_out"]):
-                if now.weekday() >= 5:
-                    return AttendanceResult(
-                        "NO_SCHEDULE", "Không áp dụng lịch Thứ Bảy/Chủ Nhật - Không chấm công"
-                    )
                 work_session = work_session_at(
                     now, settings.morning_end_time, settings.afternoon_start_time
                 )
@@ -63,6 +62,14 @@ class AttendanceService:
                 if schedule["work_status"] == "OFF":
                     return AttendanceResult("OFF", "Ca này OFF - Không chấm công")
 
+            if existing and existing["check_in"] and not existing["check_out"]:
+                if self.daily.record_return(employee_id, now):
+                    self._last_seen[employee_id] = now
+                    record = self.db.fetch_one(
+                        "SELECT * FROM attendance WHERE employee_id=? AND date=?", (employee_id, day)
+                    )
+                    return AttendanceResult("RETURN", "Returned to work.", record)
+
             previous = self._last_seen.get(employee_id)
             if previous and (now - previous).total_seconds() < settings.attendance_cooldown:
                 return AttendanceResult("COOLDOWN", "Already recorded recently.")
@@ -70,18 +77,50 @@ class AttendanceService:
                 row = conn.execute(
                     "SELECT * FROM attendance WHERE employee_id=? AND date=?", (employee_id, day)
                 ).fetchone()
+                inserted = False
+                morning = self.db.get_work_schedule(employee_id, day, "MORNING")
+                first_session = "MORNING" if morning and morning["work_status"] == "ON" else "AFTERNOON"
+                status = scheduled_check_in_status(first_session, now)
                 if row is None:
-                    status = check_in_status(now, settings.late_threshold)
-                    conn.execute(
+                    cursor = conn.execute(
                         """INSERT INTO attendance
                            (employee_id, employee_name, department, date, check_in, check_out,
-                            status, sync_status, created_at, updated_at)
-                           VALUES (?, ?, ?, ?, ?, NULL, ?, 'PENDING', ?, ?)""",
+                            status, presence_status, sync_status, created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, NULL, ?, 'PRESENT', 'PENDING', ?, ?)
+                           ON CONFLICT (employee_id, date) DO NOTHING""",
                         (employee_id, employee["full_name"], employee["department"], day,
                          timestamp, status, timestamp, timestamp),
                     )
+                    inserted = cursor.rowcount == 1
+                    if not inserted:
+                        row = conn.execute(
+                            "SELECT * FROM attendance WHERE employee_id=? AND date=?",
+                            (employee_id, day),
+                        ).fetchone()
+                if inserted:
                     action = "CHECK_IN"
                     logger.info("Check-in: %s (%s)", employee["full_name"], employee_id)
+                elif row is None:
+                    raise RuntimeError("Could not read the concurrent attendance record")
+                elif row["check_in"] is None:
+                    result = conn.execute(
+                        """UPDATE attendance SET check_in=?,status=?,presence_status='PRESENT',
+                           sync_status='PENDING',updated_at=? WHERE id=? AND check_in IS NULL""",
+                        (timestamp, status, timestamp, row["id"]),
+                    )
+                    if result.rowcount:
+                        if row["status"] == "ABSENT":
+                            conn.execute(
+                                """INSERT INTO audit_logs
+                                   (timestamp,role,action,employee_id,old_values,new_values,reason)
+                                   VALUES (?,'SYSTEM','LATE_CHECK_IN',?,?,?,?)""",
+                                (timestamp, employee_id, json.dumps({"status": "ABSENT"}),
+                                 json.dumps({"status": status, "check_in": timestamp}),
+                                 "Nhân viên được nhận diện sau thời điểm đánh dấu vắng"),
+                            )
+                        action = "CHECK_IN"
+                    else:
+                        action = "WAITING"
                 elif row["check_out"]:
                     action = "COMPLETE"
                 elif not can_check_out(row["check_in"], now, settings.checkout_min_minutes):

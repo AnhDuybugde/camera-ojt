@@ -1,5 +1,7 @@
 from camera_tracking.audio.announcer import CameraCheckInAnnouncer
 from pathlib import Path
+import threading
+
 import pytest
 
 from camera_tracking.audio.backchannel import (
@@ -89,3 +91,46 @@ def test_announcer_can_be_muted_without_stopping_worker() -> None:
         assert enabled["enabled"] is True
     finally:
         announcer.close()
+
+
+def test_play_file_sync_uses_direct_transport_and_releases_guard(
+    monkeypatch, tmp_path
+) -> None:
+    announcer = object.__new__(CameraCheckInAnnouncer)
+    announcer._closed = threading.Event()
+    announcer._muted = threading.Event()
+    announcer._speaking = threading.Event()
+    wav = tmp_path / "reply.wav"
+    wav.write_bytes(b"test")
+    played: list[bytes] = []
+
+    monkeypatch.setattr(announcer, "_wav_to_pcm", lambda path: b"pcm")
+    monkeypatch.setattr(announcer, "_play_pcm_once", played.append)
+
+    announcer.play_file_sync(wav)
+
+    assert played == [b"pcm"]
+    assert announcer.speaking is False
+
+
+def test_play_file_sync_releases_guard_after_camera_error(
+    monkeypatch, tmp_path
+) -> None:
+    announcer = object.__new__(CameraCheckInAnnouncer)
+    announcer._closed = threading.Event()
+    announcer._muted = threading.Event()
+    announcer._speaking = threading.Event()
+    wav = tmp_path / "reply.wav"
+    wav.write_bytes(b"test")
+
+    monkeypatch.setattr(announcer, "_wav_to_pcm", lambda path: b"pcm")
+
+    def fail_playback(_pcm: bytes) -> None:
+        raise RuntimeError("camera offline")
+
+    monkeypatch.setattr(announcer, "_play_pcm_once", fail_playback)
+
+    with pytest.raises(RuntimeError, match="camera offline"):
+        announcer.play_file_sync(wav)
+
+    assert announcer.speaking is False

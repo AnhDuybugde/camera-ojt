@@ -137,12 +137,19 @@ def test_lunch_break_does_not_create_attendance(tmp_path: Path) -> None:
     assert db.list_attendance() == []
 
 
-def test_weekend_schedule_never_creates_attendance(tmp_path: Path) -> None:
+def test_weekend_on_schedule_creates_attendance(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     saturday = "2026-09-19"
     db.save_work_schedule("NV001", saturday, "ON", "MORNING")
 
     result = AttendanceService(db).record("NV001", datetime(2026, 9, 19, 8, 0))
 
+    assert result.action == "CHECK_IN"
+    assert len(db.list_attendance()) == 1
+
+
+def test_weekend_without_schedule_never_creates_attendance(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    result = AttendanceService(db).record("NV001", datetime(2026, 9, 19, 8, 0))
     assert result.action == "NO_SCHEDULE"
     assert db.list_attendance() == []

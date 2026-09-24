@@ -31,8 +31,19 @@ class FaceDetector:
                         "InsightFace is not installed. Run: pip install -r requirements.txt"
                     ) from exc
                 logger.info("Loading InsightFace buffalo_l model")
-                model = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
-                model.prepare(ctx_id=-1, det_size=(self.detection_size, self.detection_size))
+                # Live attendance only needs the detector and ArcFace embedding.
+                # Skipping age/gender and dense landmark models reduces CPU load
+                # without changing the face recognition model.
+                model = FaceAnalysis(
+                    name="buffalo_l",
+                    allowed_modules=["detection", "recognition"],
+                    providers=["CPUExecutionProvider"],
+                )
+                model.prepare(
+                    ctx_id=-1,
+                    det_thresh=settings.face_detection_threshold,
+                    det_size=(self.detection_size, self.detection_size),
+                )
                 self._model = model
         return self._model
 

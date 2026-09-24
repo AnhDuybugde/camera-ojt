@@ -1,15 +1,21 @@
-"""Thread-safe SQLite access and automatic schema initialization."""
+"""Attendance repository with SQLite fallback and PostgreSQL support."""
 from __future__ import annotations
 
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
+
+from database.postgres import ConnectionAdapter, metadata
+
 from config import settings
 from auth.permissions import SYSTEM, require_owner, require_permission
+from attendance.schedule_policy import can_employee_edit_schedule
 from utils.helpers import iso_now, validate_employee_id
 
 
@@ -18,13 +24,28 @@ WORK_SESSIONS = frozenset({"MORNING", "AFTERNOON"})
 
 
 class Database:
-    def __init__(self, path: str | Path | None = None) -> None:
-        self.path = Path(path or settings.database_path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, path: str | Path | None = None, *, database_url: str | None = None) -> None:
+        url = database_url if database_url is not None else (settings.database_url if path is None else "")
+        self.database_url = url.strip()
+        self.is_postgres = self.database_url.startswith("postgresql+psycopg://")
+        self._engine = create_engine(self.database_url, pool_pre_ping=True) if self.is_postgres else None
+        if self.is_postgres:
+            self.path = None
+        elif self.database_url.startswith("sqlite:///"):
+            self.path = Path(make_url(self.database_url).database)
+        elif self.database_url:
+            raise ValueError("DATABASE_URL must use postgresql+psycopg:// or sqlite:///")
+        else:
+            self.path = Path(path or settings.database_path)
+        if self.path is not None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
         self._write_lock = threading.RLock()
         self.initialize()
 
-    def connect(self) -> sqlite3.Connection:
+    def connect(self):
+        if self.is_postgres:
+            return self._postgres_connection()
+        assert self.path is not None
         conn = sqlite3.connect(self.path, timeout=20, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
@@ -33,7 +54,18 @@ class Database:
         return conn
 
     @contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
+    def _postgres_connection(self):
+        assert self._engine is not None
+        with self._engine.connect() as conn:
+            yield ConnectionAdapter(conn)
+
+    @contextmanager
+    def transaction(self) -> Iterator[Any]:
+        if self.is_postgres:
+            assert self._engine is not None
+            with self._engine.begin() as conn:
+                yield ConnectionAdapter(conn)
+            return
         with self._write_lock, self.connect() as conn:
             try:
                 yield conn
@@ -43,6 +75,16 @@ class Database:
                 raise
 
     def initialize(self) -> None:
+        if self.is_postgres:
+            assert self._engine is not None
+            metadata.create_all(self._engine)
+            with self._engine.begin() as conn:
+                had_presence = conn.execute(text("SELECT 1 FROM information_schema.columns WHERE table_name='attendance' AND column_name='presence_status' AND table_schema=current_schema()")).first() is not None
+                conn.execute(text("ALTER TABLE attendance ADD COLUMN IF NOT EXISTS presence_status TEXT NOT NULL DEFAULT 'ABSENT'"))
+                conn.execute(text("ALTER TABLE attendance ADD COLUMN IF NOT EXISTS temporary_checkout_at TIMESTAMP"))
+                if not had_presence:
+                    conn.execute(text("UPDATE attendance SET presence_status='PRESENT' WHERE check_in IS NOT NULL"))
+            return
         with self.transaction() as conn:
             conn.executescript(
                 """
@@ -67,6 +109,8 @@ class Database:
                     check_in TEXT,
                     check_out TEXT,
                     status TEXT NOT NULL DEFAULT 'ON_TIME',
+                    presence_status TEXT NOT NULL DEFAULT 'ABSENT',
+                    temporary_checkout_at TEXT,
                     sync_status TEXT NOT NULL DEFAULT 'PENDING',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -108,6 +152,12 @@ class Database:
                 """
             )
             self._migrate_work_schedule_sessions(conn)
+            attendance_columns = {row["name"] for row in conn.execute("PRAGMA table_info(attendance)")}
+            if "presence_status" not in attendance_columns:
+                conn.execute("ALTER TABLE attendance ADD COLUMN presence_status TEXT NOT NULL DEFAULT 'ABSENT'")
+                conn.execute("UPDATE attendance SET presence_status='PRESENT' WHERE check_in IS NOT NULL")
+            if "temporary_checkout_at" not in attendance_columns:
+                conn.execute("ALTER TABLE attendance ADD COLUMN temporary_checkout_at TEXT")
 
     @staticmethod
     def _migrate_work_schedule_sessions(conn: sqlite3.Connection) -> None:
@@ -151,7 +201,7 @@ class Database:
     def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
         with self.transaction() as conn:
             cursor = conn.execute(sql, params)
-            return int(cursor.lastrowid or cursor.rowcount)
+            return int(cursor.lastrowid or cursor.rowcount or 0)
 
     def fetch_one(self, sql: str, params: Sequence[Any] = ()) -> dict[str, Any] | None:
         with self.connect() as conn:
@@ -302,7 +352,8 @@ class Database:
         self.save_work_schedules([(employee_id, work_date, work_session, work_status)])
 
     def save_work_schedules(
-        self, entries: Sequence[tuple[str, str, str, str | None]], *, actor_role: str = SYSTEM, actor_employee_id: str | None = None
+        self, entries: Sequence[tuple[str, str, str, str | None]], *, actor_role: str = SYSTEM, actor_employee_id: str | None = None,
+        now: datetime | None = None,
     ) -> None:
         """Atomically upsert schedule cells; a None status clears that cell."""
         normalized: list[tuple[str, str, str, str | None]] = []
@@ -311,6 +362,8 @@ class Database:
             require_owner(actor_role, employee_id, actor_employee_id)
             clean_id = validate_employee_id(employee_id)
             clean_date = date.fromisoformat(work_date).isoformat()
+            if actor_role.upper() == "EMPLOYEE" and not can_employee_edit_schedule(clean_date, now):
+                raise PermissionError("Nhân viên chỉ được sửa lịch tuần sau đến hết Thứ Sáu tuần này.")
             clean_session = work_session.strip().upper()
             if clean_session not in WORK_SESSIONS:
                 raise ValueError("Work session must be MORNING or AFTERNOON.")
@@ -345,8 +398,28 @@ class Database:
             "SELECT * FROM attendance WHERE sync_status != 'SYNCED' ORDER BY updated_at LIMIT ?", (limit,)
         )
 
-    def mark_synced(self, attendance_id: int) -> None:
-        self.execute("UPDATE attendance SET sync_status='SYNCED' WHERE id=?", (attendance_id,))
+    def sync_counts(self) -> dict[str, int]:
+        return {
+            row["sync_status"]: row["total"]
+            for row in self.fetch_all(
+                "SELECT sync_status, COUNT(*) AS total FROM attendance GROUP BY sync_status"
+            )
+        }
 
-    def mark_sync_error(self, attendance_id: int) -> None:
-        self.execute("UPDATE attendance SET sync_status='ERROR' WHERE id=?", (attendance_id,))
+    def mark_synced(self, attendance_id: int, expected_updated_at: str | None = None) -> None:
+        if expected_updated_at is None:
+            self.execute("UPDATE attendance SET sync_status='SYNCED' WHERE id=?", (attendance_id,))
+        else:
+            self.execute(
+                "UPDATE attendance SET sync_status='SYNCED' WHERE id=? AND updated_at=? AND sync_status!='SYNCED'",
+                (attendance_id, expected_updated_at),
+            )
+
+    def mark_sync_error(self, attendance_id: int, expected_updated_at: str | None = None) -> None:
+        if expected_updated_at is None:
+            self.execute("UPDATE attendance SET sync_status='ERROR' WHERE id=?", (attendance_id,))
+        else:
+            self.execute(
+                "UPDATE attendance SET sync_status='ERROR' WHERE id=? AND updated_at=? AND sync_status!='SYNCED'",
+                (attendance_id, expected_updated_at),
+            )

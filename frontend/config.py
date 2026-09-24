@@ -108,6 +108,7 @@ def _registration_camera_source() -> int | str:
 @dataclass(frozen=True)
 class Settings:
     base_dir: Path = BASE_DIR
+    database_url: str = os.getenv("DATABASE_URL", "").strip()
     database_path: Path = BASE_DIR / "data" / "database.db"
     face_data_dir: Path = BASE_DIR / "data" / "faces"
     log_path: Path = BASE_DIR / "logs" / "app.log"
@@ -119,6 +120,16 @@ class Settings:
     camera_height: int = _int("CAMERA_HEIGHT", 720)
     rtsp_transport: str = os.getenv("RTSP_TRANSPORT", "tcp").strip().lower()
     face_threshold: float = _float("FACE_THRESHOLD", 0.50)
+    face_detection_threshold: float = _float("FACE_DETECTION_THRESHOLD", 0.45)
+    live_min_face_size: int = _int("LIVE_MIN_FACE_SIZE", 24)
+    live_blur_threshold: float = _float("LIVE_BLUR_THRESHOLD", 3.0)
+    face_require_person_box: bool = _bool("FACE_REQUIRE_PERSON_BOX", False)
+    face_use_main_stream: bool = _bool("FACE_USE_MAIN_STREAM", True)
+    face_track_distance: float = max(40.0, _float("FACE_TRACK_DISTANCE", 220.0))
+    face_confirm_votes: int = max(1, _int("FACE_CONFIRM_VOTES", 2))
+    face_confirm_ratio: float = min(1.0, max(0.0, _float("FACE_CONFIRM_RATIO", 0.60)))
+    face_vote_window_seconds: float = max(2.0, _float("FACE_VOTE_WINDOW_SECONDS", 12.0))
+    face_identity_ttl_seconds: float = max(2.0, _float("FACE_IDENTITY_TTL_SECONDS", 15.0))
     process_every_n_frames: int = max(1, _int("PROCESS_EVERY_N_FRAMES", 3))
     recognition_interval: float = max(0.2, _float("RECOGNITION_INTERVAL", 0.65))
     detection_size: int = _int("DETECTION_SIZE", 640)
@@ -134,13 +145,20 @@ class Settings:
     afternoon_start_time: time = _time("AFTERNOON_START_TIME", "14:00")
     work_end_time: time = _time("WORK_END_TIME", "17:30")
     late_threshold: time = _time("LATE_THRESHOLD", "09:15")
+    absent_after: time = _time("ABSENT_AFTER", "09:30")
+    presence_timeout_minutes: int = max(1, _int("PRESENCE_TIMEOUT_MINUTES", 30))
     google_sheet_id: str = os.getenv("GOOGLE_SHEET_ID", "").strip()
     google_credentials_path: str = os.getenv("GOOGLE_CREDENTIALS_PATH", "").strip()
     google_worksheet: str = os.getenv("GOOGLE_WORKSHEET", "Attendance").strip()
     log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
-    # When set, Live Attendance becomes a view of the shared Camera OJT
-    # backend instead of opening the RTSP cameras a second time.
-    tracking_backend_url: str = os.getenv("TRACKING_BACKEND_URL", "").strip().rstrip("/")
+    # Khi có URL này, giao diện chỉ đọc luồng chung từ Camera OJT; tuyệt đối
+    # không mở RTSP lần hai và không tạo model/voice process cạnh tranh.
+    tracking_backend_url: str = os.getenv(
+        "TRACKING_BACKEND_URL", ""
+    ).strip().rstrip("/")
+    public_tracking_backend_url: str = os.getenv(
+        "PUBLIC_TRACKING_BACKEND_URL", ""
+    ).strip().rstrip("/")
 
     def ensure_directories(self) -> None:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)

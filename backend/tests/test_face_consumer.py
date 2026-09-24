@@ -163,3 +163,38 @@ def test_blurry_face_emits_similarity_without_confirming_identity() -> None:
     assert len(observations) == 1
     assert observations[0].identity_confirmed is False
     assert observations[0].match.score == 0.9
+
+
+class NoisyTemporalEmbedder:
+    def __init__(self) -> None:
+        self._vectors = iter((
+            np.asarray([1.0, 0.0], dtype=np.float32),
+            np.asarray([0.0, 1.0], dtype=np.float32),
+        ))
+
+    def detect_embed(self, crop_bgr):
+        return [FaceDetection((20, 20, 80, 100), 0.99, next(self._vectors))]
+
+
+class TemporalMatcher:
+    def match(self, embedding):
+        vector = np.asarray(embedding, dtype=np.float32)
+        known = bool(vector[0] > 0.6 and vector[1] > 0.6)
+        person = EnrolledPerson("employee_1", "Employee One", vector) if known else None
+        return MatchResult(person, 0.8 if known else 0.3, known, margin=0.2)
+
+
+def test_temporal_embedding_recovers_noisy_distant_face() -> None:
+    consumer = FaceTrackConsumer(
+        NoisyTemporalEmbedder(), TemporalMatcher(), min_person_area_px=1,
+        min_face_px=20, min_blur_variance=1, unknown_cooldown_s=0,
+        temporal_window=5, temporal_min_samples=2,
+    )
+
+    first = consumer.consume(_event("A"), now_s=0.0)
+    second = consumer.consume(_event("A"), now_s=1.0)
+
+    assert len(first) == 1 and first[0].match.is_known is False
+    assert len(second) == 1 and second[0].match.is_known is True
+    assert second[0].match.person is not None
+    assert second[0].match.person.person_id == "employee_1"

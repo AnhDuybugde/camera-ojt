@@ -9,9 +9,10 @@ result is stored under output/hamy_audio_cache and reused by later runs.
 
 from __future__ import annotations
 
+import argparse
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import yaml
 
@@ -24,16 +25,8 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 from camera_tracking.audio import CameraCheckInAnnouncer
 from camera_tracking.audio.announcer import PRIORITY_PREWARM
-from camera_tracking.audio.companion import (
-    GENERIC_ARRIVAL,
-    GROUP_ARRIVAL,
-    GENERIC_WAVE,
-    GENERIC_APPROACH,
-    GENERIC_STAND,
-    GENERIC_WATER,
-    GROUP_WATER,
-    GENERIC_REST,
-)
+from camera_tracking.audio.companion import critical_prewarm_texts, prewarm_texts
+from camera_tracking.audio.phrases import iter_prewarm_texts
 
 
 def _people() -> list[tuple[str, str]]:
@@ -75,39 +68,37 @@ def _people() -> list[tuple[str, str]]:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Build Bé Xinh speech cache")
+    parser.add_argument(
+        "--critical-only",
+        action="store_true",
+        help="only build instant close-range and named wave responses",
+    )
+    args = parser.parse_args()
+
     speaker = CameraCheckInAnnouncer.from_env()
     if speaker is None:
         print("Không khởi tạo được Bé Xinh. Kiểm tra IMOU_* / IMOU_TALK_HELPER.")
         return 2
 
     people = _people()
-    texts = [
-        GENERIC_ARRIVAL,
-        GROUP_ARRIVAL,
-        GENERIC_WAVE,
-        GENERIC_APPROACH,
-        GENERIC_STAND,
-        GENERIC_WATER,
-        GROUP_WATER,
-        GENERIC_REST,
-    ]
-    for _person_id, name in people:
-        texts.extend(
-            [
-                f"{name} tới rồi nè! Bé Xinh chào nha.",
-                f"{name} quay lại rồi nè! Bé Xinh chào nha.",
-                f"Hihi, {name} chào Bé Xinh hả? Chào nha.",
-                f"Ủa, {name} lại gần Bé Xinh hả?",
-                f"Ơ, {name} đi đâu đó?",
-                f"{name} ơi, uống miếng nước đi nha!",
-                f"{name} ơi, ngồi lâu rồi. Duỗi người chút nha!",
-            ]
-        )
+    texts = (
+        critical_prewarm_texts(people)
+        if args.critical_only
+        else prewarm_texts(people)
+    )
+    # Zone-event phrases share the same cache-first IMOU speaker. Include them
+    # without removing any existing conversational/gesture lines.
+    texts = list(dict.fromkeys([
+        *texts,
+        *iter_prewarm_texts(people, critical_only=args.critical_only),
+    ]))
 
-    # Preserve order while removing accidental duplicates.
-    texts = list(dict.fromkeys(texts))
-
-    print(f"[Bé Xinh/Prewarm] people={len(people)} clips={len(texts)}")
+    mode = "critical" if args.critical_only else "full"
+    print(
+        f"[Bé Xinh/Prewarm] mode={mode} "
+        f"people={len(people)} clips={len(texts)}"
+    )
     added = speaker.prewarm(texts, priority=PRIORITY_PREWARM)
     print(f"[Bé Xinh/Prewarm] queued={added}. Đang tạo cache...")
     ok = speaker.wait_idle(timeout_s=1800.0)

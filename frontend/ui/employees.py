@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from sqlalchemy.exc import IntegrityError as SQLAlchemyIntegrityError
 
 import streamlit as st
 
@@ -102,7 +103,7 @@ def render(db: Database, role: str) -> None:
                     db.add_employee({"employee_id": employee_id, **values}, actor_role=role)
                     st.success("Đã thêm nhân viên.")
                     st.rerun()
-                except (ValueError, sqlite3.IntegrityError) as exc:
+                except (ValueError, sqlite3.IntegrityError, SQLAlchemyIntegrityError) as exc:
                     st.error(f"Không thể thêm nhân viên: {translate_message(str(exc))}")
 
     if role != ADMIN:

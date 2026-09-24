@@ -10,8 +10,14 @@ if (-not (Test-Path -LiteralPath $statePath)) {
 }
 
 $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
-foreach ($name in @("frontend", "audio", "backend")) {
+foreach ($name in @("frontend", "chat", "audio", "backend")) {
+    if ($null -eq $state.PSObject.Properties[$name]) {
+        continue
+    }
     $processId = [int]$state.$name
+    if ($processId -le 0) {
+        continue
+    }
     $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
     if ($null -ne $process) {
         Stop-Process -Id $processId

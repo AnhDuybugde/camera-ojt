@@ -442,7 +442,7 @@ def _visualtalk_once(
         sample_rate=int(sample_rate),
         frame_ms=64,
         timeout=float(timeout),
-        attempts=2,
+        attempts=1,
         retry_delay=2.0,
         debug=False,
     )
@@ -483,6 +483,7 @@ class ImouP2PTalkOutput:
         bind_host: str = "127.0.0.1",
         bind_port: int = 18086,
         establish_timeout: float = 45.0,
+        retry_persistent: bool = True,
     ) -> None:
         self.creds = creds or ImouP2PCredentials.from_env()
         self.channel = int(channel)
@@ -494,6 +495,7 @@ class ImouP2PTalkOutput:
         self.persistent = bool(persistent)
         self.bind_host = str(bind_host)
         self.bind_port = int(bind_port)
+        self.retry_persistent = bool(retry_persistent)
         self._tunnel = (
             PersistentP2PTunnel(
                 self.creds,
@@ -556,6 +558,8 @@ class ImouP2PTalkOutput:
             return
         except Exception:
             self._tunnel.invalidate()
+            if not self.retry_persistent:
+                raise
         # Thu lai 1 lan voi tunnel moi truoc khi bao loi.
         host, port = self._tunnel.ensure()
         try:

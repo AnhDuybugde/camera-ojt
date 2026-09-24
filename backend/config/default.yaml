@@ -3,12 +3,12 @@ camera:
   frame_width: 1280
   frame_height: 720
   fps: 25
-  # Process half the frames to reduce CPU load.
-  process_every_n_frames: 2
+  # Run detection on every newest RTSP frame so short gestures are not delayed.
+  process_every_n_frames: 1
 
 detection:
-  # Thuần GPU: cuda bắt buộc. TensorRT FP16 dynamic batch
-  # (build tu yolo26s.pt, TRT 10.9, sm_89). ~185 frame/s vs ~50 cua .pt.
+  # Thuần GPU: cuda bắt buộc. TensorRT FP16 dynamic batch, build trên đúng
+  # RTX 3050 (TRT 10.16 / CUDA 12) để tránh engine sai kiến trúc GPU.
   # Rebuild khi doi GPU/model:
   # yolo export model=yolo26s.pt format=engine half=True imgsz=640 device=0 dynamic=True batch=2
   # Nếu thiếu .engine / TRT sẽ tự fallback .pt (vẫn cuda) + cảnh báo.
@@ -16,7 +16,8 @@ detection:
   # Recall-first nhưng bớt ghost: 0.25 đủ cho ByteTrack low-conf nối lại.
   # 0.10 cũ đẻ quá nhiều box yếu -> ghost GID.
   confidence_threshold: 0.25
-  nms_iou_threshold: 0.9
+  # Suppress near-duplicate person boxes before ByteTrack creates ghost IDs.
+  nms_iou_threshold: 0.7
   # Loại thêm bbox nhỏ nằm gần như hoàn toàn trong bbox lớn.
   nested_box_containment_threshold: 0.85
   person_class_id: 0
@@ -77,7 +78,12 @@ identity:
   # chỉ extract OSNet khi track mới / mất rồi quay lại / cross-camera.
   # refresh 10 bước (thay vì 5) để giảm ~90% ReID calls khi đông người.
   gallery_refresh_steps: 10
-  tentative_min_hits: 5
+  # Verify named employees every ~5 displayed frames, plus immediately on
+  # overlap, area jump or re-entry. Avoids an OSNet call on every frame.
+  named_verify_steps: 10
+  # 3 consecutive observations balances fast entry with duplicate-box noise;
+  # NMS + nested-box suppression provide the first anti-ghost gate.
+  tentative_min_hits: 3
   state_db: output/identity_state.db
   # Lightweight mặc định: x0_25 (~0.4M params, nhanh ~3x so với x1_0).
   # Cần chính xác hơn thì tune lên x0_5 / x1_0.
@@ -139,6 +145,10 @@ face:
   # Bind Employee ID + attendance ngay trong cung ket qua top-2 dau tien.
   consensus_hits: 1
   consensus_window_s: 3.0
+  # Gop embedding cua 3/5 khung hinh net tren cung Global ID. Cach nay tang
+  # on dinh mat xa ma van giu nguyen nguong an toan 0.45.
+  temporal_window: 5
+  temporal_min_samples: 3
   gallery_accept_threshold: 0.70
   gallery_max_prototypes: 10
   # Goc rong trong data/samples: mat thuong chi 15-30 px.
@@ -150,9 +160,9 @@ face:
   process_every_k: 2
   # Substream chỉ 640x480; dùng 640 để giữ recall với mặt 30-40 px.
   det_size: 640
-  # Retry Face async: unknown 0.6s (~7 processed frame) nhanh hon cu 1.0s;
-  # pipeline tu gian x2 khi worker queue day (may yeu). known 30s; voice lay min(...,2s).
-  unknown_cooldown_s: 0.6
+  # New tracks are recognized immediately. Only failed/unknown retries wait
+  # 1.2s, reducing InsightFace CPU/GPU contention in a crowded room.
+  unknown_cooldown_s: 1.2
   known_cooldown_s: 30.0
   # Production van ve box mat (xanh=known, do=unknown) moi khi co FaceResult tuoi.
   name_map:
@@ -331,9 +341,9 @@ voice:
   voice_face_ttl_s: 3.0
   voice_min_person_area_px: 2500.0
   # P1: ngưỡng VAD động bám nền ồn (trị ồn đều, không cần đo phòng).
-  voice_vad_floor_factor: 3.0
+  voice_vad_floor_factor: 1.6
   # Mic camera nay nen on rat thap (~0.0005) -> san thap de bat tieng nho.
-  voice_vad_floor_min: 0.004
+  voice_vad_floor_min: 0.0022
   voice_vad_ceiling: 0.15
   # P3: đoạn chỉ đi STT khi to hơn nền >= 10dB (bỏ ồn to đều/tiếng xa nhỏ).
   voice_snr_min_db: 10.0

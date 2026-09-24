@@ -116,6 +116,10 @@ class GlobalIdentityConfig:
     # path) always extract -- matching needs fresh appearance. 1 = old
     # behavior (extract for every track every frame).
     gallery_refresh_steps: int = 1
+    # Named identities remain precision-first, but production can verify them
+    # periodically instead of running OSNet on every frame. Suspicious overlap,
+    # area jumps and pending/re-entry paths still force immediate verification.
+    named_verify_steps: int = 1
     # Soft channel-transition evidence: (from_channel, to_channel) -> bonus.
     # Small by design; appearance + spatio-temporal terms always dominate.
     channel_transition_bonus: dict[tuple[str, str], float] = field(
@@ -243,6 +247,9 @@ class GlobalIdentityManager:
         refresh_gallery = (
             self._step % max(1, self.config.gallery_refresh_steps) == 0
         )
+        refresh_named = (
+            self._step % max(1, self.config.named_verify_steps) == 0
+        )
         frame_shape = frame.shape
         claimed_gids: set[int] = set()
         assignments: dict[int, int] = {}  # raw track_id -> global id
@@ -267,12 +274,14 @@ class GlobalIdentityManager:
                     track, tracks, record, frame_shape, channel
                 )
                 locked = self._is_face_locked(record, now_s)
-                # Named GID (đã có employee) luôn verify: số người có tên ít
-                # nên tốn thêm ReID mỗi frame là chấp nhận được, đổi lại bắt
-                # được cả case B thay A khớp khít box mà không gây IoU/area jump.
+                # Named GIDs use a short verification cadence in production.
+                # Occlusion and area jumps still force immediate verification.
                 need_verify = (
-                    refresh_gallery or suspect or locked or record.occluded
-                    or record.employee_id is not None
+                    refresh_gallery or suspect or record.occluded
+                    or (
+                        (locked or record.employee_id is not None)
+                        and refresh_named
+                    )
                 )
                 if not need_verify:
                     assignments[track.track_id] = gid
@@ -423,6 +432,55 @@ class GlobalIdentityManager:
         record.face_anchor_employee = None
         record.face_anchor_score = 0.0
         return True
+
+    def split_conflicting_tracklet(
+        self,
+        global_id: int,
+        *,
+        channel: str,
+        track: Track,
+        frame: np.ndarray | None,
+        now_s: float | None,
+    ) -> int | None:
+        """Move a face-conflicting local tracklet to a fresh Global ID.
+
+        A Global ID is a person identity, so changing its employee label in
+        place corrupts history. When a confirmed face contradicts an existing
+        binding, detach only the current ByteTrack tracklet and give it a new
+        GID. The old GID and employee binding remain intact.
+        """
+        raw_track_id = (
+            track.local_track_id
+            if track.local_track_id is not None
+            else track.track_id
+        )
+        key = _tracklet_key(channel, raw_track_id)
+        if self._tracklet_to_gid.get(key) != global_id:
+            return None
+        old = self._identities.get(global_id)
+        if old is None:
+            return None
+
+        self._tracklet_to_gid.pop(key, None)
+        self._tentative.pop(key, None)
+        old.tracklet_keys.discard(key)
+        if not any(item.startswith(f"{channel}:") for item in old.tracklet_keys):
+            old.sightings.pop(channel, None)
+
+        raw_track = Track(
+            track_id=raw_track_id,
+            bbox=track.bbox,
+            confidence=track.confidence,
+            age=track.age,
+            hits=track.hits,
+            confirmed=track.confirmed,
+            local_track_id=raw_track_id,
+        )
+        embedding = None
+        if frame is not None:
+            embedding = self.embedding_extractor.extract(_crop(frame, track.bbox))
+        fresh = self._create_identity(channel, raw_track, embedding, now_s)
+        return fresh.global_id
 
     def restore_identity(
         self,

@@ -5,6 +5,7 @@ import logging
 import os
 import threading
 import time
+from collections import deque
 from typing import Any
 
 import cv2
@@ -21,6 +22,8 @@ class CameraManager:
         self._capture: cv2.VideoCapture | None = None
         self._frame: np.ndarray | None = None
         self._frame_time = 0.0
+        self._frame_sequence = 0
+        self._frame_times: deque[float] = deque(maxlen=60)
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -79,9 +82,12 @@ class CameraManager:
             ok, frame = self._capture.read()
             if ok and frame is not None:
                 failures = 0
+                captured_at = time.monotonic()
                 with self._lock:
                     self._frame = frame
-                    self._frame_time = time.monotonic()
+                    self._frame_time = captured_at
+                    self._frame_sequence += 1
+                    self._frame_times.append(captured_at)
                 continue
             failures += 1
             if failures >= 10:
@@ -105,6 +111,19 @@ class CameraManager:
             if not self._frame_time:
                 return None
             return max(0, int((time.monotonic() - self._frame_time) * 1000))
+
+    @property
+    def capture_fps(self) -> float:
+        with self._lock:
+            if len(self._frame_times) < 2:
+                return 0.0
+            elapsed = self._frame_times[-1] - self._frame_times[0]
+            return (len(self._frame_times) - 1) / elapsed if elapsed > 0 else 0.0
+
+    @property
+    def frame_sequence(self) -> int:
+        with self._lock:
+            return self._frame_sequence
 
     def wait_for_frame(self, timeout: float = 8.0) -> bool:
         deadline = time.monotonic() + timeout

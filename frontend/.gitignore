@@ -19,6 +19,7 @@ logs/
 *.npy
 *.pt
 .streamlit/secrets.toml
+/backup/
 
 .env
 .venv/

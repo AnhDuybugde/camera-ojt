@@ -15,7 +15,11 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 load_dotenv(_PROJECT_ROOT / ".env")
 
-from camera_tracking.audio import CameraCheckInAnnouncer, HamyCompanion  # noqa: E402
+from camera_tracking.audio import (  # noqa: E402
+    AudioEventRouter,
+    CameraCheckInAnnouncer,
+    HamyCompanion,
+)
 from camera_tracking.integration import BackendStatusClient, BeXinhStatusBridge  # noqa: E402
 
 
@@ -27,7 +31,7 @@ def parse_args() -> argparse.Namespace:
         "--status-url",
         default=os.getenv("TRACKING_STATUS_URL", "http://127.0.0.1:8765/status.json"),
     )
-    parser.add_argument("--poll-seconds", type=float, default=0.35)
+    parser.add_argument("--poll-seconds", type=float, default=0.12)
     parser.add_argument("--timeout-seconds", type=float, default=2.0)
     return parser.parse_args()
 
@@ -44,18 +48,22 @@ def main() -> int:
         return 2
 
     companion = HamyCompanion.from_env(announcer)
-    bridge = BeXinhStatusBridge(companion)
+    event_router = AudioEventRouter(announcer)
+    bridge = BeXinhStatusBridge(companion, event_router=event_router)
     client = BackendStatusClient(args.status_url, timeout_s=args.timeout_seconds)
     interval_s = max(0.10, float(args.poll_seconds))
     last_error = ""
     last_error_at = float("-inf")
 
-    print(f"Bé Xinh bridge: ACTIVE | {args.status_url}")
+    print(
+        f"Bé Xinh bridge: ACTIVE | {args.status_url} | "
+        f"zone-events={'enabled' if event_router.enabled else 'disabled'}"
+    )
     try:
         while True:
             started = time.monotonic()
             try:
-                bridge.process(client.fetch(), now_s=started)
+                bridge.process(client.fetch(), now_s=started, wall_time_s=time.time())
                 last_error = ""
             except (HTTPError, URLError, OSError, RuntimeError, TypeError, ValueError) as error:
                 message = str(error)

@@ -1,6 +1,6 @@
-"""Tro ly voice "Ha Linh" - BAN CHINH THUC (mic camera RTSP + loa camera P2P).
+"""Tro ly voice "Be Xinh" - mic camera RTSP + Gemini + loa camera P2P.
 
-WAIT_WAKE (STT small) --"Ha Linh oi"--> "Ha Linh nghe ne" (loa camera)
+WAIT_WAKE (STT) --"Be Xinh oi"--> "Be Xinh nghe ne" (loa camera)
 --> LISTEN_CMD --> STT medium --> GEMINI 1-CALL JSON --> TOOLS (59 tool)
 --> TTS CUDA --> loa camera P2P --> WAIT_WAKE.
 
@@ -16,16 +16,24 @@ Chay:
     python scripts/halinh_assistant.py [--rounds 0]
     --rounds 0 = chay lien tuc den Ctrl+C.
     Test luat wake khong can mic:
-    python scripts/halinh_assistant.py --wake-test "ha linh oi"
+    python scripts/halinh_assistant.py --wake-test "be xinh oi"
 """
 
 from __future__ import annotations
 
 import argparse
+from collections import deque
+import hashlib
+import io
+import json
+import os
+from queue import Empty, Queue
+import re
 import subprocess
 import sys
 import threading
 import time
+import wave
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,6 +46,8 @@ from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
 
 from camera_tracking.config import load_config
+from camera_tracking.audio import AudioEventRouter, HamyCompanion
+from camera_tracking.integration import BackendStatusClient, BeXinhStatusBridge
 from camera_tracking.voice.qa_tools import (
     TOOL_FUNCS,
     build_tool_catalog,
@@ -59,10 +69,11 @@ from camera_tracking.voice.speaker_guard import (
 from camera_tracking.voice.turn_guard import (
     clear_turn,
     mark_turn,
+    turn_active,
 )
 from camera_tracking.voice.voice_trigger import normalize_trigger_text
 
-HA_LINH_PROMPT = """Bạn là Hà Linh, trợ lý giọng nói tiếng Việt cho hệ thống Camera-OJT.
+BE_XINH_PROMPT = """Bạn là Bé Xinh, trợ lý giọng nói tiếng Việt thân thiện cho hệ thống Camera-OJT.
 
 Quy tắc trả lời:
 * Trả lời trực tiếp câu hỏi của người dùng.
@@ -70,7 +81,8 @@ Quy tắc trả lời:
 * Giữ câu trả lời dưới 40 từ nếu có thể.
 * Không giải thích dài dòng, không lặp lại câu hỏi.
 * Không dùng Markdown, bullet point hoặc tiêu đề.
-* Dùng tiếng Việt tự nhiên, dễ nghe khi chuyển sang giọng nói.
+* Dùng tiếng Việt tự nhiên, thân thiện, dễ thương và dễ nghe khi chuyển thành giọng nói.
+* Luôn tự xưng là Bé Xinh; không dùng tên Hà Linh.
  * Với câu hỏi đơn giản, chỉ đưa ra thông tin cần thiết.
  * TUYỆT ĐỐI không hỏi ngược lại người dùng dưới mọi hình thức: không câu
    hỏi làm rõ, không gợi ý hỏi tiếp, không đặt nhiều câu hỏi trong một lượt
@@ -82,20 +94,17 @@ Quy tắc trả lời:
 * Không nói bạn là AI, trừ khi người dùng hỏi trực tiếp.
 * Khi gọi tool, chỉ dùng kết quả tool để tạo câu trả lời cuối cùng."""
 
-# Wake: "Ha Linh oi" lam chinh; "Ha Linh"/"Linh oi" du phong.
-# Token-match tren text da normalize. "Ha" dung mot minh KHONG wake
-# (de nham voi cuoi/ha ha); "Linh" mot minh chi wake khi segment ngan.
-HA_LINH_TOKENS = {"ha", "linh"}
-HA_LINH_PHRASES = {"ha linh oi", "ha linh a", "xin chao ha linh",
-                   "chao ha linh", "ha linh co nghe khong", "linh oi",
-                   "oi ha linh", "ha linh nghe khong", "chao linh",
-                   "xin chao linh"}
-HA_LINH_MAX_TOKENS_SINGLE = 2  # "Linh"/"Linh oi" ngan moi wake.
+# Require both words to avoid waking on the common adjective "xinh" alone.
+BE_XINH_TOKENS = {"be", "xinh"}
+BE_XINH_PHRASES = {
+    "be xinh oi", "be xinh a", "xin chao be xinh", "chao be xinh",
+    "be xinh co nghe khong", "oi be xinh", "be xinh nghe khong",
+}
 
-# Biais STT ve cum goi: giup small bat "Ha Linh oi" chuan hon.
-WAKE_STT_PROMPT = "Hà Linh ơi. Linh ơi. Chào Hà Linh."
-# Token thua khi boc lenh kem theo cau wake ("Ha Linh oi, may gio roi").
-_WAKE_FILLER_TOKENS = HA_LINH_TOKENS | {
+# Bias STT ve cum goi: giup model bat "Be Xinh oi" chuan hon.
+WAKE_STT_PROMPT = "Bé Xinh ơi. Chào Bé Xinh. Bé Xinh có nghe không."
+# Token thua khi boc lenh kem theo cau wake ("Be Xinh oi, may gio roi").
+_WAKE_FILLER_TOKENS = BE_XINH_TOKENS | {
     "oi", "ơi", "o", "a", "à", "ạ", "e", "ê", "nha", "nhe", "nhé", "ne",
 }
 
@@ -103,7 +112,7 @@ _WAKE_FILLER_TOKENS = HA_LINH_TOKENS | {
 def strip_wake_command(wake_text: str) -> str:
     """Boc phan lenh con thua sau cum goi wake.
 
-    "Ha Linh oi, may gio roi" -> "may gio roi". Tra ve "" neu khong
+    "Be Xinh oi, may gio roi" -> "may gio roi". Tra ve "" neu khong
     co lenh kem (chi goi wake don thuan).
     """
     import re
@@ -135,32 +144,40 @@ Luật:
 Danh sách tool:
 """
 
-ROUTER_SYSTEM = HA_LINH_PROMPT + "\n\n" + ROUTER_PROTOCOL + build_tool_catalog()
+ROUTER_SYSTEM = BE_XINH_PROMPT + "\n\n" + ROUTER_PROTOCOL + build_tool_catalog()
 
 FILLER_FILES = {
-    "ready": "ready.wav",
-    "listening": "listening.wav",
-    "thinking": "thinking.wav",
-    "got_it": "got_it.wav",
-    "missed": "missed.wav",
+    "ready": "be_xinh_ready.wav",
+    "listening": "be_xinh_listening.wav",
+    "thinking": "be_xinh_thinking.wav",
+    "got_it": "be_xinh_got_it.wav",
+    "missed": "be_xinh_missed.wav",
+}
+
+FILLER_TEXTS = {
+    "ready": "Bé Xinh sẵn sàng rồi. Gọi Bé Xinh ơi để trò chuyện nha.",
+    "listening": "Bé Xinh nghe nè.",
+    "thinking": "Bé Xinh đang nghĩ một chút nha.",
+    "got_it": "Bé Xinh hiểu rồi nè.",
+    "missed": "Bé Xinh nghe chưa rõ. Bạn gọi Bé Xinh ơi rồi nói lại nha.",
 }
 
 
 def ack_via_camera(talk, filler_dir: Path, channel: int) -> None:
-    """Bao 'Ha Linh nghe ne' bang loa CAMERA (P2P, chan - half-duplex).
+    """Bao 'Be Xinh nghe ne' bang loa CAMERA (P2P, chan - half-duplex).
 
     Phat xong moi mo mic (mic mo SAU khi loa dut) nen khong can
     chay background. Cham hon local 1-2s nhung toan bo am thanh
     ra loa camera.
     """
     try:
-        talk(filler_dir / FILLER_FILES["listening"], channel)
+        talk(filler_dir / FILLER_FILES["listening"], channel, tail_s=0.35)
     except Exception as error:
-        print(f"[HaLinh] ack camera loi (bo qua, nghe luon): {error}",
+        print(f"[BeXinhChat] ack camera loi (bo qua, nghe luon): {error}",
               flush=True)
 
 
-# Token thua cua chinh cau ack ("Ha Linh nghe ne") khi lot vao mic.
+# Token thua cua chinh cau ack ("Be Xinh nghe ne") khi lot vao mic.
 _ACK_ECHO_TOKENS = _WAKE_FILLER_TOKENS | {"nghe", "nè", "di"}
 
 
@@ -220,12 +237,60 @@ def fast_answer(question: str) -> str | None:
     if n <= 6 and ("tam biet" in norm or "hen gap lai" in norm):
         return "Tạm biệt bạn. Hẹn gặp lại."
     if n <= 6 and ("ban la ai" in norm or norm in ("ten gi", "ten ban la gi")):
-        return "Mình là Hà Linh, trợ lý giọng nói của hệ thống camera."
+        return "Mình là Bé Xinh, trợ lý giọng nói của hệ thống camera."
     if norm in ("xin chao", "chao", "chao ban", "hello", "hi"):
-        return "Chào bạn. Hà Linh nghe đây."
+        return "Chào bạn nha. Bé Xinh nghe đây."
     if n <= 4 and ("khoe khong" in norm or norm in ("khoe khong", "ban khoe khong")):
         return "Mình khỏe. Rất vui được nói chuyện với bạn."
     return None
+
+
+def gemini_model_candidates(primary: str, fallback: str) -> list[str]:
+    """Return an ordered, de-duplicated Gemini failover chain."""
+    result: list[str] = []
+    for item in (primary, fallback):
+        name = str(item or "").strip()
+        if name and name not in result:
+            result.append(name)
+    return result
+
+
+def is_gemini_capacity_error(error: BaseException) -> bool:
+    message = str(error).upper()
+    return ("429" in message or "RESOURCE_EXHAUSTED" in message
+            or "503" in message or "UNAVAILABLE" in message)
+
+
+def pcm_to_wav_bytes(pcm: bytes, sample_rate: int = TARGET_RATE) -> bytes:
+    """Wrap mono signed-16 PCM as an inline WAV for Gemini audio input."""
+    destination = io.BytesIO()
+    with wave.open(destination, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(int(sample_rate))
+        wav.writeframes(pcm)
+    return destination.getvalue()
+
+
+def active_voice_volume(
+    config_path: Path | None = None,
+) -> float:
+    """Return the single live speaker gain selected in the dashboard."""
+    path = config_path or ROOT.parent / ".runtime" / "be-xinh-volume.json"
+    payload: dict = {}
+    try:
+        candidate = json.loads(path.read_text(encoding="utf-8-sig"))
+        if isinstance(candidate, dict):
+            payload = candidate
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    try:
+        # normal_percent keeps old settings compatible during migration.
+        value = payload.get("percent", payload.get("normal_percent", 85))
+        return max(10, min(100, int(value))) / 100.0
+    except (TypeError, ValueError):
+        return 0.85
 
 
 def parse_args() -> argparse.Namespace:
@@ -237,18 +302,18 @@ def parse_args() -> argparse.Namespace:
                         help="Kenh loa P2P (mac dinh p2p_channel trong config).")
     parser.add_argument("--model", default=None)
     parser.add_argument("--max-tokens", type=int, default=100)
-    parser.add_argument("--tts-voice", default="maichi")
-    parser.add_argument("--tts-device", default="cuda",
+    parser.add_argument("--tts-voice", default="hamy")
+    parser.add_argument("--tts-device", default="cpu",
                         help="cuda (co GPU) hoac cpu.")
-    parser.add_argument("--wake-model", default="zipformer",
-                        help="Model STT vong cho wake 'Ha Linh oi': zipformer "
+    parser.add_argument("--wake-model", default="tiny",
+                        help="Model STT vong cho wake 'Be Xinh oi': zipformer "
                              "= nhanh ~0.1s (khuyen nghi), small/tiny = "
                              "whisper CPU.")
-    parser.add_argument("--cmd-model", default="zipformer",
+    parser.add_argument("--cmd-model", default="tiny",
                         help="Model STT vong nghe lenh: zipformer=Zipformer-vi "
                              "30M CPU ~0.3s (khuyen nghi), medium=chuan ~9s "
                              "CPU, small=nhanh ~2-3s.")
-    parser.add_argument("--think-filler-s", type=float, default=6.0,
+    parser.add_argument("--think-filler-s", type=float, default=30.0,
                         help="Xu ly lau hon nguong nay thi phat filler thinking "
                              "(cao de filler P2P ~10s khong cong them delay).")
     parser.add_argument("--think-timeout-s", type=float, default=90.0)
@@ -263,28 +328,19 @@ def parse_args() -> argparse.Namespace:
 
 
 def is_wake(text: str) -> bool:
-    """True khi cau STT goi Ha Linh ("Ha Linh oi" / "Ha Linh" / "Linh oi")."""
+    """True for an invocation, not merely any sentence naming Be Xinh."""
     norm = normalize_trigger_text(text)
     if not norm:
         return False
-    for phrase in HA_LINH_PHRASES:
+    for phrase in BE_XINH_PHRASES:
         if phrase in norm:
             return True
     import re
 
     tokens = re.findall(r"[a-z0-9]+", norm)
-    have_ha = "ha" in tokens
-    have_linh = "linh" in tokens
-    if have_ha and have_linh:
-        return True
-    if not have_linh:
-        return False  # "Ha"/"ha ha" dung mot minh thi khong wake.
-    # Chi con "linh": stutter ("linh linh") hoac segment ngan ("linh oi").
-    if tokens.count("linh") >= 2 and len(tokens) <= 3:
-        return True
-    # "Linh"/"Linh oi" ngan thi wake; "Ha" dung mot minh thi khong.
-    return (len(tokens) <= HA_LINH_MAX_TOKENS_SINGLE
-            and all(t in _WAKE_FILLER_TOKENS for t in tokens))
+    # Accept the short standalone call "Be Xinh", but reject speaker echo
+    # such as "Be Xinh xin chao ban" from the assistant's own reply.
+    return tokens == ["be", "xinh"]
 
 
 def capture_utterance(
@@ -304,12 +360,12 @@ def capture_utterance(
     ["-fflags", "nobuffer", "-rtsp_transport", "tcp", "-i", rtsp_url].
     meter_s: in dong muc mic moi N giay trong luc doi. Het max_wait_s
     thi tra None; None (EOF/stream chet) thi vong goi tu mo lai stream.
-    respect_speaker_busy: True = tat mic khi loa dang phat (trong turn,
-    tranh echo). False = mic luon mo (vong cho wake, tranh miss tieng goi).
+    respect_speaker_busy: True = tat mic khi loa dang phat de tranh echo.
+    False chi danh cho chan doan mic; production luon de True.
     """
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
-        print("[HaLinh] khong tim thay ffmpeg")
+        print("[BeXinhChat] khong tim thay ffmpeg")
         return None
     cmd = [
         ffmpeg, "-hide_banner", "-loglevel", "error",
@@ -322,9 +378,25 @@ def capture_utterance(
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, bufsize=0)
     except Exception as error:
-        print(f"[HaLinh] khong mo duoc mic: {error}")
+        print(f"[BeXinhChat] khong mo duoc mic: {error}")
         return None
     assert proc.stdout is not None
+    chunk_queue: Queue[bytes | None] = Queue()
+
+    def _read_audio() -> None:
+        try:
+            while True:
+                chunk = proc.stdout.read(4096)
+                if not chunk:
+                    break
+                chunk_queue.put(chunk)
+        finally:
+            chunk_queue.put(None)
+
+    reader = threading.Thread(
+        target=_read_audio, name="be-xinh-rtsp-reader", daemon=True)
+    reader.start()
+    last_audio_at = time.monotonic()
     tracker = NoiseFloorTracker(
         static_threshold=float(voice_cfg.voice_vad_threshold),
         factor=float(voice_cfg.voice_vad_floor_factor),
@@ -342,6 +414,9 @@ def capture_utterance(
     last_floor = 0.0
     got_frame = False
     leftover = bytearray()
+    # Preserve the syllable just before VAD crosses its threshold. Without
+    # pre-roll, short Vietnamese initials and names are frequently clipped.
+    pre_roll: deque[bytes] = deque(maxlen=10)  # 10 x 30 ms = 300 ms
     next_meter = time.monotonic() + (meter_s or 0)
     max_bytes = int(max_len_s * TARGET_RATE * 2)
     busy = False
@@ -350,16 +425,24 @@ def capture_utterance(
     print(prompt, flush=True)
     try:
         while True:
-            chunk = proc.stdout.read(4096)
-            if not chunk:
+            try:
+                chunk = chunk_queue.get(timeout=1.0)
+            except Empty:
+                if time.monotonic() - last_audio_at >= 6.0:
+                    print("[BeXinhChat] RTSP mic im 6s - tu mo lai luong.",
+                          flush=True)
+                    break
+                continue
+            if chunk is None:
                 break
+            last_audio_at = time.monotonic()
             leftover += chunk
             n_frames = 0
             while len(leftover) >= FRAME_BYTES:
                 frame = bytes(leftover[:FRAME_BYTES])
                 del leftover[:FRAME_BYTES]
                 n_frames += 1
-                # Half-duplex xuyen process: loa (greeter chao / Ha Linh
+                # Half-duplex xuyen process: loa (greeter chao / Be Xinh
                 # noi) dang phat thi TAT MIC - bo frame, huy doan dang
                 # ghi do de khoi nghe lai chinh tieng loa. Check moi 8
                 # frame (~4 lan/giay) cho nhe.
@@ -372,27 +455,31 @@ def capture_utterance(
                     heard = 0
                     if not busy_announced:
                         busy_announced = True
-                        print("[HaLinh] loa dang phat - tam tat mic.",
+                        print("[BeXinhChat] loa dang phat - tam tat mic.",
                               flush=True)
                     if started:
                         started = False
                         buf.clear()
                         silence_ms = 0
+                    pre_roll.clear()
                     continue
                 level = rms_level(frame)
                 thr = tracker.update(level)
                 if not got_frame:
                     got_frame = True
-                    print("[HaLinh] mic thong, goi 'Hà Linh ơi' di.",
+                    print("[BeXinhChat] mic thông, gọi 'Bé Xinh ơi' đi.",
                           flush=True)
                 if level > peak:
                     peak = level
                 last_thr, last_floor = thr, tracker.floor
                 loud = level >= thr
                 if not started:
+                    pre_roll.append(frame)
                     heard = heard + 1 if loud else 0
-                    if heard >= 3:
+                    if heard >= 2:
                         started = True
+                        buf += b"".join(pre_roll)
+                        pre_roll.clear()
                 else:
                     buf += frame
                     silence_ms = 0 if loud else silence_ms + frame_ms
@@ -402,11 +489,11 @@ def capture_utterance(
                 next_meter = time.monotonic() + meter_s
                 show, peak = peak, 0.0
                 if not got_frame:
-                    print("[HaLinh:meter] chua co frame audio "
+                    print("[BeXinhChat:meter] chua co frame audio "
                           "(sai --mic-source?)", flush=True)
                 else:
                     mark = "CO TIENG" if show >= last_thr else "yen"
-                    print(f"[HaLinh:meter] {mark} dinh={show:.4f} "
+                    print(f"[BeXinhChat:meter] {mark} dinh={show:.4f} "
                           f"nguong={last_thr:.4f} nen={last_floor:.4f}",
                           flush=True)
             if not started and max_wait_s is not None:
@@ -418,11 +505,17 @@ def capture_utterance(
             proc.terminate()
         except Exception:
             pass
+        try:
+            proc.wait(timeout=0.8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        reader.join(timeout=0.5)
     return bytes(buf) if started and buf else None
 
 
 def think(question: str, model: str, max_tokens: int,
-          use_search: bool = False) -> tuple[str, float, list[str]]:
+          use_search: bool = False,
+          audio_pcm: bytes | None = None) -> tuple[str, float, list[str]]:
     """Router JSON 1-call duy nhat: Gemini chi hieu cau hoi.
 
     - direct -> text trong JSON la dap an cuoi (khong goi them).
@@ -442,15 +535,56 @@ def think(question: str, model: str, max_tokens: int,
     client = genai.Client(
         api_key=api_key,
         http_options={"retry_options": {"attempts": 1}})
-    config = types.GenerateContentConfig(
-        system_instruction=ROUTER_SYSTEM,
-        max_output_tokens=300,
-        temperature=0,
-        thinking_config=types.ThinkingConfig(thinking_budget=0),
-    )
+    config_args = {
+        "system_instruction": ROUTER_SYSTEM,
+        "max_output_tokens": max(32, int(max_tokens)),
+        "temperature": 0,
+    }
+    # Flash-Lite currently rejects an explicit thinking configuration.  It is
+    # our low-latency quota fallback, so leave that field out for Lite models.
+    if "lite" not in model.lower():
+        config_args["thinking_config"] = types.ThinkingConfig(
+            thinking_budget=0)
+    config = types.GenerateContentConfig(**config_args)
+    contents: object = question
+    if audio_pcm:
+        glossary = os.getenv(
+            "BE_XINH_SPEECH_GLOSSARY",
+            "Bé Xinh, Anh Quốc Ngọc, Quốc Ngọc, Anh Khoa 617, Đà Nẵng, "
+            "Camera OJT, AI Mind",
+        ).strip()
+        contents = [
+            (
+                "Hãy nghe chính xác câu nói tiếng Việt trong file âm thanh. "
+                "Âm thanh là nguồn chính; transcript cục bộ bên dưới chỉ là "
+                "gợi ý và có thể sai. Tự phát hiện tiếng Việt, tiếng Anh hoặc "
+                "câu nói trộn hai ngôn ngữ; ưu tiên tiếng Việt và hiểu được "
+                "giọng miền Trung/Đà Nẵng. Không tự đổi tên riêng thành từ "
+                "tiếng Anh gần âm. Trong JSON kết quả, thêm field heard chứa "
+                "nguyên văn câu đã nghe và field language là vi, en hoặc "
+                "mixed. Thực hiện yêu cầu theo đúng giao thức JSON trong "
+                "system instruction.\n"
+                f"Từ vựng/tên riêng ưu tiên nếu âm thanh phù hợp: {glossary}.\n"
+                f"Transcript gợi ý: {question}"
+            ),
+            types.Part.from_bytes(
+                data=pcm_to_wav_bytes(audio_pcm), mime_type="audio/wav"),
+        ]
     response = client.models.generate_content(
-        model=model, contents=question, config=config)
+        model=model, contents=contents, config=config)
     raw = (getattr(response, "text", "") or "").strip()
+    if audio_pcm:
+        match = re.search(r"\{.*\}", raw, re.S)
+        if match:
+            try:
+                details = json.loads(match.group(0))
+                heard = " ".join(str(details.get("heard") or "").split())
+                language = str(details.get("language") or "unknown").strip()
+                if heard:
+                    print(f"[BeXinhChat] Gemini nghe ({language}): {heard}",
+                          flush=True)
+            except (TypeError, ValueError):
+                pass
     plan = parse_router_json(raw)
     if plan["type"] == "direct" or not plan["tool"]:
         return plan["text"], 0.0, []
@@ -470,24 +604,22 @@ def think(question: str, model: str, max_tokens: int,
     except Exception as error:
         answer = f"lỗi tool {name}: {error}"
     tool_s = time.monotonic() - t0
-    print(f"[HaLinh] tool {name}({args}) -> {answer}", flush=True)
+    print(f"[BeXinhChat] tool {name}({args}) -> {answer}", flush=True)
     return str(answer), tool_s, [name]
 
 
 def main() -> None:
-    import os
-
     args = parse_args()
     if args.wake_test is not None:
         print(f"{args.wake_test!r} -> wake={is_wake(args.wake_test)}")
         return
     if args.with_search:
-        print("[HaLinh] single-call JSON mode khong ho tro search "
+        print("[BeXinhChat] single-call JSON mode khong ho tro search "
               "grounding, bo qua --with-search.", flush=True)
     config = load_config(args.config)
     voice_cfg = config.voice
     channel = args.channel or int(voice_cfg.p2p_channel)
-    model = args.model or os.getenv("GEMINI_MODEL", "").strip() or "gemini-3.6-flash"
+    model = args.model or os.getenv("GEMINI_MODEL", "").strip() or "gemini-3.5-flash"
     if not os.getenv("GEMINI_API_KEY", "").strip():
         raise SystemExit("Thieu GEMINI_API_KEY: them vao .env roi chay lai.")
     from camera_tracking.camera.camera_imou import imou_url
@@ -502,7 +634,7 @@ def main() -> None:
     filler_dir = ROOT / "output" / "voice_fillers"
     missing = [f for f in FILLER_FILES.values() if not (filler_dir / f).is_file()]
     if missing:
-        raise SystemExit(f"Thieu filler WAV {missing}: gen truoc (ZeroTTS).")
+        print(f"[BeXinhChat] sẽ tạo filler lần đầu: {missing}", flush=True)
 
     from faster_whisper import WhisperModel
 
@@ -511,8 +643,9 @@ def main() -> None:
         ImouP2PTalkOutput,
     )
     from camera_tracking.voice.zerotts_tts import ZeroTTSBackend
+    from camera_tracking.audio.announcer import CameraCheckInAnnouncer
 
-    print("[HaLinh] warmup (STT wake + lenh, TTS CUDA, tunnel loa)...", flush=True)
+    print("[BeXinhChat] warmup (STT wake + lenh, TTS, tunnel loa)...", flush=True)
     t0 = time.monotonic()
     # RTX 2050 4GB: STT giu CPU (CUDA tran VRAM voi ZeroTTS).
     # zipformer-vi 30M (~0.3s) cho ca wake + lenh; whisper giu lam fallback.
@@ -520,21 +653,33 @@ def main() -> None:
     def _pick(name: str, default: str) -> str:
         val = str(name or default).strip().lower()
         if val not in ("tiny", "small", "medium", "zipformer"):
-            print(f"[HaLinh] model {name!r} la, dung {default}.", flush=True)
+            print(f"[BeXinhChat] model {name!r} la, dung {default}.", flush=True)
             return default
         return val
     _wake_model = _pick(args.wake_model, "zipformer")
     _cmd_model = _pick(args.cmd_model, "zipformer")
     _zipformer = None
     if "zipformer" in (_wake_model, _cmd_model):
-        from camera_tracking.voice.sherpa_stt import SherpaZipformerSTT
+        try:
+            from camera_tracking.voice.sherpa_stt import SherpaZipformerSTT
 
-        _zipformer = SherpaZipformerSTT(
-            num_threads=int(getattr(voice_cfg, "stt_threads", 6)))
-        _zipformer.warmup()
-        print(f"[HaLinh] STT zipformer CPU xong "
-              f"({time.monotonic() - t0:.1f}s, dung chung wake+lenh).",
-              flush=True)
+            _zipformer = SherpaZipformerSTT(
+                num_threads=int(getattr(voice_cfg, "stt_threads", 6)))
+            _zipformer.warmup()
+            print(f"[BeXinhChat] STT zipformer CPU xong "
+                  f"({time.monotonic() - t0:.1f}s, dung chung wake+lenh).",
+                  flush=True)
+        except (ImportError, OSError, RuntimeError, ValueError) as error:
+            # A fresh Windows setup may not have sherpa-onnx or its external
+            # model yet. Keep voice chat usable with the already-supported
+            # faster-whisper backend instead of terminating the process.
+            print(f"[BeXinhChat] Zipformer chua san sang ({error}); "
+                  "tu dong dung Whisper.", flush=True)
+            if _wake_model == "zipformer":
+                _wake_model = "tiny"
+            if _cmd_model == "zipformer":
+                _cmd_model = "tiny"
+            _zipformer = None
 
     def _zip_text(pcm: bytes) -> str:
         # Transducer khong co cua no_speech nhu Whisper: tieng on phong
@@ -561,7 +706,7 @@ def main() -> None:
                 min_avg_logprob=-1.10,
                 initial_prompt=WAKE_STT_PROMPT,
             )
-        print(f"[HaLinh] STT wake {_wake_model} xong "
+        print(f"[BeXinhChat] STT wake {_wake_model} xong "
               f"({time.monotonic() - t0:.1f}s).", flush=True)
     t0 = time.monotonic()
     if _cmd_model == "zipformer":
@@ -570,7 +715,7 @@ def main() -> None:
         def transcribe_cmd(pcm: bytes) -> str:
             return _zip_text(pcm)
 
-        print(f"[HaLinh] STT lenh zipformer CPU xong "
+        print(f"[BeXinhChat] STT lenh zipformer CPU xong "
               f"({time.monotonic() - t0:.1f}s).", flush=True)
     else:
         stt_medium = WhisperModel(_cmd_model, device="cpu",
@@ -584,41 +729,68 @@ def main() -> None:
                 min_avg_logprob=float(voice_cfg.voice_min_avg_logprob),
             )
 
-        print(f"[HaLinh] STT lenh {_cmd_model} CPU xong "
+        print(f"[BeXinhChat] STT lenh {_cmd_model} CPU xong "
               f"({time.monotonic() - t0:.1f}s).", flush=True)
     tts = ZeroTTSBackend(device=args.tts_device, voice=args.tts_voice)
     tts._load()
-    # Tunnel RIENG cho Ha Linh (halinh_bind_port, mac dinh 18087): greeter
+    filler_dir.mkdir(parents=True, exist_ok=True)
+    for _key, _filename in FILLER_FILES.items():
+        _target = filler_dir / _filename
+        if not _target.is_file():
+            print(f"[BeXinhChat] tạo {_filename}...", flush=True)
+            tts.save_wav(FILLER_TEXTS[_key], _target)
+    # Tunnel RIENG cho voice chat (halinh_bind_port, mac dinh 18087): greeter
     # tracking giu 18086. Chung port -> bind fail -> talk 25-70s.
     _halinh_port = int(getattr(voice_cfg, "halinh_bind_port",
                                getattr(voice_cfg, "p2p_bind_port", 18086) + 1))
     p2p = ImouP2PTalkOutput(
         ImouP2PCredentials.from_env(),
         channel=channel,
-        timeout=float(voice_cfg.p2p_timeout_s),
-        attempts=int(voice_cfg.p2p_attempts),
+        # Voice chat must never block tens of seconds on a broken talkback
+        # session. Fail fast, listen to the question, reconnect next turn.
+        timeout=min(6.0, float(voice_cfg.p2p_timeout_s)),
+        attempts=1,
         retry_delay=float(voice_cfg.p2p_retry_delay_s),
         sample_rate=int(voice_cfg.p2p_sample_rate),
         volume=float(voice_cfg.p2p_volume),
         bind_port=_halinh_port,
+        establish_timeout=10.0,
+        retry_persistent=False,
     )
+    direct_speaker = CameraCheckInAnnouncer.from_env()
     # Duong truyen loa phai SAN SANG THAT moi duoc noi "san sang":
     # cho dong bo, retry vai lan; khong noi thi dung (khong gia vo san sang).
-    tunnel_ok = False
-    for attempt in range(1, 4):
-        try:
-            p2p.warmup(raise_on_error=True)
-            tunnel_ok = True
-            break
-        except Exception as error:
-            print(f"[HaLinh] cho loa lan {attempt}/3: {error}", flush=True)
-            time.sleep(5.0)
+    tunnel_ok = direct_speaker is not None
+    if tunnel_ok:
+        print("[BeXinhChat] loa LAN truc tiep san sang; P2P la fallback.",
+              flush=True)
+    else:
+        for attempt in range(1, 4):
+            try:
+                p2p.warmup(raise_on_error=True)
+                tunnel_ok = True
+                break
+            except Exception as error:
+                print(f"[BeXinhChat] cho loa lan {attempt}/3: {error}", flush=True)
+                time.sleep(5.0)
     if not tunnel_ok:
         raise SystemExit(
-            "[HaLinh] khong mo duoc duong truyen loa sau 3 lan (kiem tra mang/ "
+            "[BeXinhChat] khong mo duoc duong truyen loa sau 3 lan (kiem tra mang/ "
             "cloud Imou roi chay lai). Chua san sang, dung chuong trinh.")
 
-    def talk(path: str | Path, _channel: int | None = None) -> None:
+    _last_volume_ratio: float | None = None
+
+    def talk(path: str | Path, _channel: int | None = None, *,
+             tail_s: float = 5.0) -> None:
+        nonlocal _last_volume_ratio
+        volume_ratio = active_voice_volume()
+        if direct_speaker is not None:
+            direct_speaker.gain = volume_ratio
+        p2p.volume = volume_ratio
+        if volume_ratio != _last_volume_ratio:
+            print(f"[BeXinhChat] am luong: "
+                  f"{round(volume_ratio * 100)}%.", flush=True)
+            _last_volume_ratio = volume_ratio
         # Phan xu loa: greeter (hinh anh) co the dang phat do loi chao
         # da xep tu truoc WAKE -> doi loa ranh (toi da 10s) roi moi noi,
         # khong de 2 ben noi chong nhau.
@@ -627,7 +799,7 @@ def main() -> None:
             time.sleep(0.2)
             _waited += 0.2
         if _waited >= 10.0:
-            print(f"[HaLinh] loa van ban sau 10s, cu phat "
+            print(f"[BeXinhChat] loa van ban sau 10s, cu phat "
                   f"{Path(path).name} (co the chong lan nhau).", flush=True)
         # Giu mic rong truoc: P2P relay cham hon file nhieu (7-28s) nen
         # duration file + margin khong du; giu thua roi that lai sau.
@@ -640,15 +812,85 @@ def main() -> None:
             pass
         t0 = time.monotonic()
         try:
-            p2p(path, channel)
+            if direct_speaker is not None:
+                try:
+                    direct_speaker.play_file_sync(path)
+                except Exception as direct_error:  # noqa: BLE001
+                    print(f"[BeXinhChat] loa LAN loi, thu P2P: {direct_error}",
+                          flush=True)
+                    try:
+                        p2p(path, channel)
+                    except Exception as fallback_error:  # noqa: BLE001
+                        print(f"[BeXinhChat] ca LAN va P2P deu loi; bo audio "
+                              f"nay, van giu mic: {fallback_error}", flush=True)
+            else:
+                try:
+                    p2p(path, channel)
+                except Exception as fallback_error:  # noqa: BLE001
+                    print(f"[BeXinhChat] P2P loi; bo audio nay, van giu mic: "
+                          f"{fallback_error}", flush=True)
         finally:
-            # Phat xong: chi giu duoi vang 2s cho mic mo lai ngay.
+            # RTSP mic co the con audio cu vai giay sau khi P2P bao phat xong.
+            # Cau tra loi dung 5s de khong tu danh thuc; rieng ACK truyen
+            # tail_s=0.35 de khong mat phan dau cau hoi cua nguoi dung.
             try:
-                mark_speaker_busy(hold_s=2.0)
+                mark_speaker_busy(hold_s=max(0.0, float(tail_s)))
             except Exception:  # noqa: BLE001
                 pass
-        print(f"[HaLinh] loa xong {Path(path).name} "
+        print(f"[BeXinhChat] loa xong {Path(path).name} "
               f"({time.monotonic() - t0:.1f}s).", flush=True)
+
+    # Zone events and conversational Q&A share the same direct speaker.
+    # The router drops proactive lines while turn_guard is active, so a user
+    # saying "Bé Xinh ơi" always has priority and never competes with a zone
+    # greeting in a second process.
+    zone_bridge_stop = threading.Event()
+    zone_bridge_thread: threading.Thread | None = None
+    if direct_speaker is not None:
+        zone_companion = HamyCompanion.from_env(direct_speaker)
+        zone_router = AudioEventRouter(
+            direct_speaker,
+            turn_guard=turn_active,
+        )
+        zone_bridge = BeXinhStatusBridge(
+            zone_companion,
+            event_router=zone_router,
+        )
+        zone_client = BackendStatusClient(
+            os.getenv(
+                "TRACKING_STATUS_URL",
+                "http://127.0.0.1:8765/status.json",
+            ),
+            timeout_s=2.0,
+        )
+
+        def _run_zone_bridge() -> None:
+            last_error = ""
+            while not zone_bridge_stop.wait(0.12):
+                started = time.monotonic()
+                try:
+                    zone_bridge.process(
+                        zone_client.fetch(),
+                        now_s=started,
+                        wall_time_s=time.time(),
+                    )
+                    last_error = ""
+                except Exception as error:  # noqa: BLE001 - sidecar must stay alive
+                    message = str(error)
+                    if message != last_error:
+                        print(
+                            f"[BeXinhChat/Zone] chờ backend: {message}",
+                            flush=True,
+                        )
+                        last_error = message
+
+        zone_bridge_thread = threading.Thread(
+            target=_run_zone_bridge,
+            name="be-xinh-zone-bridge",
+            daemon=True,
+        )
+        zone_bridge_thread.start()
+        print("[BeXinhChat] Audio Zone bridge: ACTIVE", flush=True)
 
     # Pre-convert TAT CA filler sang AAC ngay tu warmup: moi cau
     # (ready/listening/thinking/missed) tiet kiem 1-2s spawn ffmpeg o lan
@@ -656,46 +898,51 @@ def main() -> None:
     try:
         for _filler in FILLER_FILES.values():
             p2p._convert_cached(filler_dir / _filler)
-        print("[HaLinh] da preload AAC fillers.", flush=True)
+        print("[BeXinhChat] da preload AAC fillers.", flush=True)
     except Exception as preload_error:  # noqa: BLE001 - chi la toi uu
-        print(f"[HaLinh] preload AAC fillers loi (bo qua): {preload_error}",
+        print(f"[BeXinhChat] preload AAC fillers loi (bo qua): {preload_error}",
               flush=True)
 
-    talk(filler_dir / FILLER_FILES["ready"], channel)
-    print("[HaLinh] sẵn sàng. Gọi 'Hà Linh ơi' để bắt đầu "
-          "(dự phòng: 'Hà Linh', 'Linh ơi'). Ctrl+C dừng.", flush=True)
+    # Do not occupy/reopen camera talkback merely to announce startup. This
+    # saves several seconds and avoids a stale camera session killing chat.
+    print("[BeXinhChat] sẵn sàng. Gọi 'Bé Xinh ơi' để bắt đầu. "
+          "Ctrl+C để dừng.", flush=True)
 
     out_dir = ROOT / "output" / "qa_cache"
     out_dir.mkdir(parents=True, exist_ok=True)
     done_rounds = 0
     wake_miss = 0
     empty_wake = 0  # dem doan on STT ra rong (de heartbeat, khoi tuong chet)
+    # A quota failure is normally project/model-scoped, not a useful signal to
+    # retry on every utterance. Keep the fast Lite fallback hot for five
+    # minutes before probing the primary model again.
+    primary_retry_after = 0.0
     try:
         while True:
             if args.rounds and done_rounds >= args.rounds:
                 break
             # -- WAIT_WAKE (tiny 0.3s, nhanh gap ~10x medium) --
-            # Mic LUON MO o vong nay (ke ca loa dang chao) de khong miss
-            # tieng goi "Ha Linh oi". Ne echo chi bat sau WAKE.
+            # Van ne loa khi cho wake: neu khong, camera se thu lai chinh
+            # cau tra loi cua Be Xinh va tu kich hoat mot vong chao moi.
             pcm = capture_utterance(
                 mic_input, voice_cfg,
-                prompt="[HaLinh] ... nghe (goi 'Hà Linh ơi') ...",
+                prompt="[BeXinhChat] ... nghe (gọi 'Bé Xinh ơi') ...",
                 end_silence_ms=700, max_len_s=4.0, max_wait_s=None,
-                meter_s=3.0, respect_speaker_busy=False)
+                meter_s=3.0, respect_speaker_busy=True)
             if not pcm:
                 time.sleep(1.0)
                 continue
             t0 = time.monotonic()
             wake_text = transcribe_wake(pcm)
-            print(f"[HaLinh] STT wake ({time.monotonic() - t0:.2f}s, {_wake_model}): "
+            print(f"[BeXinhChat] STT wake ({time.monotonic() - t0:.2f}s, {_wake_model}): "
                   f"{wake_text!r}", flush=True)
             if not wake_text or not is_wake(wake_text):
-                # Co tieng nhung khong phai goi Ha Linh: dem hut; du N lan thi
+                # Co tieng nhung khong phai goi Be Xinh: dem hut; du N lan thi
                 # nhac 1 cau roi ve cho (STT rong/im lang thi khong dem).
                 if wake_text:
                     wake_miss += 1
                     empty_wake = 0
-                    print(f"[HaLinh] hut wake ({wake_miss}): {wake_text}",
+                    print(f"[BeXinhChat] hut wake ({wake_miss}): {wake_text}",
                           flush=True)
                     if wake_miss >= max(1, args.wake_miss_n):
                         wake_miss = 0
@@ -705,12 +952,12 @@ def main() -> None:
                     # mic van song (khong thi tuong chuong trinh treo).
                     empty_wake += 1
                     if empty_wake % 5 == 1:
-                        print("[HaLinh] mic van nghe (toan tieng on phong) - "
-                              "goi 'Ha Linh oi' de bat dau.", flush=True)
+                        print("[BeXinhChat] mic van nghe (toan tieng on phong) - "
+                              "gọi 'Bé Xinh ơi' để bắt đầu.", flush=True)
                 continue
             wake_miss = 0
             empty_wake = 0
-            print(f"[HaLinh] WAKE: {wake_text}", flush=True)
+            print(f"[BeXinhChat] WAKE: {wake_text}", flush=True)
             # Khoa turn-taking: pipeline tracking nhin thay thi tam ngung
             # xep chao vẫy/mặt de 2 loa khong noi chong giua hoi-dap.
             # TTL tu het neu crash giua turn.
@@ -721,21 +968,21 @@ def main() -> None:
             question = strip_wake_command(wake_text)
             stt_s = 0.0
             if question:
-                # Wake kem lenh ("Ha Linh oi, may gio roi"): tiny bat wake
+                # Wake kem lenh ("Be Xinh oi, may gio roi"): tiny bat wake
                 # nhanh nhung co the sai lenh dai -> chay lai model lenh
                 # tren cung pcm de lay lenh chuan (hiem, chap nhan cham 1 lan).
                 t0 = time.monotonic()
                 refined = transcribe_cmd(pcm)
                 refined_cmd = strip_wake_command(refined) if refined else ""
-                print(f"[HaLinh] refine lenh ({_cmd_model}) "
+                print(f"[BeXinhChat] refine lenh ({_cmd_model}) "
                       f"({time.monotonic() - t0:.2f}s): {refined!r} -> "
                       f"{refined_cmd!r}", flush=True)
                 if refined_cmd:
                     question = refined_cmd
-                print(f"[HaLinh] lenh kem wake: {question}", flush=True)
+                print(f"[BeXinhChat] lenh kem wake: {question}", flush=True)
                 total0 = time.monotonic()
             else:
-                print("[HaLinh] ack loa ('Hà Linh nghe nè' xong roi hay noi).",
+                print("[BeXinhChat] ack loa ('Bé Xinh nghe nè' xong rồi hãy nói).",
                       flush=True)
                 ack_via_camera(talk, filler_dir, channel)
 
@@ -743,20 +990,19 @@ def main() -> None:
             if not question:
                 stt_s = 0.0
                 attempt = 0
-                while True:
+                while attempt < 2:
                     attempt += 1
                     # Trong turn (sau WAKE): mic NE loa dang phat de lenh
                     # khong dinh echo cau chao/ack.
                     pcm = capture_utterance(
                         mic_input, voice_cfg,
-                        prompt="[HaLinh] NÓI NGAY (cứ nói, Hà Linh vẫn nghe)...",
-                        end_silence_ms=1300,
-                        max_len_s=10.0,
-                        max_wait_s=None, respect_speaker_busy=True)
+                        prompt="[BeXinhChat] NÓI NGAY (Bé Xinh đang nghe)...",
+                        end_silence_ms=700,
+                        max_len_s=7.0,
+                        max_wait_s=6.0, respect_speaker_busy=True)
                     if not pcm:
-                        print(f"[HaLinh] lan {attempt}: mat stream mic, "
-                              f"mo lai...", flush=True)
-                        time.sleep(1.0)
+                        print(f"[BeXinhChat] lan {attempt}: khong nghe thay "
+                              f"cau hoi trong 6s.", flush=True)
                         continue
                     total0 = time.monotonic()
                     t0 = time.monotonic()
@@ -766,15 +1012,20 @@ def main() -> None:
                         question = strip_ack_echo(question)
                     if question and is_wake(question) \
                             and not strip_wake_command(question):
-                        print(f"[HaLinh] lan {attempt}: chi nghe wake "
+                        print(f"[BeXinhChat] lan {attempt}: chi nghe wake "
                               f"({question}) - doi cau lenh that.",
                               flush=True)
                         question = ""
                     if question:
                         break
-                    print(f"[HaLinh] lan {attempt}: STT rong ({stt_s:.2f}s) - "
+                    print(f"[BeXinhChat] lan {attempt}: STT rong ({stt_s:.2f}s) - "
                           f"van nghe tiep.", flush=True)
-            print(f"[HaLinh] lenh ({stt_s:.2f}s): {question}", flush=True)
+                if not question:
+                    print("[BeXinhChat] het luot nghe, ve cho wake moi.",
+                          flush=True)
+                    clear_turn()
+                    continue
+            print(f"[BeXinhChat] lenh ({stt_s:.2f}s): {question}", flush=True)
             # Cau noi cho tool get_last_transcript (vong sau hoi lai van co).
             try:
                 (out_dir / "last_transcript.txt").write_text(
@@ -783,14 +1034,14 @@ def main() -> None:
                 pass
 
             # -- THINK (thread + filler thinking theo nguong) --
-            def _run_think_once():
+            def _run_think_once(target_model: str):
                 one: dict = {}
 
                 def _one() -> None:
                     try:
                         ans, tls, used = think(
-                            question, model, args.max_tokens,
-                            args.with_search)
+                            question, target_model, args.max_tokens,
+                            args.with_search, audio_pcm=pcm)
                         one.update(answer=ans, tool_s=tls, used=used)
                     except Exception as error:  # noqa: BLE001
                         one.update(error=error)
@@ -813,89 +1064,118 @@ def main() -> None:
             tool_s = 0.0
             llm_s = 0.0
             # Fast-path: cau thuong gap tra ngay, khoi doi Gemini ~14s.
-            fast = fast_answer(question)
+            fast_enabled = os.getenv(
+                "BE_XINH_FAST_PATH", "false").strip().lower() in (
+                    "1", "true", "yes", "on")
+            fast = fast_answer(question) if fast_enabled else None
             if fast is not None:
                 result = {"answer": fast, "tool_s": 0.0, "used": ["fast-path"]}
                 llm_s = 0.0
                 think_ok = True
-                print(f"[HaLinh] fast-path (0s): {fast}", flush=True)
-            for quota_try in range(3):
+                print(f"[BeXinhChat] fast-path (0s): {fast}", flush=True)
+            fallback_model = os.getenv(
+                "GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite").strip()
+            if time.monotonic() < primary_retry_after:
+                model_chain = gemini_model_candidates(fallback_model, "")
+                print(f"[BeXinhChat] primary dang cooldown; dung ngay "
+                      f"{fallback_model}.", flush=True)
+            else:
+                model_chain = gemini_model_candidates(model, fallback_model)
+            for model_index, target_model in enumerate(model_chain):
                 if think_ok:
                     break
-                result, llm_s = _run_think_once()
+                result, llm_s = _run_think_once(target_model)
                 error = result.get("error")
                 if error is None:
                     answer = result.get("answer", "")
                     tool_s = result.get("tool_s", 0.0)
                     think_ok = True
+                    if model_index:
+                        result.setdefault("used", []).insert(
+                            0, f"fallback:{target_model}")
+                        print(f"[BeXinhChat] Gemini fallback OK: "
+                              f"{target_model}.", flush=True)
                     break
                 message = str(error)
-                is_quota = ("429" in message
-                            or "RESOURCE_EXHAUSTED" in message)
-                if not is_quota:
-                    print(f"[HaLinh] Gemini loi gon: "
+                is_capacity = is_gemini_capacity_error(error)
+                has_fallback = model_index + 1 < len(model_chain)
+                if is_capacity and has_fallback:
+                    if target_model == model:
+                        primary_retry_after = time.monotonic() + 300.0
+                    print(f"[BeXinhChat] {target_model} het quota/ban; "
+                          f"chuyen ngay sang {model_chain[model_index + 1]}.",
+                          flush=True)
+                    continue
+                if not is_capacity:
+                    print(f"[BeXinhChat] Gemini loi gon: "
                           f"{type(error).__name__}: "
                           f"{message[:200]}", flush=True)
                     if isinstance(error, TimeoutError):
                         try:
                             timeout_wav = (out_dir /
-                                           f"halinh_timeout_{int(time.time())}.wav")
+                                           f"be_xinh_timeout_{int(time.time())}.wav")
                             tts.save_wav(
-                                "Hà Linh nghĩ lâu quá, bạn nói lại giúp Hà Linh nhé.",
+                                "Bé Xinh nghĩ lâu quá, bạn nói lại giúp Bé Xinh nha.",
                                 timeout_wav)
                             talk(timeout_wav)
                         except Exception as speak_error:  # noqa: BLE001
-                            print(f"[HaLinh] bao timeout loi: {speak_error}",
+                            print(f"[BeXinhChat] bao timeout loi: {speak_error}",
                                   flush=True)
                     break
-                if quota_try >= 2:
-                    print("[HaLinh] van 429 sau 2 lan retry - bo cau nay, "
-                          "ve cho.", flush=True)
-                    break
-                print(f"[HaLinh] Gemini het quota (429) lan {quota_try + 1}/3 - "
-                      f"bao loa + nghi 60s roi thu lai.", flush=True)
+                print(f"[BeXinhChat] Gemini het quota ca chuoi "
+                      f"{model_chain} - bao ngay, khong treo 60s.", flush=True)
                 try:
-                    quota_wav = out_dir / f"halinh_quota_{int(time.time())}.wav"
+                    quota_wav = out_dir / f"be_xinh_quota_{int(time.time())}.wav"
                     tts.save_wav(
-                        "Hà Linh hết quota rồi, đợi một phút rồi Hà Linh trả lời.",
+                        "Bé Xinh đang hết lượt trả lời thông minh rồi. "
+                        "Bạn thử lại sau một chút nha.",
                         quota_wav)
                     talk(quota_wav)
                 except Exception as speak_error:  # noqa: BLE001
-                    print(f"[HaLinh] bao quota loi (van nghi 60s): "
+                    print(f"[BeXinhChat] bao quota loi: "
                           f"{speak_error}", flush=True)
-                time.sleep(60.0)
+                break
             if not think_ok:
                 clear_turn()
                 continue
             answer = result.get("answer", "")
             tool_s = result.get("tool_s", 0.0)
             if not answer:
-                print(f"[HaLinh] Gemini tra rong ({llm_s:.2f}s), ve cho.",
+                print(f"[BeXinhChat] Gemini tra rong ({llm_s:.2f}s), ve cho.",
                       flush=True)
                 clear_turn()
                 continue
-            print(f"[HaLinh] dap ({llm_s:.2f}s, tool {tool_s:.2f}s "
+            print(f"[BeXinhChat] dap ({llm_s:.2f}s, tool {tool_s:.2f}s "
                   f"{result.get('used', [])}): {answer}", flush=True)
 
             # -- SPEAK (loa camera P2P) --
             t0 = time.monotonic()
-            wav = out_dir / f"halinh_{int(time.time())}.wav"
-            tts.save_wav(answer, wav)
+            answer_key = hashlib.sha1(
+                f"{args.tts_voice}\0{answer}".encode("utf-8")
+            ).hexdigest()[:16]
+            wav = out_dir / f"be_xinh_answer_{answer_key}.wav"
+            if not wav.is_file():
+                tts.save_wav(answer, wav)
             tts_s = time.monotonic() - t0
             t0 = time.monotonic()
             talk(wav, channel)
             play_s = time.monotonic() - t0
-            print(f"[HaLinh] TTS {tts_s:.2f}s | loa {play_s:.2f}s | "
+            print(f"[BeXinhChat] TTS {tts_s:.2f}s | loa {play_s:.2f}s | "
                   f"VONG {time.monotonic() - total0:.1f}s.", flush=True)
             done_rounds += 1
             clear_turn()
     except KeyboardInterrupt:
-        print("\n[HaLinh] dung.", flush=True)
+        print("\n[BeXinhChat] dung.", flush=True)
     finally:
         try:
             clear_turn()
         except Exception:  # noqa: BLE001
             pass
+        zone_bridge_stop.set()
+        if zone_bridge_thread is not None:
+            zone_bridge_thread.join(timeout=3.0)
+        if direct_speaker is not None:
+            direct_speaker.close()
         p2p.close()
 
 

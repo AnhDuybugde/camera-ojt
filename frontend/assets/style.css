@@ -1057,6 +1057,7 @@ hr { border-color: var(--st-surface-high) !important; }
 .ds-table td {
   height: 66px;
   padding: 10px 18px;
+  overflow: hidden;
   color: #334155;
   background: #fff;
   border-bottom: 1px solid #e2e8f0;
@@ -1101,6 +1102,7 @@ hr { border-color: var(--st-surface-high) !important; }
 .ds-badge-list { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
 .ds-badge {
   min-height: 24px; display: inline-flex; align-items: center; justify-content: center;
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis;
   padding: 4px 8px; border: 1px solid; border-radius: 6px;
   font-size: 9px; font-weight: 700; line-height: 14px; white-space: nowrap;
 }
@@ -1314,13 +1316,24 @@ hr { border-color: var(--st-surface-high) !important; }
 .ws-hours { margin-left: auto; color: #94a3b8; }
 
 .st-key-ws_table {
-  overflow: hidden;
+  overflow-x: auto;
+  overflow-y: hidden;
   margin-bottom: 18px;
   background: #fff;
   border: 1px solid #e2e8f0;
   border-radius: 16px;
   box-shadow: 0 1px 3px rgba(15, 23, 42, .05);
 }
+.st-key-ws_table > div { min-width: 1220px; }
+.ws-registration-state {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  margin: 0 0 14px; padding: 12px 16px;
+  border: 1px solid #c7d2fe; border-radius: 12px;
+  background: #f8faff; color: #1e293b;
+}
+.ws-registration-state span { color: #64748b; font-size: 11px; font-weight: 700; letter-spacing: .04em; }
+.ws-registration-state strong { font-size: 14px; }
+.ws-registration-state em { margin-left: auto; color: #4338ca; font-size: 12px; font-style: normal; font-weight: 700; }
 .st-key-ws_table > div > [data-testid="stVerticalBlock"] { gap: 0 !important; }
 .st-key-ws_table [data-testid="stHorizontalBlock"] { gap: 8px !important; }
 .ws-employee-header, .ws-day-head { min-height: 96px; background: #f8fafc; }

@@ -67,6 +67,11 @@ os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
 import cv2
 import numpy as np
 
+from camera_tracking.audio import (
+    HandGestureDetector,
+    InteractionEngine,
+    ZoneEventObserver,
+)
 from camera_tracking.camera import FrameHub
 from camera_tracking.config import load_config
 from camera_tracking.detection import YoloPersonDetector, resolve_device
@@ -119,6 +124,13 @@ def normalize_source(src) -> int | str:
             return int(s)
         return s
     return src
+
+
+def _runtime_env_float(name: str, default: float, minimum: float) -> float:
+    try:
+        return max(minimum, float(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
 
 
 def _substream_fallback(source: str) -> str | None:
@@ -444,10 +456,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--channel-a", type=int, default=1, help="Kenh IMOU cho cam A.")
     parser.add_argument("--channel-b", type=int, default=2, help="Kenh IMOU cho cam B.")
     parser.add_argument(
-        "--subtype-a", type=int, default=0, choices=(0, 1), help="0=main, 1=sub stream."
+        "--subtype-a",
+        type=int,
+        default=1,
+        choices=(0, 1),
+        help="0=main, 1=sub stream (low latency).",
     )
     parser.add_argument(
-        "--subtype-b", type=int, default=0, choices=(0, 1), help="0=main, 1=sub stream."
+        "--subtype-b",
+        type=int,
+        default=1,
+        choices=(0, 1),
+        help="0=main, 1=sub stream (low latency).",
     )
     parser.add_argument("--display", action="store_true")
     parser.add_argument("--max-frames", type=int, default=None)
@@ -980,7 +1000,7 @@ def main() -> None:
         f"Camera B: {source_label(source_b)}"
     )
     if str(model_path).endswith(".engine"):
-        print("YOLO: TensorRT engine (FP16, batch A+B) — kỳ vọng ~150+ fps trên GPU.")
+        print("YOLO: TensorRT engine active (FP16, dynamic batch A+B).")
     else:
         print("YOLO: .pt cuda (chậm hơn engine ~3x) — export engine để tối ưu.")
 
@@ -1051,6 +1071,9 @@ def main() -> None:
     )
     try:
         embedder.load()
+        # Pay CUDA/cuDNN's one-time setup before the camera becomes live;
+        # otherwise the first person can freeze tracking for several seconds.
+        embedder.extract(np.zeros((256, 128, 3), dtype=np.uint8))
     except (ImportError, OSError, RuntimeError) as error:
         raise RuntimeError(
             "Production tracking requires OSNet; install the reid extra and "
@@ -1059,7 +1082,8 @@ def main() -> None:
     _reid_dev = getattr(embedder, "_device", None)
     print(f"ReID: OSNet {identity_cfg.reid_model} ({_reid_dev or identity_cfg.reid_device}, "
           f"FP16 cuda, event-driven: chỉ new/re-entry/cross-camera, "
-          f"refresh={identity_cfg.gallery_refresh_steps})")
+          f"refresh={identity_cfg.gallery_refresh_steps}, "
+          f"named_verify={identity_cfg.named_verify_steps})")
 
     # Mot GlobalIdentityManager dung chung cho ca 2 channel -> Global ID
     # xuyen tracklet, xuyen mat dau dai, xuyen channel.
@@ -1092,6 +1116,7 @@ def main() -> None:
             unresolved_keep_s=identity_cfg.unresolved_keep_s,
             min_gallery_confidence=identity_cfg.min_gallery_confidence,
             gallery_refresh_steps=identity_cfg.gallery_refresh_steps,
+            named_verify_steps=identity_cfg.named_verify_steps,
         ),
     )
     identity_store = DailyIdentityStore(
@@ -1179,6 +1204,7 @@ def main() -> None:
     use_face = bool(face_cfg.enabled and not args.no_face and face_cfg.channels)
     face_embedder = shared_face_embedder
     face_matcher = face_gallery = attendance = face_consumer = None
+    face_roster: list[dict[str, object]] = []
     face_model_lock = threading.Lock()
     enrollment_lock = threading.Lock()
     gid_to_person: dict[int, str] = {}
@@ -1228,6 +1254,17 @@ def main() -> None:
                 face_cfg.name_map,
                 face_cfg.employee_map,
             )
+            face_roster = [
+                {
+                    "person_id": person.employee_id or person.person_id,
+                    "person_name": person.display_name,
+                    "gallery_samples": (
+                        (1 if person.embedding is not None else 0)
+                        + len(person.prototypes)
+                    ),
+                }
+                for person in face_gallery.people
+            ]
             face_matcher = FaceMatcher(
                 face_gallery,
                 threshold=face_threshold,
@@ -1251,6 +1288,8 @@ def main() -> None:
                 channels=tuple(face_cfg.channels),
                 consensus_hits=face_cfg.consensus_hits,
                 consensus_window_s=face_cfg.consensus_window_s,
+                temporal_window=face_cfg.temporal_window,
+                temporal_min_samples=face_cfg.temporal_min_samples,
             )
             enrolled_by_employee = {
                 (person.employee_id or person.person_id): person
@@ -1544,6 +1583,31 @@ def main() -> None:
             print(f"Stream port {args.stream_port} busy, "
                   f"running without live stream.")
 
+    zone_config_path = Path(os.getenv(
+        "HAMY_ZONE_LABELS_PATH",
+        str(_PROJECT_ROOT.parent / "frontend" / "data" / "zone_labels.json"),
+    ))
+    zone_observer = ZoneEventObserver(
+        zone_config_path,
+        transition_dwell_s=_runtime_env_float(
+            "HAMY_ZONE_TRANSITION_DWELL_SECONDS", 0.25, 0.0),
+        door_transition_window_s=_runtime_env_float(
+            "HAMY_DOOR_TRANSITION_WINDOW_SECONDS", 8.0, 1.0),
+        event_ttl_s=_runtime_env_float(
+            "HAMY_ZONE_EVENT_TTL_SECONDS", 2.5, 1.0),
+    )
+    # Polygon labels are an operator/debug aid.  Keep the normal attendance
+    # stream clean; the zone editor renders these shapes independently.
+    zone_overlay_enabled = os.getenv(
+        "HAMY_ZONE_OVERLAY_ENABLED", "false"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    print(
+        f"Audio Zone Engine: {'enabled' if zone_observer.enabled else 'waiting'} "
+        f"| {zone_config_path} | "
+        f"A={len(zone_observer.zones['A'])}, B={len(zone_observer.zones['B'])} "
+        f"| overlay={'on' if zone_overlay_enabled else 'off'}"
+    )
+
     # --- Embedded supervisor cho dashboard (VITE_CONTROL_URL, :8766) ---
     # Gộp backend + supervisor vào 1 lệnh: chạy pipeline là dashboard có
     # ngay API status (Pipeline card). Tắt bằng --no-supervisor hoặc
@@ -1628,8 +1692,10 @@ def main() -> None:
     halinh_stop: threading.Event | None = None
     halinh_thread: threading.Thread | None = None
     if args.halinh:
-        halinh_script = (args.halinh_script
-                         or str(_PROJECT_ROOT / "scripts" / "halinh_assistant.py"))
+        halinh_script = (
+            args.halinh_script
+            or str(_PROJECT_ROOT / "scripts" / "be_xinh_assistant.py")
+        )
         if not Path(halinh_script).is_file():
             print(f"[HaLinh-sup] khong thay {halinh_script}, bo qua voice.")
         else:
@@ -1660,6 +1726,41 @@ def main() -> None:
     face_marks_a: list = []  # (x1,y1,x2,y2,score,known) for cam A overlay
     face_marks_b: list = []  # (x1,y1,x2,y2,score,known) for cam B overlay
     frame_hub = FrameHub()
+    # Bé Xinh consumes only compact status events. Gesture inference stays
+    # asynchronous and motion analysis reuses existing tracking boxes, so the
+    # sidecar never opens either RTSP stream a second time.
+    # Monocular proximity requires one camera-specific calibration point.
+    # Defaults are conservative: at the reference framing, a person whose
+    # box nearly fills the frame is approximately 0.5 m from the camera.
+    hamy_interaction = InteractionEngine(
+        distance_reference_m=_runtime_env_float(
+            "HAMY_DISTANCE_REFERENCE_METERS", 1.0, 0.10),
+        distance_reference_height_ratio=_runtime_env_float(
+            "HAMY_DISTANCE_REFERENCE_HEIGHT_RATIO", 0.45, 0.02),
+        greeting_distance_m=_runtime_env_float(
+            "HAMY_GREETING_DISTANCE_METERS", 0.50, 0.20),
+        distance_release_m=_runtime_env_float(
+            "HAMY_DISTANCE_RELEASE_METERS", 0.70, 0.25),
+        near_confirm_s=_runtime_env_float(
+            "HAMY_NEAR_CONFIRM_SECONDS", 0.25, 0.0),
+    )
+    hamy_gesture: HandGestureDetector | None = None
+    hamy_gesture_enabled = os.getenv("HAMY_GESTURE_ENABLED", "true").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    if hamy_gesture_enabled:
+        try:
+            hamy_gesture = HandGestureDetector.from_env()
+            if not hamy_gesture.available:
+                hamy_gesture.close()
+                hamy_gesture = None
+        except (ImportError, OSError, RuntimeError, ValueError) as error:
+            print(f"[Bé Xinh/Gesture] disabled: {error}")
+            hamy_gesture = None
+    hamy_gesture_cursor = 0
+    hamy_event_sequence = 0
+    hamy_gesture_events: deque[dict] = deque(maxlen=32)
+    hamy_motion_events: deque[dict] = deque(maxlen=32)
     from camera_tracking.evaluation import IdentityTraceWriter
     identity_trace = IdentityTraceWriter(args.identity_log)
     # Voice vay tay: mac dinh BAT (tat bang --no-greet); TTS cache + loa camera.
@@ -1989,19 +2090,13 @@ def main() -> None:
             _assignments = unique_face_assignments(
                 _fresh_rankings, threshold=float(face_threshold), limit=2)
 
-            # A live GID that lost a score conflict must immediately lose the
-            # stale bbox name. Never merge two simultaneously visible people
-            # merely because their Top-1 gallery candidate was identical.
-            for _ranked_gid in _fresh_rankings:
-                _chosen = _assignments.get(_ranked_gid)
-                _chosen_employee = (
-                    _chosen.employee_id if _chosen is not None else None)
-                _old_employee = gid_to_person.get(_ranked_gid)
-                if _old_employee and _old_employee != _chosen_employee:
-                    manager.unbind_employee(_ranked_gid)
-                    gid_to_person.pop(_ranked_gid, None)
-                    gid_to_display.pop(_ranked_gid, None)
-                    gid_to_score.pop(_ranked_gid, None)
+            # Do not change an existing employee label merely because one
+            # fresh ranking picked another face. A confirmed contradiction is
+            # handled below by splitting the local tracklet into a new GID;
+            # mutating the old GID would corrupt that person's history.
+            # Keep an old binding stable while the alternative candidate is
+            # accumulating consensus. Resetting its streak here would make a
+            # genuine contradiction impossible to confirm on the next frame.
 
             _assigned = _assignments.get(raw_gid)
             if _assigned is None:
@@ -2052,6 +2147,31 @@ def main() -> None:
                 or match.person.person_id
             )
             identity_gid = track.track_id
+            _current_employee = manager.employee_id_of(identity_gid)
+            if _current_employee not in (None, employee_id):
+                fresh_gid = manager.split_conflicting_tracklet(
+                    identity_gid,
+                    channel=channel,
+                    track=track,
+                    frame=frame,
+                    now_s=now_s,
+                )
+                if fresh_gid is None:
+                    print(
+                        f"[Identity conflict] refused {employee_id} -> "
+                        f"G{identity_gid}; tracklet could not be split"
+                    )
+                    return
+                print(
+                    f"[Identity split] G{identity_gid} kept "
+                    f"{_current_employee}; tracklet moved to G{fresh_gid} "
+                    f"for {employee_id}"
+                )
+                face_assignment_streaks.pop(identity_gid, None)
+                gid_to_face_candidates.pop(identity_gid, None)
+                gid_to_face_rankings.pop(identity_gid, None)
+                gid_face_ranking_at.pop(identity_gid, None)
+                identity_gid = fresh_gid
             # The joint score resolver is authoritative. If an older GID was
             # provisionally holding this name, release it; do not merge two
             # people who are simultaneously visible in the same room.
@@ -2067,12 +2187,6 @@ def main() -> None:
                 gid_to_person.pop(conflict_gid, None)
                 gid_to_display.pop(conflict_gid, None)
                 gid_to_score.pop(conflict_gid, None)
-            _current_employee = manager.employee_id_of(identity_gid)
-            if _current_employee not in (None, employee_id):
-                manager.unbind_employee(identity_gid)
-                gid_to_person.pop(identity_gid, None)
-                gid_to_display.pop(identity_gid, None)
-                gid_to_score.pop(identity_gid, None)
             if not manager.bind_employee(identity_gid, employee_id):
                 print(f"[Identity conflict] refused {employee_id} -> G{identity_gid}")
                 return
@@ -2606,6 +2720,7 @@ def main() -> None:
 
     try:
         while True:
+            loop_started_perf = time.perf_counter()
             now_s = time.time() - start
             local_day = datetime.now().astimezone().date().isoformat()
             if local_day != current_identity_day:
@@ -2616,6 +2731,7 @@ def main() -> None:
                     business_a.forget(gid)
                     business_b.forget(gid)
                 manager.reset_for_new_day()
+                zone_observer.reset()
                 identity_store.load(local_day, manager)
                 gid_to_person.clear()
                 gid_to_display.clear()
@@ -2635,6 +2751,7 @@ def main() -> None:
                 foreground_by_channel.update({"A": None, "B": None})
                 if face_worker is not None:
                     face_worker.forget_retired(set())
+                hamy_interaction.forget_global_ids(set())
                 for _det in list(gesture_detectors.values()):
                     try:
                         _det.forget_retired(set())
@@ -2711,13 +2828,89 @@ def main() -> None:
                         )
                     ]
                     identity_inputs[channel] = (frame, local_tracks)
-                global_tracks = manager.update_batch(identity_inputs, now_s=now_s)
+                with metrics.measure("identity"):
+                    global_tracks = manager.update_batch(identity_inputs, now_s=now_s)
                 confirmed_a = global_tracks.get("A", [])
                 confirmed_b = global_tracks.get("B", [])
+                _zone_wall_time = time.time()
+                for _zone_channel, _zone_frame, _zone_tracks in (
+                    ("A", frame_a if ret_a else None, confirmed_a),
+                    ("B", frame_b if ret_b else None, confirmed_b),
+                ):
+                    if _zone_frame is not None:
+                        zone_observer.observe_tracks(
+                            _zone_channel,
+                            _zone_tracks,
+                            _zone_frame.shape,
+                            now_s=now_s,
+                            wall_time_s=_zone_wall_time,
+                            aliases=gid_alias,
+                            person_ids=gid_to_person,
+                            display_names=gid_to_display,
+                        )
                 foreground_by_channel["A"] = foreground_selectors["A"].update(
                     confirmed_a, now_s)
                 foreground_by_channel["B"] = foreground_selectors["B"].update(
                     confirmed_b, now_s)
+
+                for _channel, _frame, _tracks in (
+                    ("A", frame_a if ret_a else None, confirmed_a),
+                    ("B", frame_b if ret_b else None, confirmed_b),
+                ):
+                    if _frame is None:
+                        continue
+                    for _event in hamy_interaction.observe_tracks(
+                        _channel, _tracks, _frame.shape, now_s
+                    ):
+                        hamy_event_sequence += 1
+                        hamy_motion_events.append({
+                            "seq": hamy_event_sequence,
+                            "kind": _event.kind,
+                            "channel": _event.channel,
+                            "gid": _event.global_id,
+                            "confidence": round(float(_event.confidence), 3),
+                            "at_s": now_s,
+                        })
+
+                if hamy_gesture is not None:
+                    for _event in hamy_gesture.poll():
+                        hamy_event_sequence += 1
+                        hamy_gesture_events.append({
+                            "seq": hamy_event_sequence,
+                            "kind": _event.kind,
+                            "channel": _event.channel,
+                            "gid": _event.global_id,
+                            "confidence": round(float(_event.confidence), 3),
+                            "at_s": now_s,
+                        })
+                        print(
+                            f"[Bé Xinh/Gesture] {_event.kind} "
+                            f"G{_event.global_id} camera {_event.channel} "
+                            f"({float(_event.confidence):.2f})"
+                        )
+
+                    _gesture_candidates = [
+                        item
+                        for item in (
+                            ("A", frame_a if ret_a else None, confirmed_a),
+                            ("B", frame_b if ret_b else None, confirmed_b),
+                        )
+                        if item[1] is not None and item[2]
+                    ]
+                    if _gesture_candidates:
+                        _start = hamy_gesture_cursor % len(_gesture_candidates)
+                        _ordered = (
+                            _gesture_candidates[_start:]
+                            + _gesture_candidates[:_start]
+                        )
+                        for _channel, _frame, _tracks in _ordered:
+                            if hamy_gesture.submit(
+                                _channel, _frame, _tracks, now_s
+                            ):
+                                hamy_gesture_cursor = (
+                                    hamy_gesture_cursor + 1
+                                ) % len(_gesture_candidates)
+                                break
                 if ret_a and frame_a is not None:
                     last_tracks_a = confirmed_a
                     count_a.update(len(confirmed_a))
@@ -3176,10 +3369,13 @@ def main() -> None:
                                                   f"vẫy lại sau ít giây")
 
             # --- Live view: annotated Global-ID frames for window/stream ---
+            visualization_started = time.perf_counter()
             need_vis = args.display or stream_on
             vis_a = vis_b = None
             if ret_a and frame_a is not None and need_vis:
                 vis_a = frame_a.copy()
+                if zone_overlay_enabled:
+                    zone_observer.draw_overlay(vis_a, "A")
                 draw_person_tracks(vis_a, last_tracks_a, display_count=count_a.value,
                                    title="Global", status=room_status_now)
                 draw_global_labels(
@@ -3212,6 +3408,8 @@ def main() -> None:
                         )
             if ret_b and frame_b is not None and need_vis:
                 vis_b = frame_b.copy()
+                if zone_overlay_enabled:
+                    zone_observer.draw_overlay(vis_b, "B")
                 draw_person_tracks(vis_b, last_tracks_b, display_count=count_b.value,
                                    title="Global", status=room_status_now)
                 draw_global_labels(
@@ -3249,6 +3447,9 @@ def main() -> None:
                 if vis_b is not None:
                     cv2.imshow("Channel B - tracking", vis_b)
                     window_b_shown = True
+            metrics.observe(
+                "visualization", time.perf_counter() - visualization_started
+            )
             if stream_on:
                 with metrics.measure("rendering"):
                     if jpeg_renderer is not None:
@@ -3257,9 +3458,64 @@ def main() -> None:
                         if vis_b is not None:
                             jpeg_renderer.submit("cam_b", vis_b)
                 if process_frame:
+                    stationary_for_by_gid: dict[int, float] = {}
+                    proximity_by_gid: dict[
+                        int, tuple[bool, float | None, float]
+                    ] = {}
+                    for _snapshot in hamy_interaction.snapshots():
+                        _status_gid = gid_alias.get(
+                            _snapshot.global_id, _snapshot.global_id)
+                        if (
+                            _snapshot.stationary
+                            and _snapshot.stationary_since_s is not None
+                        ):
+                            _duration = max(
+                                0.0, now_s - _snapshot.stationary_since_s)
+                            stationary_for_by_gid[_status_gid] = max(
+                                stationary_for_by_gid.get(_status_gid, 0.0),
+                                _duration,
+                            )
+                        _previous_proximity = proximity_by_gid.get(_status_gid)
+                        _distance = _snapshot.estimated_distance_m
+                        if _previous_proximity is None:
+                            proximity_by_gid[_status_gid] = (
+                                bool(_snapshot.near_camera),
+                                _distance,
+                                _snapshot.box_height_ratio,
+                            )
+                        else:
+                            _previous_distance = _previous_proximity[1]
+                            _nearest_distance = (
+                                _distance
+                                if _previous_distance is None
+                                else _previous_distance
+                                if _distance is None
+                                else min(_previous_distance, _distance)
+                            )
+                            proximity_by_gid[_status_gid] = (
+                                _previous_proximity[0]
+                                or bool(_snapshot.near_camera),
+                                _nearest_distance,
+                                max(
+                                    _previous_proximity[2],
+                                    _snapshot.box_height_ratio,
+                                ),
+                            )
                     live_people = []
+                    _visible_a = {track.track_id for track in last_tracks_a}
+                    _visible_b = {track.track_id for track in last_tracks_b}
                     for gid, st in sorted(room_status_now.items()):
                         identity = manager.identities.get(gid)
+                        _channels_now = [
+                            channel for channel, visible in (
+                                ("A", gid in _visible_a),
+                                ("B", gid in _visible_b),
+                            ) if visible
+                        ]
+                        _last_seen_ago = (
+                            max(0.0, now_s - identity.last_seen_s)
+                            if identity is not None else None
+                        )
                         live_people.append({
                             "gid": gid,
                             "person_id": gid_to_person.get(gid),
@@ -3278,17 +3534,46 @@ def main() -> None:
                                 {"name": name, "score": score}
                                 for name, score in gid_to_face_candidates.get(gid, [])[:2]
                             ],
-                            "camera": identity.channel if identity else None,
+                            "camera": "+".join(_channels_now) or (
+                                identity.channel if identity else None
+                            ),
+                            "visible": bool(_channels_now),
+                            "last_seen_ago_s": (
+                                round(_last_seen_ago, 2)
+                                if _last_seen_ago is not None else None
+                            ),
                             "cameras": (
                                 sorted(identity.sightings) if identity else []
                             ),
                             "tracking_state": (
-                                identity.state.value if identity else None
+                                "ACTIVE" if _channels_now else (
+                                    identity.state.value if identity else None
+                                )
                             ),
                             "foreground_cameras": [
                                 channel for channel in ("A", "B")
                                 if foreground_by_channel.get(channel) == gid
                             ],
+                            "stationary_for_s": (
+                                round(stationary_for_by_gid[gid], 2)
+                                if gid in stationary_for_by_gid
+                                else None
+                            ),
+                            "near_camera": proximity_by_gid.get(
+                                gid, (False, None, 0.0))[0],
+                            "estimated_distance_m": (
+                                round(proximity_by_gid[gid][1], 2)
+                                if (
+                                    gid in proximity_by_gid
+                                    and proximity_by_gid[gid][1] is not None
+                                )
+                                else None
+                            ),
+                            "person_height_ratio": (
+                                round(proximity_by_gid[gid][2], 3)
+                                if gid in proximity_by_gid
+                                else None
+                            ),
                         })
                     attendance_today = [] if attendance is None else [
                         {
@@ -3304,11 +3589,24 @@ def main() -> None:
                     ]
                     streamer.set_status({
                         "people": live_people,
+                        "employee_roster": face_roster,
                         "attendance_today": attendance_today,
                         "recent_events": list(recent_events),
                         "pending_attendance": pending_attendance(),
                         "count_a": count_a.value,
                         "count_b": count_b.value,
+                        "audio_events": zone_observer.active_events(now_s),
+                        "zone_status": zone_observer.status(),
+                        "gesture_events": [
+                            dict(event)
+                            for event in hamy_gesture_events
+                            if now_s - float(event["at_s"]) <= 12.0
+                        ],
+                        "motion_events": [
+                            dict(event)
+                            for event in hamy_motion_events
+                            if now_s - float(event["at_s"]) <= 12.0
+                        ],
                     })
 
             # Cau runtime cho voice Ha Linh BAN CAMERA (2s/lan): dem nguoi,
@@ -3340,6 +3638,7 @@ def main() -> None:
             if args.metrics_log_s > 0 and now_s - last_metrics_log_s >= args.metrics_log_s:
                 last_metrics_log_s = now_s
                 print(f"[Metrics] {metrics.snapshot()}")
+            metrics.observe("loop_total", time.perf_counter() - loop_started_perf)
             frame_idx += 1
             if args.max_frames is not None and frame_idx >= args.max_frames:
                 break
@@ -3357,6 +3656,8 @@ def main() -> None:
             write_worker.stop()
         except Exception as error:  # noqa: BLE001
             print(f"Flush cuoi loi (da giu trong queue): {error}")
+        if hamy_gesture is not None:
+            hamy_gesture.close()
         if jpeg_renderer is not None:
             jpeg_renderer.stop()
         if streamer is not None:

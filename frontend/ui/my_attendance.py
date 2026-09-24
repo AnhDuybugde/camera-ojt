@@ -3,6 +3,7 @@ from datetime import date, datetime, timedelta
 from html import escape
 import streamlit as st
 from auth.permissions import require_owner
+from attendance.schedule_policy import get_next_week_range, get_week_schedule_completion
 
 
 def _time(value):
@@ -25,13 +26,30 @@ def render(db, role):
     st.markdown('<div class="ws-page-head"><div><div class="ws-title-line"><h1>Chấm công của tôi</h1>'
                 '<span class="ws-standard"><span></span>Cá nhân</span></div>'
                 f'<p>{escape(employee["full_name"])} · {escape(owner)} — Theo dõi điểm danh hôm nay và lịch sử chấm công của bạn.</p></div></div>', unsafe_allow_html=True)
+    next_start, next_end = get_next_week_range(today)
+    next_rows = db.list_work_schedules(next_start.isoformat(), next_end.isoformat(), employee_id=owner)
+    completion = get_week_schedule_completion(next_rows, owner, next_start)
+    if completion.status == "COMPLETE":
+        st.success("Lịch làm việc tuần sau đã hoàn tất (5/5 ngày).")
+    elif today.weekday() == 4:
+        st.warning(f"Hôm nay là hạn cuối đăng ký lịch tuần sau ({completion.registered_days}/5 ngày).")
+    elif today.weekday() >= 5:
+        st.info(f"Đã hết hạn đăng ký lịch tuần sau ({completion.registered_days}/5 ngày). Liên hệ Quản trị viên nếu cần điều chỉnh.")
+    else:
+        st.warning(f"Bạn chưa hoàn tất lịch tuần sau: {completion.registered_days}/5 ngày đã đăng ký.")
     records = db.list_attendance(today.isoformat(), today.isoformat(), employee_id=owner)
     record = records[0] if records else {}
     checked_in, checked_out = bool(record.get("check_in")), bool(record.get("check_out"))
     message = ("Đã ghi nhận CHECK-IN và CHECK-OUT hôm nay." if checked_in and checked_out
+               else "Đang check-out tạm thời; trạng thái đi muộn/đúng giờ được giữ nguyên."
+               if record.get("presence_status") == "TEMP_CHECKOUT"
+               else "Đang vắng khỏi văn phòng sau check-out tạm thời."
+               if checked_in and record.get("presence_status") == "ABSENT"
                else "Đã điểm danh CHECK-IN thành công hôm nay." if checked_in
+               else "Vắng mặt: chưa check-in trước hạn." if record.get("status") == "ABSENT"
+               else "Đang chờ chấm công theo lịch ON." if record.get("status") == "WAITING"
                else "Chưa ghi nhận CHECK-IN hôm nay.")
-    tone = "on" if checked_in else "empty"
+    tone = "on" if checked_in else "off" if record.get("status") == "ABSENT" else "empty"
     initials = ''.join(word[0] for word in employee["full_name"].split()[-2:]).upper()
     identity = (f'<div class="pa-person"><span class="pa-avatar">{escape(initials)}</span><div>'
                 f'<b>{escape(employee["full_name"])}</b><small>{escape(employee.get("position") or "Nhân viên")}</small>'
@@ -45,7 +63,7 @@ def render(db, role):
                 '<th>Nhân viên</th><th>Giờ vào · CHECK-IN</th><th>Giờ ra · CHECK-OUT</th><th>Ghi nhận hôm nay</th>'
                 f'</tr></thead><tbody><tr><td>{identity}</td><td>{time_cell(record.get("check_in"))}</td>'
                 f'<td>{time_cell(record.get("check_out"))}</td><td><span class="ws-legend-{tone}">'
-                f'{"Đã CHECK-IN / OUT" if checked_in and checked_out else "Đã CHECK-IN" if checked_in else "Chưa CHECK-IN"}</span></td></tr></tbody></table></div>'
+                f'{"Đã CHECK-IN / OUT" if checked_in and checked_out else "Check-out tạm thời" if record.get("presence_status") == "TEMP_CHECKOUT" else "Đang vắng khỏi văn phòng" if checked_in and record.get("presence_status") == "ABSENT" else "Đã CHECK-IN" if checked_in else "Vắng mặt" if record.get("status") == "ABSENT" else "Chờ chấm công" if record.get("status") == "WAITING" else "Chưa CHECK-IN"}</span></td></tr></tbody></table></div>'
                 f'<div class="pa-footer"><i class="bi bi-info-circle"></i> {message}</div></div>', unsafe_allow_html=True)
     with st.container(key="pa_toolbar"):
         left, right, refresh = st.columns([1, 1, .8])
@@ -62,10 +80,14 @@ def render(db, role):
         st.warning("Ngày bắt đầu phải trước hoặc bằng ngày kết thúc.")
         return
     rows = db.list_attendance(start.isoformat(), end.isoformat(), employee_id=owner)
-    statuses = {"ON_TIME": ("Đúng giờ", "on"), "LATE": ("Đi muộn", "off"), "EARLY_LEAVE": ("Về sớm", "off"), "ABSENT": ("Vắng", "empty"), "LATE_EARLY": ("Muộn / về sớm", "off")}
+    statuses = {"ON_TIME": ("Đúng giờ", "on"), "LATE": ("Đi muộn", "off"), "EARLY_LEAVE": ("Về sớm", "off"), "ABSENT": ("Vắng mặt", "off"), "WAITING": ("Chờ chấm công", "empty"), "LATE_EARLY": ("Muộn / về sớm", "off")}
     body = []
     for row in rows:
         label, color = statuses.get(row["status"], (row["status"], "empty"))
+        if row.get("presence_status") == "TEMP_CHECKOUT":
+            label += " · Check-out tạm thời"
+        elif row.get("presence_status") == "ABSENT" and row.get("check_in"):
+            label += " · Đang vắng khỏi văn phòng"
         day = date.fromisoformat(row["date"]).strftime("%d/%m/%Y")
         work_day = date.fromisoformat(row["date"])
         weekday = "Chủ nhật" if work_day.weekday() == 6 else f"Thứ {work_day.weekday() + 2}"

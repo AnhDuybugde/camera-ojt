@@ -15,6 +15,7 @@ from config import settings
 from database.db import Database
 from face.detector import FaceDetector
 from face.recognizer import FaceRecognizer
+from spatial.activity_rules import ACTIVITY_LABELS, ActivityType
 from spatial.business_analytics import (
     attendance_flow, attendance_frame, filter_spatial_events, gate_flow,
     occupancy_timeline, peak,
@@ -33,7 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @st.cache_resource
 def _repository() -> SpatialRepository:
-    return SpatialRepository(ROOT / "data" / "spatial_analytics.db")
+    return SpatialRepository(ROOT / "data" / "spatial_analytics.db", database_url=settings.database_url)
 
 
 @st.cache_resource
@@ -106,6 +107,9 @@ def render(
     visit_rows = _filter_timestamp_rows(
         repository.visit_rows(since), "entered_at", start_day, end_day,
     )
+    activity_rows = _filter_timestamp_rows(
+        repository.activity_rows(since, limit=5000), "started_at", start_day, end_day,
+    )
     flow = attendance_flow(attendance, bucket_minutes)
     physical_flow = gate_flow(transitions, bucket_minutes)
     allowed_employee_ids = {
@@ -121,8 +125,8 @@ def render(
     _summary_kpis(attendance, flow, engines)
     _insight_strip(attendance, flow, density_rows, zones, engines)
 
-    people_tab, presence_tab, space_tab, anomaly_tab = st.tabs([
-        "Dòng người", "Hiện diện", "Không gian", "Bất thường",
+    people_tab, presence_tab, space_tab, activity_tab, anomaly_tab = st.tabs([
+        "Dòng người", "Hiện diện", "Không gian", "Hoạt động", "Bất thường",
     ])
     with people_tab:
         _people_flow_tab(attendance, flow, physical_flow, bucket_minutes)
@@ -133,6 +137,8 @@ def render(
         )
     with space_tab:
         _space_tab(engines, zones, density_rows, transitions, visit_rows)
+    with activity_tab:
+        _activity_tab(activity_rows)
     with anomaly_tab:
         _anomaly_tab(attendance, anomaly_transitions, engines, end_day)
 
@@ -338,6 +344,59 @@ def _space_tab(
     else:
         st.info("Nhấn “Bắt đầu phân tích” để thu thập mật độ và luồng vùng từ camera.")
     _space_history(density_rows, transitions, visits, zones)
+
+
+def _activity_tab(rows: list[dict]) -> None:
+    section_header(
+        "Phân bổ trạng thái quan sát",
+        "Ước lượng theo pose, vị trí và thời gian; không phải điểm năng suất hay đánh giá nhân viên",
+    )
+    if not rows:
+        st.info("Chưa có activity event. Hãy bật Camera điểm danh trực tiếp để bắt đầu phân tích.")
+        return
+    frame = pd.DataFrame(rows)
+    frame["started_at"] = pd.to_datetime(frame["started_at"], errors="coerce")
+    frame["ended_at"] = pd.to_datetime(frame["ended_at"], errors="coerce")
+    now = pd.Timestamp.now(tz=frame["started_at"].dt.tz)
+    inferred = (frame["ended_at"].fillna(now) - frame["started_at"]).dt.total_seconds()
+    frame["duration_seconds"] = pd.to_numeric(frame["duration_seconds"], errors="coerce").fillna(inferred)
+    labels = {item.value: label for item, label in ACTIVITY_LABELS.items()}
+    frame["Trạng thái"] = frame["activity_type"].map(labels).fillna("Không xác định")
+    frame["Nhân viên"] = frame["employee_name"].fillna("Chưa xác định")
+    grouped = frame.groupby(["Nhân viên", "Trạng thái"], as_index=False)["duration_seconds"].sum()
+    grouped["Phút"] = (grouped["duration_seconds"] / 60).round(1)
+    chart = (
+        alt.Chart(grouped)
+        .mark_bar(cornerRadiusEnd=4)
+        .encode(
+            x=alt.X("Phút:Q", title="Thời lượng quan sát (phút)"),
+            y=alt.Y("Nhân viên:N", title=None, sort="-x"),
+            color=alt.Color("Trạng thái:N", legend=alt.Legend(orient="top")),
+            tooltip=["Nhân viên:N", "Trạng thái:N", "Phút:Q"],
+        ).properties(height=max(240, min(520, grouped["Nhân viên"].nunique() * 42)))
+    )
+    st.altair_chart(chart, width="stretch")
+    recent = frame.sort_values("started_at", ascending=False).head(100)
+    data_table(
+        [
+            TableColumn("time", "Bắt đầu", 160),
+            TableColumn("employee", "Nhân viên", 190),
+            TableColumn("activity", "Trạng thái", 180),
+            TableColumn("duration", "Thời lượng", 100, "center"),
+            TableColumn("camera", "Camera", 150),
+        ],
+        [{
+            "time": row["started_at"].strftime("%d/%m/%Y %H:%M:%S"),
+            "employee": row["Nhân viên"],
+            "activity": status_badge(
+                row["Trạng thái"],
+                "warning" if row["activity_type"] in {"SLEEPING_SUSPECTED", "AWAY"} else "info",
+            ),
+            "duration": f'{max(0, float(row["duration_seconds"])) / 60:.1f} phút',
+            "camera": row["camera_id"],
+        } for _, row in recent.iterrows()],
+        compact=True, max_height=420,
+    )
 
 
 def _anomaly_tab(

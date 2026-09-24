@@ -46,9 +46,11 @@ class SheetsClient:
         worksheet = self.connect()
         values = [
             record["employee_id"], record["employee_name"], record.get("department", ""),
-            record["date"], _clock(record.get("check_in")), _clock(record.get("check_out")), record["status"],
+            record["date"], _clock(record.get("check_in")), _clock(record.get("check_out")),
+            {"WAITING": "Chờ chấm công", "ON_TIME": "Đúng giờ", "LATE": "Đi muộn",
+             "ABSENT": "Vắng mặt"}.get(record["status"], record["status"]),
         ]
-        # Employee ID + date form the same unique key as SQLite.
+        # Employee ID + date form the same unique key as the source database.
         rows = worksheet.get_all_values()
         target = next(
             (index for index, row in enumerate(rows[1:], start=2)
@@ -65,4 +67,3 @@ def _clock(value: str | None) -> str:
     if not value:
         return ""
     return value.split("T", 1)[-1][:8]
-

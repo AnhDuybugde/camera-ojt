@@ -1,4 +1,4 @@
-"""Separate SQLite store for spatial analytics; attendance data is never mutated."""
+"""Spatial event repository; PostgreSQL in production, SQLite for local use."""
 from __future__ import annotations
 
 import sqlite3
@@ -7,6 +7,10 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator
+
+from sqlalchemy import create_engine
+
+from database.postgres import ConnectionAdapter, metadata
 
 
 def local_now() -> datetime:
@@ -18,13 +22,21 @@ def iso(value: datetime | None = None) -> str:
 
 
 class SpatialRepository:
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, database_url: str = "") -> None:
+        self.database_url = database_url.strip()
+        self.is_postgres = self.database_url.startswith("postgresql+psycopg://")
+        if self.database_url and not self.is_postgres:
+            raise ValueError("Spatial database_url must use postgresql+psycopg://")
+        self._engine = create_engine(self.database_url, pool_pre_ping=True) if self.is_postgres else None
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.is_postgres:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self.initialize()
 
-    def connect(self) -> sqlite3.Connection:
+    def connect(self):
+        if self.is_postgres:
+            return self._postgres_connection()
         conn = sqlite3.connect(self.path, timeout=20, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
@@ -32,7 +44,18 @@ class SpatialRepository:
         return conn
 
     @contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
+    def _postgres_connection(self):
+        assert self._engine is not None
+        with self._engine.connect() as conn:
+            yield ConnectionAdapter(conn)
+
+    @contextmanager
+    def transaction(self) -> Iterator[object]:
+        if self.is_postgres:
+            assert self._engine is not None
+            with self._engine.begin() as conn:
+                yield ConnectionAdapter(conn)
+            return
         with self._lock, self.connect() as conn:
             try:
                 yield conn
@@ -42,6 +65,10 @@ class SpatialRepository:
                 raise
 
     def initialize(self) -> None:
+        if self.is_postgres:
+            assert self._engine is not None
+            metadata.create_all(self._engine)
+            return
         with self.transaction() as conn:
             conn.executescript(
                 """
@@ -78,6 +105,24 @@ class SpatialRepository:
                     dwell_seconds REAL NOT NULL CHECK(dwell_seconds >= 0)
                 );
                 CREATE INDEX IF NOT EXISTS idx_visits_time ON zone_visits(entered_at DESC);
+                CREATE TABLE IF NOT EXISTS activity_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    employee_id TEXT,
+                    employee_name TEXT NOT NULL DEFAULT 'Chưa xác định',
+                    camera_id TEXT NOT NULL,
+                    track_id INTEGER NOT NULL,
+                    activity_type TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT,
+                    duration_seconds REAL,
+                    confidence REAL NOT NULL,
+                    zone TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_activity_events_time
+                    ON activity_events(started_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_activity_events_employee
+                    ON activity_events(employee_id, started_at DESC);
                 """
             )
 
@@ -130,6 +175,83 @@ class SpatialRepository:
     def visit_rows(self, since: datetime) -> list[dict]:
         return self._rows(
             "SELECT * FROM zone_visits WHERE entered_at>=? ORDER BY entered_at DESC", (iso(since),)
+        )
+
+    def transition_activity(
+        self, camera_id: str, track_id: int, employee_id: str | None,
+        employee_name: str, activity_type: str, confidence: float,
+        zone: str | None, at: datetime | None = None,
+    ) -> None:
+        """Close the previous event and create exactly one row for a transition."""
+        changed_at = at or local_now()
+        changed_iso = iso(changed_at)
+        with self.transaction() as conn:
+            open_row = conn.execute(
+                """SELECT id,started_at,activity_type FROM activity_events
+                   WHERE camera_id=? AND track_id=? AND ended_at IS NULL
+                   ORDER BY started_at DESC LIMIT 1""",
+                (camera_id, track_id),
+            ).fetchone()
+            if open_row and open_row["activity_type"] == activity_type:
+                conn.execute(
+                    """UPDATE activity_events SET employee_id=?,employee_name=?,confidence=?,zone=?
+                       WHERE id=?""",
+                    (employee_id, employee_name, float(confidence), zone, open_row["id"]),
+                )
+                return
+            if open_row:
+                started_at = datetime.fromisoformat(str(open_row["started_at"]))
+                if started_at.tzinfo is None and changed_at.tzinfo is not None:
+                    started_at = started_at.replace(tzinfo=changed_at.tzinfo)
+                duration = max(0.0, (changed_at - started_at).total_seconds())
+                conn.execute(
+                    "UPDATE activity_events SET ended_at=?,duration_seconds=? WHERE id=?",
+                    (changed_iso, duration, open_row["id"]),
+                )
+            # Short UNKNOWN flicker is useful in live UI but not useful storage.
+            if activity_type != "UNKNOWN":
+                conn.execute(
+                    """INSERT INTO activity_events
+                       (employee_id,employee_name,camera_id,track_id,activity_type,started_at,
+                        ended_at,duration_seconds,confidence,zone,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (employee_id, employee_name, camera_id, track_id, activity_type,
+                     changed_iso, None, None, float(confidence), zone, changed_iso),
+                )
+
+    def close_activity(self, camera_id: str, track_id: int, at: datetime | None = None) -> None:
+        ended_at = at or local_now()
+        with self.transaction() as conn:
+            row = conn.execute(
+                """SELECT id,started_at FROM activity_events
+                   WHERE camera_id=? AND track_id=? AND ended_at IS NULL
+                   ORDER BY started_at DESC LIMIT 1""",
+                (camera_id, track_id),
+            ).fetchone()
+            if not row:
+                return
+            started_at = datetime.fromisoformat(str(row["started_at"]))
+            if started_at.tzinfo is None and ended_at.tzinfo is not None:
+                started_at = started_at.replace(tzinfo=ended_at.tzinfo)
+            conn.execute(
+                "UPDATE activity_events SET ended_at=?,duration_seconds=? WHERE id=?",
+                (iso(ended_at), max(0.0, (ended_at - started_at).total_seconds()), row["id"]),
+            )
+
+    def bind_activity_identity(
+        self, camera_id: str, track_id: int, employee_id: str, employee_name: str,
+    ) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                """UPDATE activity_events SET employee_id=?,employee_name=?
+                   WHERE camera_id=? AND track_id=? AND ended_at IS NULL""",
+                (employee_id, employee_name, camera_id, track_id),
+            )
+
+    def activity_rows(self, since: datetime, limit: int = 1000) -> list[dict]:
+        return self._rows(
+            """SELECT * FROM activity_events WHERE started_at>=?
+               ORDER BY started_at DESC LIMIT ?""", (iso(since), limit),
         )
 
     def _rows(self, query: str, params: tuple) -> list[dict]:

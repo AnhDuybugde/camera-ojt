@@ -1,4 +1,4 @@
-"""Retryable SQLite-to-Sheets synchronization."""
+"""Retryable database-to-Sheets reporting mirror."""
 from __future__ import annotations
 
 import logging
@@ -39,12 +39,12 @@ class SyncService:
         for record in pending:
             try:
                 self.client.upsert_attendance(record)
-                self.db.mark_synced(record["id"])
+                self.db.mark_synced(record["id"], record["updated_at"])
                 synced += 1
                 logger.info("Google Sheets synced attendance id=%s", record["id"])
             except Exception as exc:
                 failed += 1
-                self.db.mark_sync_error(record["id"])
+                self.db.mark_sync_error(record["id"], record["updated_at"])
                 logger.warning("Google Sheets sync failed for id=%s: %s", record["id"], exc)
         return SyncResult(synced, failed, f"Synced {synced}; failed {failed}.")
 

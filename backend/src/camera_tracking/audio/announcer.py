@@ -202,11 +202,7 @@ class CameraCheckInAnnouncer:
         if muted:
             self._muted.set()
             self._discard_live_requests()
-            with self._talk_process_lock:
-                process = self._talk_process
-            if process is not None and process.poll() is None:
-                process.kill()
-            self._speaking.clear()
+            self.cancel_playback()
             print("[Bé Xinh] muted from dashboard.")
         else:
             self._muted.clear()
@@ -345,6 +341,9 @@ class CameraCheckInAnnouncer:
         if self._closed.is_set():
             return
         self._closed.set()
+        # Synchronous voice-chat playback bypasses the queue worker. Stop its
+        # VisualTalk child too so shutdown is immediate.
+        self.cancel_playback()
         try:
             self._queue.put_nowait(
                 SpeechRequest(
@@ -359,6 +358,31 @@ class CameraCheckInAnnouncer:
         except Full:
             pass
         self._thread.join(timeout=10.0)
+
+    def cancel_playback(self) -> None:
+        """Immediately stop the active VisualTalk helper, if any."""
+        with self._talk_process_lock:
+            process = self._talk_process
+        if process is not None and process.poll() is None:
+            process.kill()
+        self._speaking.clear()
+
+    def play_file_sync(self, audio_path: str | Path) -> None:
+        """Play one existing WAV/audio file through direct LAN VisualTalk.
+
+        Voice chat already owns TTS generation, so this bypasses the queued
+        companion scheduler while reusing its proven PCM conversion and IMOU
+        direct-talk transport. It is intentionally synchronous so callers can
+        enforce half-duplex microphone guards precisely.
+        """
+        if self._closed.is_set() or self._muted.is_set():
+            raise RuntimeError("Bé Xinh direct speaker is unavailable")
+        pcm = self._wav_to_pcm(Path(audio_path))
+        self._speaking.set()
+        try:
+            self._play_pcm(pcm)
+        finally:
+            self._speaking.clear()
 
     def _run(self) -> None:
         # Production runtime is cache-first. Do NOT load ZeroTTS here: YOLO +
@@ -430,12 +454,42 @@ class CameraCheckInAnnouncer:
                     )
                     continue
 
+                # Voice chat has priority over proactive zone speech.  Check
+                # again immediately before playback because a user may wake
+                # Bé Xinh after this request was queued.
+                from camera_tracking.voice.turn_guard import turn_active
+                if turn_active():
+                    print("[Bé Xinh] zone speech skipped: voice chat is active")
+                    continue
+
+                from camera_tracking.voice.speaker_guard import (
+                    mark_speaker_busy,
+                    speaker_busy,
+                )
+                while speaker_busy() and not self._closed.is_set():
+                    if turn_active():
+                        break
+                    if (
+                        request.expires_s is not None
+                        and time.monotonic() - request.created_s > request.expires_s
+                    ):
+                        break
+                    time.sleep(0.10)
+                if turn_active() or (
+                    request.expires_s is not None
+                    and time.monotonic() - request.created_s > request.expires_s
+                ):
+                    continue
+                duration_s = len(pcm) / max(1, PCM_BYTES_PER_SECOND)
+                mark_speaker_busy(hold_s=duration_s + 12.0)
+
                 print(f"[Bé Xinh] {selected_text}")
                 self._speaking.set()
                 try:
                     self._play_pcm(pcm)
                 finally:
                     self._speaking.clear()
+                    mark_speaker_busy(hold_s=0.8)
                 self._last_line = selected_text
                 self._last_spoken_monotonic = time.monotonic()
                 print("[Bé Xinh] announced")
@@ -494,14 +548,14 @@ class CameraCheckInAnnouncer:
         # - 0.97x tempo makes the voice a touch softer/easier to follow;
         # - moderate gain + limiter avoids clipping and crackle.
         filters = (
-            "adelay=180,"
+            "adelay=80,"
             "highpass=f=110,"
             "lowpass=f=6200,"
             "equalizer=f=2500:t=q:w=1.2:g=1.5,"
-            "atempo=0.97,"
+            "atempo=1.0,"
             "volume=1.10,"
             "alimiter=limit=0.90,"
-            "apad=pad_dur=0.65"
+            "apad=pad_dur=0.15"
         )
         command = [
             self.ffmpeg_bin,

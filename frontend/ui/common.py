@@ -4,6 +4,7 @@ from __future__ import annotations
 import streamlit as st
 
 from attendance.attendance_service import AttendanceService
+from attendance.daily_service import DailyAttendanceService, DailyAttendanceWorker
 from attendance.admin_service import AttendanceAdminService
 from auth.service import AuthService
 from database.db import Database
@@ -35,6 +36,16 @@ def get_attendance_service(runtime_version: int = 4) -> AttendanceService:
     # Refresh the service when attendance validation rules change.
     del runtime_version
     return AttendanceService(get_db(4), on_change=get_sync_worker().request_sync)
+
+
+@st.cache_resource
+def get_daily_attendance_service() -> DailyAttendanceService:
+    return DailyAttendanceService(get_db(4), on_change=get_sync_worker().request_sync)
+
+
+@st.cache_resource
+def get_daily_attendance_worker() -> DailyAttendanceWorker:
+    return DailyAttendanceWorker(get_daily_attendance_service()).start()
 
 
 @st.cache_resource

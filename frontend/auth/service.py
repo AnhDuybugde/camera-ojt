@@ -1,4 +1,4 @@
-"""Role + password authentication backed by bcrypt hashes in SQLite."""
+"""Role + employee authentication backed by bcrypt hashes."""
 from __future__ import annotations
 
 import bcrypt
@@ -16,14 +16,15 @@ class AuthService:
     def __init__(self, db: Database) -> None:
         self.db = db
         self.initialize_defaults()
-        self.db.execute("""CREATE TABLE IF NOT EXISTS employee_accounts (
-            employee_id TEXT PRIMARY KEY REFERENCES employees(employee_id) ON DELETE CASCADE,
-            password_hash TEXT NOT NULL, must_change INTEGER NOT NULL DEFAULT 1,
-            failures INTEGER NOT NULL DEFAULT 0, locked_until REAL NOT NULL DEFAULT 0,
-            version INTEGER NOT NULL DEFAULT 1)""")
-        self.db.execute("""CREATE TABLE IF NOT EXISTS login_limits (
-            account TEXT PRIMARY KEY, failures INTEGER NOT NULL DEFAULT 0,
-            locked_until REAL NOT NULL DEFAULT 0)""")
+        if not self.db.is_postgres:
+            self.db.execute("""CREATE TABLE IF NOT EXISTS employee_accounts (
+                employee_id TEXT PRIMARY KEY REFERENCES employees(employee_id) ON DELETE CASCADE,
+                password_hash TEXT NOT NULL, must_change INTEGER NOT NULL DEFAULT 1,
+                failures INTEGER NOT NULL DEFAULT 0, locked_until REAL NOT NULL DEFAULT 0,
+                version INTEGER NOT NULL DEFAULT 1)""")
+            self.db.execute("""CREATE TABLE IF NOT EXISTS login_limits (
+                account TEXT PRIMARY KEY, failures INTEGER NOT NULL DEFAULT 0,
+                locked_until REAL NOT NULL DEFAULT 0)""")
         self.ensure_accounts()
 
     def ensure_accounts(self) -> None:
@@ -32,7 +33,7 @@ class AuthService:
             hashed = self._hash("123")
             with self.db.transaction() as conn:
                 for row in rows:
-                    conn.execute("INSERT OR IGNORE INTO employee_accounts(employee_id,password_hash) VALUES (?,?)", (row["employee_id"], hashed))
+                    conn.execute("INSERT INTO employee_accounts(employee_id,password_hash) VALUES (?,?) ON CONFLICT (employee_id) DO NOTHING", (row["employee_id"], hashed))
 
     def account(self, employee_id: str) -> dict | None:
         return self.db.fetch_one("SELECT * FROM employee_accounts WHERE employee_id=?", (employee_id,))
@@ -41,7 +42,7 @@ class AuthService:
         self.ensure_accounts()
         key = "ADMIN" if role == ADMIN else "EMPLOYEE:" + employee_id.strip()
         with self.db.transaction() as conn:
-            conn.execute("INSERT OR IGNORE INTO login_limits(account) VALUES (?)", (key,))
+            conn.execute("INSERT INTO login_limits(account) VALUES (?) ON CONFLICT (account) DO NOTHING", (key,))
             limit = conn.execute("SELECT * FROM login_limits WHERE account=?", (key,)).fetchone()
             if limit["locked_until"] > time.time():
                 raise ValueError("Nhập sai quá nhiều lần. Hãy thử lại sau 5 phút.")
@@ -101,8 +102,8 @@ class AuthService:
         with self.db.transaction() as conn:
             for role in missing:
                 conn.execute(
-                    """INSERT OR IGNORE INTO auth_settings(role, password_hash, updated_at)
-                       VALUES (?, ?, ?)""",
+                    """INSERT INTO auth_settings(role, password_hash, updated_at)
+                       VALUES (?, ?, ?) ON CONFLICT (role) DO NOTHING""",
                     (role, self._hash(DEFAULT_PASSWORDS[role]), now),
                 )
 

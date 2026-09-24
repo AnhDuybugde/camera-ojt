@@ -4,6 +4,7 @@ from pathlib import Path
 from attendance.attendance_service import AttendanceService
 from database.db import Database
 from google_sheets.sync_service import SyncService
+from google_sheets.sheets_client import SheetsClient
 
 
 class FakeSheetsClient:
@@ -40,3 +41,22 @@ def test_failed_sync_remains_retryable(tmp_path: Path) -> None:
     assert (result.synced, result.failed) == (0, 1)
     assert db.list_attendance()[0]["sync_status"] == "ERROR"
     assert len(db.pending_attendance()) == 1
+
+
+def test_absent_google_sheet_row_has_blank_times_and_vietnamese_status() -> None:
+    class Worksheet:
+        appended = None
+
+        def get_all_values(self):
+            return [["Employee ID", "Employee Name", "Department", "Date", "Check In", "Check Out", "Status"]]
+
+        def append_row(self, values, value_input_option):
+            self.appended = values
+
+    worksheet = Worksheet()
+    client = SheetsClient()
+    client._worksheet = worksheet
+    client.upsert_attendance({"employee_id": "NV001", "employee_name": "A", "department": "AI",
+                              "date": "2026-09-22", "check_in": None, "check_out": None,
+                              "status": "ABSENT"})
+    assert worksheet.appended == ["NV001", "A", "AI", "2026-09-22", "", "", "Vắng mặt"]

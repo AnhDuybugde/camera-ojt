@@ -31,6 +31,7 @@ class _TrackGate:
     best_quality: float = 0.0
     employee_id: str | None = None
     votes: deque[tuple[float, str | None]] = field(default_factory=deque)
+    embeddings: deque[tuple[float, np.ndarray]] = field(default_factory=deque)
 
 
 class FaceTrackConsumer:
@@ -50,6 +51,8 @@ class FaceTrackConsumer:
         channels: tuple[str, ...] = ("A", "B"),
         consensus_hits: int = 1,
         consensus_window_s: float = 3.0,
+        temporal_window: int = 5,
+        temporal_min_samples: int = 3,
     ) -> None:
         self.embedder = embedder
         self.matcher = matcher
@@ -62,6 +65,10 @@ class FaceTrackConsumer:
         self.channels = tuple(channels) or ("A", "B")
         self.consensus_hits = max(1, consensus_hits)
         self.consensus_window_s = max(0.1, consensus_window_s)
+        self.temporal_window = max(1, int(temporal_window))
+        self.temporal_min_samples = min(
+            self.temporal_window, max(1, int(temporal_min_samples))
+        )
         # A global identity may be visible on both cameras in the same tick.
         # Keep quality/cooldown state per camera so one channel cannot starve
         # face recognition on the other.
@@ -126,6 +133,9 @@ class FaceTrackConsumer:
                     )
                 )
                 continue
+            detection, match = self._temporal_match(
+                gate, detection, match, quality
+            )
             # Do not suppress later observations using the lifetime best
             # quality.  A single unusually sharp frame would otherwise make
             # almost every scheduled recheck disappear forever, which looks
@@ -162,6 +172,54 @@ class FaceTrackConsumer:
             )
         return observations
 
+    def _temporal_match(
+        self,
+        gate: _TrackGate,
+        detection: FaceDetection,
+        raw_match: MatchResult,
+        quality: float,
+    ) -> tuple[FaceDetection, MatchResult]:
+        """Prefer a multi-frame embedding only when it yields a safe match.
+
+        Raw observations remain authoritative when already known. The
+        temporal vector is allowed to upgrade an unknown observation only if
+        the normal matcher threshold and ambiguity margin both pass.
+        """
+        vector = np.asarray(detection.embedding, dtype=np.float32).ravel()
+        norm = float(np.linalg.norm(vector))
+        if norm <= 1e-12:
+            return detection, raw_match
+        vector = vector / norm
+        gate.embeddings.append((max(0.05, float(quality)), vector))
+        while len(gate.embeddings) > self.temporal_window:
+            gate.embeddings.popleft()
+        if len(gate.embeddings) < self.temporal_min_samples:
+            return detection, raw_match
+
+        weights = np.asarray(
+            [item[0] for item in gate.embeddings], dtype=np.float32
+        )
+        samples = np.stack([item[1] for item in gate.embeddings], axis=0)
+        averaged = np.average(samples, axis=0, weights=weights)
+        averaged_norm = float(np.linalg.norm(averaged))
+        if averaged_norm <= 1e-12:
+            return detection, raw_match
+        averaged = np.asarray(averaged / averaged_norm, dtype=np.float32)
+        temporal_match = self.matcher.match(averaged)
+        if not temporal_match.is_known:
+            return detection, raw_match
+        if raw_match.is_known:
+            raw_id = _match_person_id(raw_match)
+            temporal_id = _match_person_id(temporal_match)
+            if raw_id != temporal_id or temporal_match.score < raw_match.score:
+                return detection, raw_match
+        return FaceDetection(
+            bbox=detection.bbox,
+            score=detection.score,
+            embedding=averaged,
+            kps=detection.kps,
+        ), temporal_match
+
     def forget_retired(self, alive_global_ids: set[int]) -> None:
         retired = [
             key for key in self._gates if key[1] not in alive_global_ids
@@ -172,6 +230,12 @@ class FaceTrackConsumer:
 
 def _global_id(track: Track) -> int:
     return track.global_person_id if track.global_person_id is not None else track.track_id
+
+
+def _match_person_id(match: MatchResult) -> str | None:
+    if not match.is_known or match.person is None:
+        return None
+    return match.person.employee_id or match.person.person_id
 
 
 def _crop(frame: np.ndarray, bbox: BoundingBox) -> np.ndarray | None:

@@ -85,6 +85,7 @@ class GlobalIdentityConfig(StrictModel):
     unresolved_keep_s: float = Field(default=86400.0, ge=0)
     min_gallery_confidence: float = Field(default=0.25, ge=0, le=1)
     gallery_refresh_steps: int = Field(default=5, ge=1)
+    named_verify_steps: int = Field(default=1, ge=1)
     tentative_min_hits: int = Field(default=5, ge=1)
     state_db: Path = Path("output/identity_state.db")
     reid_model: str = "osnet_x0_25"
@@ -155,6 +156,11 @@ class FaceConfig(StrictModel):
     min_margin: float = Field(default=0.05, ge=0, le=1)
     consensus_hits: int = Field(default=2, ge=1)
     consensus_window_s: float = Field(default=3.0, gt=0)
+    # Average several sharp observations from the same stable Global ID.
+    # This reduces compression/noise on small, distant office faces without
+    # lowering the identity threshold and increasing false matches.
+    temporal_window: int = Field(default=5, ge=1, le=20)
+    temporal_min_samples: int = Field(default=3, ge=1, le=20)
     gallery_accept_threshold: float = Field(default=0.70, ge=0, le=1)
     gallery_max_prototypes: int = Field(default=10, ge=1)
     min_face_px: int = Field(default=40, ge=8)
@@ -165,10 +171,9 @@ class FaceConfig(StrictModel):
     det_size: int = Field(default=320, ge=160)
     # Retry cadence cho Face async worker (event-driven once-per-track).
     # unknown: GID chua biet ten -> thu lai sau X giay de bat goc mat dep.
-    # 0.6s (~7 processed frame @12fps) nhanh hon default cu 1.0s mot chut
-    # nhung van nhe GPU; may yeu se tu tang len nho backpressure theo
-    # queue occupancy trong run_workstate._enqueue_face_async.
-    unknown_cooldown_s: float = Field(default=0.6, ge=0)
+    # New tracks run immediately; only failed/unknown retries wait. A moderate
+    # delay avoids continuous InsightFace contention in crowded scenes.
+    unknown_cooldown_s: float = Field(default=1.2, ge=0)
     # known: GID da biet ten -> recheck sau X giay. Voice/greet se lay
     # min(known, 2.0s) de co observation moi cho trigger tay+mat.
     known_cooldown_s: float = Field(default=30.0, ge=0)
@@ -181,6 +186,8 @@ class FaceConfig(StrictModel):
     def validate_gallery_threshold(self) -> FaceConfig:
         if self.gallery_accept_threshold < self.match_threshold:
             raise ValueError("gallery_accept_threshold must be at least match_threshold")
+        if self.temporal_min_samples > self.temporal_window:
+            raise ValueError("temporal_min_samples must not exceed temporal_window")
         return self
 
 
@@ -375,8 +382,8 @@ class VoiceConfig(StrictModel):
     # P5: người được voice-greet phải đủ lớn (cùng đơn vị palm_min_person_area_px).
     voice_min_person_area_px: float = Field(default=2500.0, ge=0)
     # P1: ngưỡng VAD động bám nền (factor<=0 -> ngưỡng tĩnh như cũ).
-    voice_vad_floor_factor: float = Field(default=3.0, ge=0)
-    voice_vad_floor_min: float = Field(default=0.004, gt=0.0)
+    voice_vad_floor_factor: float = Field(default=1.6, ge=0)
+    voice_vad_floor_min: float = Field(default=0.0022, gt=0.0)
     voice_vad_ceiling: float = Field(default=0.15, gt=0.0)
     # P3: đoạn chỉ đi STT khi to hơn nền >= số dB này.
     voice_snr_min_db: float = Field(default=10.0, ge=0)

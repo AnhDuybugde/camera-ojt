@@ -36,25 +36,33 @@ def render(db: Database) -> None:
         st.info("Không có dữ liệu điểm danh trong khoảng thời gian đã chọn.")
         return
 
+    frame["_present"] = (frame["check_in"].notna() & (frame["status"] != "ABSENT")).astype(int)
     daily = frame.groupby("date").agg(**{
-        "Có mặt":  ("employee_id", "nunique"),
+        "Có mặt": ("_present", "sum"),
         "Đi muộn": ("status", lambda x: (x == "LATE").sum()),
+        "Vắng mặt": ("status", lambda x: (x == "ABSENT").sum()),
+        "Chờ chấm công": ("status", lambda x: (x == "WAITING").sum()),
     })
     daily["Tỷ lệ đúng giờ (%)"] = (
-        (daily["Có mặt"] - daily["Đi muộn"]) / daily["Có mặt"] * 100
-    ).round(1)
+        (daily["Có mặt"] - daily["Đi muộn"]) / daily["Có mặt"].replace(0, float("nan")) * 100
+    ).fillna(0).round(1)
 
     on_time = int((frame["status"] == "ON_TIME").sum())
 
     # KPI cards – Stitch colors
-    for column, card in zip(st.columns(3), (
-        ("Tổng lượt điểm danh", len(frame),  "Toàn bộ dữ liệu",
+    present_count = int(frame["_present"].sum())
+    late_count = int((frame["status"] == "LATE").sum())
+    absent_count = int((frame["status"] == "ABSENT").sum())
+    for column, card in zip(st.columns(4), (
+        ("Đã tới văn phòng", present_count, "Có CHECK-IN",
          "fact_check", "#004ac6", "#dce9ff"),
         ("Lượt đúng giờ", on_time,
-         f"{on_time / len(frame) * 100:.1f}% tổng lượt",
+         f"{on_time / present_count * 100:.1f}% đã tới" if present_count else "Chưa có check-in",
          "check_circle", "#006c49", "rgba(108,248,187,0.30)"),
-        ("Lượt đi muộn", len(frame) - on_time, "Cần theo dõi",
+        ("Lượt đi muộn", late_count, "Cần theo dõi",
          "alarm_on", "#784b00", "#ffddb8"),
+        ("Vắng mặt", absent_count, "Lịch ON, quá hạn chưa tới",
+         "person_off", "#ba1a1a", "#ffdad6"),
     )):
         with column:
             kpi_card(*card)
@@ -75,7 +83,7 @@ def render(db: Database) -> None:
                          axis=alt.Axis(format="%d/%m", labelFontSize=11, labelColor="#434655")),
                 y=alt.Y("Có mặt:Q", title="Nhân viên",
                          axis=alt.Axis(labelFontSize=11, labelColor="#434655")),
-                tooltip=[alt.Tooltip("Ngày:T", format="%d/%m/%Y"), "Có mặt:Q", "Đi muộn:Q"],
+                tooltip=[alt.Tooltip("Ngày:T", format="%d/%m/%Y"), "Có mặt:Q", "Đi muộn:Q", "Vắng mặt:Q"],
             )
             .properties(height=300, background="transparent")
         )
@@ -108,12 +116,14 @@ def render(db: Database) -> None:
             TableColumn("date", "Ngày", 130),
             TableColumn("present", "Có mặt", 110, "center"),
             TableColumn("late", "Đi muộn", 110, "center"),
+            TableColumn("absent", "Vắng mặt", 110, "center"),
             TableColumn("rate", "Tỷ lệ đúng giờ", 150, "center"),
         ],
         [{
             "date": row["Ngày"].strftime("%d/%m/%Y"),
             "present": int(row["Có mặt"]),
             "late": status_badge(str(int(row["Đi muộn"])), "warning"),
+            "absent": status_badge(str(int(row["Vắng mặt"])), "danger"),
             "rate": status_badge(
                 f'{row["Tỷ lệ đúng giờ (%)"]:.1f}%',
                 "success" if row["Tỷ lệ đúng giờ (%)"] >= 80 else "warning",

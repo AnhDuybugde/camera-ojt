@@ -198,6 +198,44 @@ def test_convert_missing_file(tmp_path):
         convert_file_to_aac_adts(tmp_path / "nope.mp3")
 
 
+def test_persistent_tunnel_can_fail_fast_without_hidden_retry(monkeypatch):
+    from camera_tracking.voice import p2p_talk
+    from camera_tracking.voice.p2p_talk import (
+        ImouP2PCredentials, ImouP2PTalkOutput, P2PTalkError)
+
+    class _Tunnel:
+        def __init__(self):
+            self.ensure_calls = 0
+            self.invalidated = 0
+
+        def ensure(self):
+            self.ensure_calls += 1
+            return "127.0.0.1", 18087
+
+        def invalidate(self):
+            self.invalidated += 1
+
+        def close(self):
+            pass
+
+    tunnel = _Tunnel()
+    out = ImouP2PTalkOutput(
+        ImouP2PCredentials(serial="S", password="P"),
+        persistent=True,
+        retry_persistent=False,
+    )
+    out._tunnel = tunnel
+
+    def _fail(*args, **kwargs):
+        raise P2PTalkError("talkback unavailable")
+
+    monkeypatch.setattr(p2p_talk, "_visualtalk_once", _fail)
+    with pytest.raises(P2PTalkError, match="talkback unavailable"):
+        out._send_persistent(b"aac", 1)
+    assert tunnel.ensure_calls == 1
+    assert tunnel.invalidated == 1
+
+
 def test_voice_config_p2p_defaults():
     config = load_config(Path("config/default.yaml"))
     assert config.voice.backend == "imou_p2p"

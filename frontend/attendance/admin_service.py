@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
+from sqlalchemy.exc import IntegrityError as SQLAlchemyIntegrityError
 from collections.abc import Callable
 from datetime import date, datetime
 
@@ -12,9 +14,11 @@ from config import settings
 from database.db import Database
 from utils.helpers import iso_now
 
+logger = logging.getLogger(__name__)
+
 
 ATTENDANCE_STATUSES = frozenset({"ON_TIME", "LATE", "ABSENT"})
-AUDITED_FIELDS = ("date", "check_in", "check_out", "status")
+AUDITED_FIELDS = ("date", "check_in", "check_out", "status", "presence_status", "temporary_checkout_at")
 
 
 class AttendanceAdminService:
@@ -61,22 +65,32 @@ class AttendanceAdminService:
             if old_row is None:
                 raise ValueError("Không tìm thấy bản ghi chấm công.")
             old_values = {field: old_row[field] for field in AUDITED_FIELDS}
+            presence_status = (
+                old_row["presence_status"]
+                if normalized_check_in and old_row["temporary_checkout_at"] and normalized_date == old_row["date"]
+                else "PRESENT" if normalized_check_in and not normalized_check_out else "ABSENT"
+            )
+            temporary_checkout_at = (
+                old_row["temporary_checkout_at"] if normalized_check_in and normalized_date == old_row["date"] else None
+            )
             new_values = {
                 "date": normalized_date,
                 "check_in": normalized_check_in,
                 "check_out": normalized_check_out,
                 "status": final_status,
+                "presence_status": presence_status,
+                "temporary_checkout_at": temporary_checkout_at,
             }
             try:
                 conn.execute(
                     """UPDATE attendance
-                       SET date=?, check_in=?, check_out=?, status=?,
+                       SET date=?, check_in=?, check_out=?, status=?, presence_status=?, temporary_checkout_at=?,
                            sync_status='PENDING', updated_at=?
                        WHERE id=?""",
                     (normalized_date, normalized_check_in, normalized_check_out,
-                     final_status, timestamp, attendance_id),
+                     final_status, presence_status, temporary_checkout_at, timestamp, attendance_id),
                 )
-            except sqlite3.IntegrityError as exc:
+            except (sqlite3.IntegrityError, SQLAlchemyIntegrityError) as exc:
                 raise ValueError("Nhân viên đã có bản ghi chấm công trong ngày này.") from exc
             conn.execute(
                 """INSERT INTO audit_logs
@@ -93,7 +107,10 @@ class AttendanceAdminService:
             )
 
         if self.on_change:
-            self.on_change()
+            try:
+                self.on_change()
+            except Exception:
+                logger.exception("Could not notify attendance change listener")
         updated = self.db.get_attendance(attendance_id)
         if updated is None:
             raise RuntimeError("Không thể đọc lại bản ghi vừa cập nhật.")

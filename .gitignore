@@ -18,6 +18,7 @@ backend/data/images/*
 backend/data/faces/*
 frontend/data/*
 frontend/logs/*
+frontend/static/zone_samples/*
 *.pt
 *.onnx
 *.engine
@@ -35,3 +36,4 @@ logs/
 !backend/output/.gitkeep
 !backend/models/.gitkeep
 !backend/data/images/.gitkeep
+!frontend/static/zone_samples/.gitkeep

@@ -7,6 +7,8 @@ signals from the YOLO/ByteTrack boxes already produced by Camera AIM:
 * STAND_UP: a previously stable/seated box becomes markedly taller while its
   floor contact stays near the same place.
 * STATIONARY: used only for long water/rest reminders.
+* PROXIMITY: an approximate monocular distance derived from calibrated person
+  box height, with confirmation and hysteresis to avoid boundary chatter.
 
 The calculations are O(number_of_tracks) and do not add GPU inference.
 """
@@ -42,6 +44,9 @@ class MotionSnapshot:
     area_ratio: float
     center_x: float
     center_y: float
+    box_height_ratio: float
+    near_camera: bool
+    estimated_distance_m: float | None
 
 
 @dataclass(frozen=True)
@@ -64,6 +69,9 @@ class _TrackMotionState:
     stationary_since_s: float | None = None
     last_approach_s: float = float("-inf")
     last_stand_s: float = float("-inf")
+    near_started_s: float | None = None
+    near_camera: bool = False
+    estimated_distance_m: float | None = None
 
 
 class InteractionEngine:
@@ -85,6 +93,11 @@ class InteractionEngine:
         stand_foot_delta: float = 0.08,
         stand_cooldown_s: float = 120.0,
         retire_after_s: float = 20.0,
+        distance_reference_m: float = 1.0,
+        distance_reference_height_ratio: float = 0.45,
+        greeting_distance_m: float = 0.50,
+        distance_release_m: float = 0.70,
+        near_confirm_s: float = 0.25,
     ) -> None:
         self.stationary_window_s = max(2.0, stationary_window_s)
         self.stationary_center_delta = max(0.005, stationary_center_delta)
@@ -99,6 +112,15 @@ class InteractionEngine:
         self.stand_foot_delta = max(0.02, stand_foot_delta)
         self.stand_cooldown_s = max(10.0, stand_cooldown_s)
         self.retire_after_s = max(5.0, retire_after_s)
+        self.distance_reference_m = max(0.10, distance_reference_m)
+        self.distance_reference_height_ratio = max(
+            0.02, distance_reference_height_ratio
+        )
+        self.greeting_distance_m = max(0.20, greeting_distance_m)
+        self.distance_release_m = max(
+            self.greeting_distance_m + 0.05, distance_release_m
+        )
+        self.near_confirm_s = max(0.0, near_confirm_s)
         self._states: dict[tuple[str, int], _TrackMotionState] = {}
         self._snapshots: dict[tuple[str, int], MotionSnapshot] = {}
 
@@ -142,6 +164,7 @@ class InteractionEngine:
             if state is None:
                 state = _TrackMotionState(first_seen_s=now_s, last_seen_s=now_s)
                 state.samples.append(sample)
+                self._update_proximity(state, sample, now_s)
                 self._states[key] = state
                 self._set_snapshot(channel, gid, state, sample, stationary=False)
                 continue
@@ -241,6 +264,7 @@ class InteractionEngine:
                 state.stationary_since_s = None
 
             state.samples.append(sample)
+            self._update_proximity(state, sample, now_s)
             self._set_snapshot(channel, gid, state, sample, stationary=stationary)
 
         self._retire(now_s)
@@ -286,7 +310,44 @@ class InteractionEngine:
             area_ratio=sample.area,
             center_x=sample.cx,
             center_y=sample.cy,
+            box_height_ratio=sample.height,
+            near_camera=state.near_camera,
+            estimated_distance_m=state.estimated_distance_m,
         )
+
+    def _update_proximity(
+        self,
+        state: _TrackMotionState,
+        sample: _Sample,
+        now_s: float,
+    ) -> None:
+        """Update a calibrated monocular distance proxy.
+
+        ``distance_reference_height_ratio`` must be measured once by asking a
+        standing person to occupy a known reference distance. This is not a
+        depth sensor, so the estimate is deliberately exposed as approximate.
+        """
+        distance_m = (
+            self.distance_reference_m
+            * self.distance_reference_height_ratio
+            / max(sample.height, 1e-6)
+        )
+        state.estimated_distance_m = distance_m
+
+        if state.near_camera:
+            if distance_m >= self.distance_release_m:
+                state.near_camera = False
+                state.near_started_s = None
+            return
+
+        if distance_m > self.greeting_distance_m:
+            state.near_started_s = None
+            return
+        if state.near_started_s is None:
+            state.near_started_s = now_s
+            return
+        if now_s - state.near_started_s >= self.near_confirm_s:
+            state.near_camera = True
 
     def _retire(self, now_s: float) -> None:
         stale = [

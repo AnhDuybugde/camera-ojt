@@ -2,6 +2,8 @@
 
 Ứng dụng Windows/Python nhận diện nhân viên từ webcam hoặc RTSP, ghi check-in/check-out vào SQLite và đồng bộ bất đồng bộ lên Google Sheets. SQLite luôn là nguồn dữ liệu chính: mất mạng hoặc lỗi Google API không làm dừng camera hay mất lượt điểm danh.
 
+Tài liệu module trạng thái Camera Live: [ACTIVITY_RECOGNITION.md](ACTIVITY_RECOGNITION.md).
+
 ## Tính năng
 
 - CRUD nhân viên trên giao diện Streamlit.

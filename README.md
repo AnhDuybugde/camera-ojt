@@ -87,8 +87,8 @@ cd ..
 .\stop.ps1
 ```
 
-Launcher tắt greeting “Hà Linh”/legacy của model để tránh hai giọng nói đồng
-thời; “Bé Xinh” là audio output duy nhất. Log nằm trong `logs/`.
+Launcher tắt greeting legacy của model để tránh hai giọng nói đồng thời;
+“Bé Xinh” là audio output duy nhất. Log nằm trong `logs/`.
 
 ## Kiểm thử
 
@@ -103,13 +103,79 @@ cd ..\frontend
 
 ## Phạm vi adapter hiện tại
 
-Bridge xử lý người đã được model xác nhận, heartbeat hiện diện, arrival/return
-và reminder theo chính sách của `HamyCompanion`. Module gesture của Bé Xinh vẫn
-được bảo toàn trong source, nhưng chưa lấy frame/bounding-box qua status API;
-do đó gesture riêng của audio chưa được bật trong sidecar. Nếu cần gesture
-5-ngón của Bé Xinh, nên mở rộng contract API thay vì chép đè vòng lặp model.
+Bridge xử lý người đã được model xác nhận, heartbeat hiện diện, arrival/return,
+gesture 5-ngón, approach/stand-up và reminder theo chính sách của
+`HamyCompanion`. Model tái sử dụng frame + bounding box hiện có để phát các
+`gesture_events`, `motion_events` và `stationary_for_s` qua status API; Bé Xinh
+không mở camera hoặc chạy YOLO lần hai. Lời chào, nhắc nước/nghỉ và lời rủ
+high-five được luân phiên nhưng luôn có cooldown chống spam.
+
+### Voice thân thiện và vùng chào gần
+
+- Giơ bàn tay mở được xác nhận qua 2 mẫu liên tiếp; bridge poll mỗi `0.12s` và
+  lời chào tay có ưu tiên cao nhất trong hàng đợi.
+- Khi đã nhận diện được người, mọi biến thể chào tay/chào gần đều chứa tên và
+  được luân phiên để tránh lặp nguyên văn.
+- Chào tự động chỉ xảy ra khi `near_camera=true`; giơ tay vẫn được phản hồi dù
+  đang ở xa. Ngưỡng mặc định là khoảng `0.50m`, nhả trạng thái ở `0.70m` để
+  tránh bật/tắt liên tục tại biên.
+- Camera RGB không phải cảm biến độ sâu. `estimated_distance_m` là ước lượng
+  từ chiều cao bbox và cần hiệu chuẩn một lần: đứng đúng `1m`, mở `status.json`,
+  đọc `person_height_ratio` rồi điền giá trị đó vào
+  `HAMY_DISTANCE_REFERENCE_HEIGHT_RATIO` trong
+  `backend/.env`. Các biến liên quan có sẵn trong `.env.example`.
+
+Sau khi đổi lời thoại hoặc thêm nhân viên, chạy lại cache khi camera đã dừng:
+
+```powershell
+cd D:\team-integration\backend
+.\.venv\Scripts\python.exe scripts\prewarm_hamy.py
+# Chỉ tạo các câu cần phản hồi ngay (chào gần + vẫy tay):
+.\.venv\Scripts\python.exe scripts\prewarm_hamy.py --critical-only
+```
 
 Trang **Live Attendance** đã dùng chung camera/model backend. Các trang báo cáo
 còn lại của UI vẫn đọc SQLite riêng của repository giao diện, trong khi backend
 dùng queue/Supabase của `camera-ojt`; bản tích hợp không âm thầm đồng bộ hai kho
 dữ liệu vì cần nhóm thống nhất nguồn dữ liệu chuẩn trước.
+
+### Audio Zone Event Engine
+
+Bridge hỗ trợ contract `audio_events` cho `DOOR_ENTER`, `DOOR_EXIT`,
+`BE_XINH_NEAR`, `WATER`, `RESTROOM` và `WAVE`, đồng thời nhận generic
+`ZONE_DWELL`. Khi backend có trường `audio_events` (kể cả danh sách rỗng), Zone
+Mode tắt chào theo kiểu chỉ thấy mặt; sự kiện WC không bao giờ đọc tên. Event ID
+dedupe, cooldown theo người/sự kiện, global gap, priority và queue expiry ngăn
+phát lặp hoặc phát câu đã cũ. Contract chi tiết nằm tại
+`backend/docs/AUDIO_EVENT_CONTRACT.md`.
+
+```powershell
+cd backend
+.\.venv\Scripts\python.exe scripts\test_be_xinh_events.py --dry-run --event wave --name Ngọc
+.\.venv\Scripts\python.exe scripts\test_be_xinh_events.py --dry-run --generic-zone restroom --name Ngọc
+```
+
+### Trò chuyện bằng giọng nói với Bé Xinh
+
+Luồng chạy hoàn toàn bằng giọng nói:
+
+`Mic camera → STT tiếng Việt → Gemini 3.5 Flash → ZeroTTS Hà My → loa camera`
+
+Thêm khóa vào `backend/.env` trên máy cá nhân, không commit khóa lên Git:
+
+```env
+GEMINI_API_KEY=your_real_key_here
+GEMINI_MODEL=gemini-3.5-flash
+```
+
+Bật hoặc kiểm tra riêng voice chat mà không khởi động lại camera:
+
+```powershell
+.\chat.ps1 start
+.\chat.ps1 status
+# Gọi: "Bé Xinh ơi"
+.\chat.ps1 stop
+```
+
+Lần chạy đầu sẽ tạo năm câu filler bằng giọng Hà My. Những lần sau dùng lại
+cache. `run.ps1` tự bật voice chat khi `GEMINI_API_KEY` đã được cấu hình.

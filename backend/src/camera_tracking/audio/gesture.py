@@ -138,19 +138,27 @@ class HandGestureDetector:
     def __init__(
         self,
         *,
-        interval_s: float = 0.12,
+        interval_s: float = 0.10,
         max_candidates: int = 4,
         max_crop_side: int = 448,
-        emit_cooldown_s: float = 6.0,
-        confirm_hits: int = 1,
-        min_confidence: float = 0.62,
+        emit_cooldown_s: float = 20.0,
+        confirm_hits: int = 2,
+        release_s: float = 1.0,
+        min_confidence: float = 0.70,
+        max_hand_center_y: float = 0.68,
+        min_palm_width_ratio: float = 0.20,
     ) -> None:
         self.interval_s = max(0.10, interval_s)
         self.max_candidates = max(1, max_candidates)
         self.max_crop_side = max(160, max_crop_side)
         self.emit_cooldown_s = max(3.0, emit_cooldown_s)
         self.confirm_hits = max(1, confirm_hits)
+        self.release_s = max(0.4, release_s)
         self.min_confidence = min(0.95, max(0.50, float(min_confidence)))
+        self.max_hand_center_y = min(0.90, max(0.35, max_hand_center_y))
+        self.min_palm_width_ratio = min(
+            0.60, max(0.10, min_palm_width_ratio)
+        )
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="hamy-hand-gesture"
         )
@@ -158,6 +166,8 @@ class HandGestureDetector:
         self._last_submit_s = float("-inf")
         self._last_emit_s: dict[tuple[str, int], float] = {}
         self._hits: dict[tuple[str, int], tuple[int, float]] = {}
+        self._latched: set[tuple[str, int]] = set()
+        self._missing_since_s: dict[tuple[str, int], float] = {}
         self._model = None
         self._model_lock = threading.Lock()
         self._candidate_cursor = 0
@@ -175,15 +185,22 @@ class HandGestureDetector:
     @classmethod
     def from_env(cls) -> "HandGestureDetector":
         return cls(
-            interval_s=_env_float("HAMY_GESTURE_INTERVAL_SECONDS", 0.12, 0.10),
+            interval_s=_env_float("HAMY_GESTURE_INTERVAL_SECONDS", 0.10, 0.10),
             max_candidates=_env_int("HAMY_GESTURE_MAX_CANDIDATES", 4, 1),
             max_crop_side=_env_int("HAMY_GESTURE_CROP_SIDE", 448, 192),
             emit_cooldown_s=_env_float(
-                "HAMY_GESTURE_COOLDOWN_SECONDS", 6.0, 2.0
+                "HAMY_GESTURE_COOLDOWN_SECONDS", 20.0, 3.0
             ),
-            confirm_hits=_env_int("HAMY_GESTURE_CONFIRM_HITS", 1, 1),
+            confirm_hits=_env_int("HAMY_GESTURE_CONFIRM_HITS", 2, 1),
+            release_s=_env_float("HAMY_GESTURE_RELEASE_SECONDS", 1.0, 0.4),
             min_confidence=_env_float(
-                "HAMY_GESTURE_MIN_CONFIDENCE", 0.62, 0.50
+                "HAMY_GESTURE_MIN_CONFIDENCE", 0.70, 0.50
+            ),
+            max_hand_center_y=_env_float(
+                "HAMY_GESTURE_MAX_HAND_CENTER_Y", 0.68, 0.35
+            ),
+            min_palm_width_ratio=_env_float(
+                "HAMY_GESTURE_MIN_PALM_WIDTH_RATIO", 0.20, 0.10
             ),
         )
 
@@ -228,8 +245,23 @@ class HandGestureDetector:
         seen_keys = {(raw.channel, raw.global_id) for raw in raw_events}
         latest_event_s = max((raw.now_s for raw in raw_events), default=self._last_submit_s)
 
+        # A held-up hand is one gesture, not a new greeting every cooldown.
+        # Re-arm only after the palm has disappeared continuously.
+        for key in list(self._latched):
+            if key in seen_keys:
+                self._missing_since_s.pop(key, None)
+                continue
+            missing_since = self._missing_since_s.setdefault(key, latest_event_s)
+            if latest_event_s - missing_since >= self.release_s:
+                self._latched.discard(key)
+                self._missing_since_s.pop(key, None)
+                self._hits.pop(key, None)
+
         for raw in raw_events:
             key = (raw.channel, raw.global_id)
+            self._missing_since_s.pop(key, None)
+            if key in self._latched:
+                continue
             count, previous_s = self._hits.get(key, (0, float("-inf")))
             if raw.now_s - previous_s <= 1.2:
                 count += 1
@@ -243,6 +275,7 @@ class HandGestureDetector:
 
             self._last_emit_s[key] = raw.now_s
             self._hits[key] = (0, raw.now_s)
+            self._latched.add(key)
             emitted.append(
                 GestureEvent(
                     kind="OPEN_PALM",
@@ -419,7 +452,10 @@ class HandGestureDetector:
                 ]
             for landmarks in detected_hands:
                 confidence = self._open_palm_confidence(landmarks)
-                if confidence >= self.min_confidence:
+                if (
+                    confidence >= self.min_confidence
+                    and self._is_raised_front_palm(landmarks)
+                ):
                     found.append(
                         _RawPalm(
                             channel=candidate.channel,
@@ -430,6 +466,25 @@ class HandGestureDetector:
                     )
                     break
         return found
+
+    def _is_raised_front_palm(self, landmarks) -> bool:
+        """Reject desk-level and edge-on hands that look open by accident."""
+        if len(landmarks) < 21:
+            return False
+
+        def dist(a: int, b: int) -> float:
+            dx = float(landmarks[a].x) - float(landmarks[b].x)
+            dy = float(landmarks[a].y) - float(landmarks[b].y)
+            return math.hypot(dx, dy)
+
+        palm_center_y = sum(float(landmarks[index].y) for index in (0, 5, 9, 13, 17)) / 5.0
+        hand_length = dist(0, 12)
+        palm_width = dist(5, 17)
+        return (
+            palm_center_y <= self.max_hand_center_y
+            and hand_length > 1e-6
+            and palm_width / hand_length >= self.min_palm_width_ratio
+        )
 
     @staticmethod
     def _open_palm_confidence(landmarks) -> float:

@@ -74,6 +74,34 @@ class GlobalIdentityTest(TestCase):
         self.assertEqual(refreshed[0].global_person_id, 1)
         self.assertEqual(refreshed[0].employee_id, "employee_123")
 
+    def test_conflicting_face_splits_tracklet_without_renaming_old_gid(self) -> None:
+        manager = make_manager(tentative_min_hits=1)
+        frame = make_frame()
+        current = manager.update(
+            channel="A", frame=frame,
+            tracks=[raw_track(10, BoundingBox(20, 40, 120, 160))], now_s=0.0,
+        )[0]
+        assert manager.bind_employee(current.track_id, "employee_a")
+
+        fresh_gid = manager.split_conflicting_tracklet(
+            current.track_id,
+            channel="A",
+            track=current,
+            frame=frame,
+            now_s=1.0,
+        )
+
+        assert fresh_gid is not None and fresh_gid != current.track_id
+        assert manager.employee_id_of(current.track_id) == "employee_a"
+        assert manager.employee_id_of(fresh_gid) is None
+        assert manager.bind_employee(fresh_gid, "employee_b")
+        refreshed = manager.update(
+            channel="A", frame=frame,
+            tracks=[raw_track(10, BoundingBox(20, 40, 120, 160))], now_s=2.0,
+        )
+        assert refreshed[0].track_id == fresh_gid
+        assert refreshed[0].employee_id == "employee_b"
+
     def test_merge_identity_redirects_duplicate_tracklets(self) -> None:
         manager = make_manager()
         frame = make_frame()
@@ -262,6 +290,37 @@ class GlobalIdentityTest(TestCase):
             tracks=[raw_track(11, box)], now_s=7.0,
         )
         self.assertEqual(result[0].track_id, 1)
+
+    def test_named_identity_can_verify_on_short_cadence(self) -> None:
+        calls = {"n": 0}
+
+        class CountingEmbedding(MeanColorEmbedding):
+            def extract(self, crop_bgr):
+                calls["n"] += 1
+                return super().extract(crop_bgr)
+
+        manager = GlobalIdentityManager(
+            CountingEmbedding(),
+            GlobalIdentityConfig(
+                gallery_refresh_steps=100,
+                named_verify_steps=3,
+            ),
+        )
+        frame = make_frame()
+        box = BoundingBox(20, 40, 120, 160)
+        manager.update(
+            channel="A", frame=frame,
+            tracks=[raw_track(10, box)], now_s=0.0,
+        )
+        manager.bind_employee(1, "employee_1")
+        for step in range(1, 6):
+            manager.update(
+                channel="A", frame=frame,
+                tracks=[raw_track(10, box)], now_s=float(step),
+            )
+
+        # New identity extracts once; named refreshes at manager steps 3 and 6.
+        self.assertEqual(calls["n"], 3)
 
 
 class BusinessSeparationTest(TestCase):

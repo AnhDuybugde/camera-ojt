@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root { color-scheme: light dark; font-family: Inter, system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: transparent; color: #e8edf5; }
+    .shell { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 14px; }
+    .stage-card, .panel { background: #111827; border: 1px solid #334155; border-radius: 14px; }
+    .toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:10px; border-bottom:1px solid #334155; }
+    button, input, select { font: inherit; }
+    button { border:1px solid #475569; border-radius:9px; color:#e8edf5; background:#1e293b; padding:8px 11px; cursor:pointer; }
+    button:hover { border-color:#60a5fa; background:#27364c; }
+    button.primary { background:#2563eb; border-color:#3b82f6; color:white; font-weight:650; }
+    button.danger { color:#fecaca; border-color:#7f1d1d; background:#3f1519; }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    .zoom-value { min-width:55px; text-align:center; color:#bfdbfe; font-size:13px; }
+    .canvas-scroll { overflow:auto; width:100%; max-height:720px; background:#050b15; border-radius:0 0 14px 14px; }
+    .canvas-wrap { position:relative; transform-origin:top left; margin:0 auto; }
+    canvas { display:block; width:100%; height:100%; touch-action:none; cursor:crosshair; }
+    .panel { padding:14px; display:flex; flex-direction:column; gap:12px; }
+    .panel h3 { margin:0; font-size:16px; }
+    .hint { color:#94a3b8; font-size:12px; line-height:1.45; }
+    label { display:grid; gap:5px; color:#cbd5e1; font-size:12px; font-weight:650; }
+    input[type=text], select { width:100%; padding:9px 10px; border:1px solid #475569; border-radius:9px; color:#f8fafc; background:#0f172a; }
+    input[type=color] { width:100%; height:38px; padding:3px; border:1px solid #475569; border-radius:9px; background:#0f172a; }
+    .field-row { display:grid; grid-template-columns:1fr 82px; gap:8px; }
+    .actions { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    .status { min-height:36px; padding:9px 10px; border-radius:9px; color:#bfdbfe; background:#172554; font-size:12px; line-height:1.4; }
+    .zone-list { display:grid; gap:7px; max-height:210px; overflow:auto; }
+    .zone-item { display:flex; gap:8px; align-items:center; padding:8px; border:1px solid #334155; border-radius:9px; cursor:pointer; background:#0f172a; }
+    .zone-item.active { border-color:#60a5fa; background:#172554; }
+    .swatch { width:12px; height:12px; flex:0 0 12px; border-radius:50%; }
+    .zone-copy { min-width:0; }
+    .zone-copy b, .zone-copy small { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .zone-copy small { color:#94a3b8; margin-top:2px; }
+    .privacy { display:flex; align-items:flex-start; gap:7px; padding:8px; color:#cbd5e1; background:#201a31; border-radius:9px; font-size:12px; }
+    .privacy input { margin-top:2px; }
+    .stage-card:fullscreen { padding:10px; background:#020617; }
+    .stage-card:fullscreen .canvas-scroll { max-height:calc(100vh - 74px); }
+    @media (max-width: 900px) { .shell { grid-template-columns:1fr; } .canvas-scroll { max-height:560px; } }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <section class="stage-card" id="stageCard">
+      <div class="toolbar">
+        <button id="zoomOut" title="Thu nhỏ">−</button>
+        <span class="zoom-value" id="zoomValue">100%</span>
+        <button id="zoomIn" title="Phóng to">＋</button>
+        <button id="fit">Vừa khung</button>
+        <button id="undo">Hoàn tác điểm</button>
+        <button id="clearDraft">Vẽ lại</button>
+        <button id="fullscreen">Toàn màn hình</button>
+      </div>
+      <div class="canvas-scroll" id="scroll">
+        <div class="canvas-wrap" id="canvasWrap"><canvas id="canvas"></canvas></div>
+      </div>
+    </section>
+    <aside class="panel">
+      <h3>Polygon vùng · Camera <span id="cameraLabel"></span></h3>
+      <div class="hint">Click lần lượt quanh vùng cần đánh dấu. Tối thiểu 3 điểm; sau đó bấm <b>Lưu vùng</b>. Kéo các điểm tròn để hiệu chỉnh.</div>
+      <label>Tên hiển thị<input id="label" type="text" maxlength="60" placeholder="Ví dụ: Vùng chào Bé Xinh" /></label>
+      <label>Loại vùng
+        <select id="kind">
+          <option value="door_inside">Cửa · phía trong</option>
+          <option value="door_outside">Cửa · phía ngoài</option>
+          <option value="be_xinh">Vùng tương tác Bé Xinh</option>
+          <option value="water">Khu vực nước uống</option>
+          <option value="restroom">WC / khu riêng tư</option>
+          <option value="workspace">Khu làm việc</option>
+          <option value="custom">Vùng tùy chỉnh</option>
+        </select>
+      </label>
+      <div class="field-row">
+        <label>Mã vùng<input id="zoneId" type="text" maxlength="50" placeholder="be_xinh" /></label>
+        <label>Màu<input id="color" type="color" value="#22c55e" /></label>
+      </div>
+      <label class="privacy"><input id="privacy" type="checkbox" /> Không đọc tên người trong vùng này</label>
+      <div class="status" id="status">Chưa có điểm. Hãy click lên ảnh để bắt đầu.</div>
+      <div class="actions">
+        <button class="primary" id="save">Lưu vùng</button>
+        <button id="newZone">Vùng mới</button>
+      </div>
+      <button class="danger" id="remove" disabled>Xóa vùng đang chọn</button>
+      <div>
+        <h3 style="margin-bottom:8px">Các vùng đã vẽ</h3>
+        <div class="zone-list" id="zoneList"></div>
+      </div>
+    </aside>
+  </div>
+  <script>
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const wrap = document.getElementById('canvasWrap');
+    const scroll = document.getElementById('scroll');
+    const image = new Image();
+    const state = { camera:'', zones:[], draft:[], selected:-1, dragPoint:-1, zoom:1, source:'' };
+    const colors = ['#22c55e','#3b82f6','#f59e0b','#a855f7','#ef4444','#06b6d4'];
+    const $ = id => document.getElementById(id);
+
+    function post(type, extra={}) {
+      window.parent.postMessage({ isStreamlitMessage:true, type, ...extra }, '*');
+    }
+    function ready() { post('streamlit:componentReady', { apiVersion:1 }); }
+    function frameHeight() { post('streamlit:setFrameHeight', { height: Math.max(760, document.documentElement.scrollHeight + 4) }); }
+    function emit() {
+      post('streamlit:setComponentValue', {
+        dataType:'json',
+        value:{ camera:state.camera, zones:state.zones, revision:Date.now() }
+      });
+    }
+    function slug(value) {
+      return String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g,'')
+        .toLowerCase().replace(/đ/g,'d').replace(/[^a-z0-9]+/g,'_').replace(/^_+|_+$/g,'').slice(0,50);
+    }
+    function storageKey() { return `ai-mind-zone-draft-v1:${state.camera}`; }
+    function formValue() {
+      return { label:$('label').value, kind:$('kind').value, id:$('zoneId').value,
+        color:$('color').value, privacy:$('privacy').checked };
+    }
+    function persistDraft() {
+      if(!state.camera) return;
+      try {
+        const editingId=state.selected>=0 ? state.zones[state.selected]?.id || '' : '';
+        localStorage.setItem(storageKey(),JSON.stringify({draft:state.draft,form:formValue(),editingId}));
+      } catch(_error) { /* Private browsing may disable storage; server autosave still works. */ }
+    }
+    function restoreDraft() {
+      try {
+        const saved=JSON.parse(localStorage.getItem(storageKey()) || 'null');
+        if(!saved || !Array.isArray(saved.draft)) return;
+        state.draft=saved.draft.filter(point=>Array.isArray(point)&&point.length===2);
+        const form=saved.form || {};
+        const editingIndex=saved.editingId ? state.zones.findIndex(zone=>zone.id===saved.editingId) : -1;
+        state.selected=state.draft.length ? -1 : editingIndex;
+        $('label').value=String(form.label || ''); $('kind').value=String(form.kind || 'be_xinh');
+        $('zoneId').value=String(form.id || ''); $('color').value=String(form.color || '#22c55e');
+        $('privacy').checked=Boolean(form.privacy); $('remove').disabled=state.selected<0;
+      } catch(_error) { /* Ignore corrupt browser draft and start clean. */ }
+    }
+    function kindLabel(kind) {
+      const option = [...$('kind').options].find(item => item.value === kind);
+      return option ? option.textContent : kind;
+    }
+    function fitCanvas() {
+      if (!image.naturalWidth) return;
+      const baseWidth = Math.min(image.naturalWidth, Math.max(640, scroll.clientWidth));
+      const baseHeight = Math.round(baseWidth * image.naturalHeight / image.naturalWidth);
+      canvas.width = baseWidth; canvas.height = baseHeight;
+      wrap.style.width = `${baseWidth * state.zoom}px`;
+      wrap.style.height = `${baseHeight * state.zoom}px`;
+      canvas.style.width = `${baseWidth * state.zoom}px`;
+      canvas.style.height = `${baseHeight * state.zoom}px`;
+      draw(); frameHeight();
+    }
+    function pointToCanvas(point) { return [point[0] * canvas.width, point[1] * canvas.height]; }
+    function drawPolygon(points, color, fill, selected, label) {
+      if (!points.length) return;
+      ctx.beginPath();
+      points.forEach((point,index) => { const [x,y]=pointToCanvas(point); index ? ctx.lineTo(x,y) : ctx.moveTo(x,y); });
+      if (fill && points.length >= 3) ctx.closePath();
+      ctx.lineWidth = selected ? 4 : 2;
+      ctx.strokeStyle = color; ctx.stroke();
+      if (fill && points.length >= 3) { ctx.fillStyle = `${color}33`; ctx.fill(); }
+      points.forEach((point,index) => {
+        const [x,y]=pointToCanvas(point); ctx.beginPath(); ctx.arc(x,y, selected ? 7 : 4, 0, Math.PI*2);
+        ctx.fillStyle = selected ? '#fff' : color; ctx.fill(); ctx.strokeStyle=color; ctx.lineWidth=2; ctx.stroke();
+        if (selected) { ctx.fillStyle='#0f172a'; ctx.font='bold 10px sans-serif'; ctx.fillText(String(index+1),x+9,y-8); }
+      });
+      if (label && points[0]) {
+        const xs=points.map(p=>p[0]*canvas.width), ys=points.map(p=>p[1]*canvas.height);
+        const x=xs.reduce((a,b)=>a+b,0)/xs.length, y=ys.reduce((a,b)=>a+b,0)/ys.length;
+        ctx.font='bold 14px sans-serif'; const w=ctx.measureText(label).width;
+        ctx.fillStyle='rgba(2,6,23,.82)'; ctx.fillRect(x-w/2-6,y-20,w+12,24);
+        ctx.fillStyle='#fff'; ctx.fillText(label,x-w/2,y-4);
+      }
+    }
+    function draw() {
+      if (!canvas.width) return;
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      if (image.complete && image.naturalWidth) ctx.drawImage(image,0,0,canvas.width,canvas.height);
+      state.zones.forEach((zone,index)=>drawPolygon(zone.points,zone.color || '#22c55e',true,index===state.selected,zone.label));
+      drawPolygon(state.draft,$('color').value,false,true,'');
+      updateStatus();
+    }
+    function pointer(event) {
+      const rect=canvas.getBoundingClientRect();
+      return [Math.max(0,Math.min(1,(event.clientX-rect.left)/rect.width)), Math.max(0,Math.min(1,(event.clientY-rect.top)/rect.height))];
+    }
+    function distance(a,b) { return Math.hypot(a[0]-b[0],a[1]-b[1]); }
+    function pointInPolygon(point, polygon) {
+      let inside=false;
+      for(let i=0,j=polygon.length-1;i<polygon.length;j=i++){
+        const xi=polygon[i][0], yi=polygon[i][1], xj=polygon[j][0], yj=polygon[j][1];
+        const hit=((yi>point[1])!==(yj>point[1])) && point[0] < (xj-xi)*(point[1]-yi)/((yj-yi)||1e-12)+xi;
+        if(hit) inside=!inside;
+      }
+      return inside;
+    }
+    function selectZone(index) {
+      state.selected=index; state.draft=[];
+      if(index>=0){ const z=state.zones[index]; $('label').value=z.label; $('kind').value=z.kind; $('zoneId').value=z.id; $('color').value=z.color; $('privacy').checked=z.privacy==='anonymous_audio'; }
+      $('remove').disabled=index<0; renderList(); draw(); persistDraft();
+    }
+    function newZone() {
+      state.selected=-1; state.draft=[];
+      $('label').value=''; $('kind').value='be_xinh'; $('zoneId').value='';
+      $('color').value=colors[state.zones.length%colors.length]; $('privacy').checked=false;
+      $('remove').disabled=true; renderList(); draw(); persistDraft();
+    }
+    function updateStatus(message='') {
+      if(message){ $('status').textContent=message; return; }
+      if(state.selected>=0) $('status').textContent=`Đang sửa vùng “${state.zones[state.selected].label}”. Kéo điểm tròn để chỉnh polygon.`;
+      else if(state.draft.length) $('status').textContent=`Đã đặt ${state.draft.length} điểm · cần tối thiểu 3 điểm.`;
+      else $('status').textContent='Chưa có điểm. Hãy click lên ảnh để bắt đầu.';
+    }
+    function renderList() {
+      const list=$('zoneList'); list.innerHTML='';
+      if(!state.zones.length){ list.innerHTML='<div class="hint">Chưa lưu vùng nào.</div>'; return; }
+      state.zones.forEach((zone,index)=>{
+        const item=document.createElement('div'); item.className=`zone-item${index===state.selected?' active':''}`;
+        item.innerHTML=`<i class="swatch" style="background:${zone.color}"></i><div class="zone-copy"><b></b><small></small></div>`;
+        item.querySelector('b').textContent=zone.label; item.querySelector('small').textContent=`${zone.id} · ${kindLabel(zone.kind)}`;
+        item.onclick=()=>selectZone(index); list.appendChild(item);
+      });
+    }
+    function saveZone() {
+      const editing=state.selected>=0;
+      const points=editing ? state.zones[state.selected].points : state.draft;
+      const label=$('label').value.trim(), kind=$('kind').value;
+      const id=slug($('zoneId').value || label || kind);
+      if(points.length<3){ updateStatus('Cần ít nhất 3 điểm để tạo polygon.'); return; }
+      if(!label){ updateStatus('Hãy nhập tên hiển thị của vùng.'); return; }
+      if(!id){ updateStatus('Mã vùng không hợp lệ.'); return; }
+      if(state.zones.some((z,i)=>z.id===id && i!==state.selected)){ updateStatus(`Mã vùng “${id}” đã tồn tại.`); return; }
+      const zone={ id,label,kind,points:points.map(p=>p.map(v=>Number(v.toFixed(6)))),color:$('color').value,
+        privacy:(kind==='restroom'||$('privacy').checked)?'anonymous_audio':'standard', enabled:true };
+      if(editing) state.zones[state.selected]=zone; else { state.zones.push(zone); state.selected=state.zones.length-1; state.draft=[]; }
+      $('zoneId').value=id; $('remove').disabled=false; renderList(); draw(); persistDraft(); emit();
+      updateStatus(`Đã cập nhật “${label}” và gửi yêu cầu tự động lưu JSON.`);
+    }
+
+    canvas.addEventListener('pointerdown',event=>{
+      const p=pointer(event);
+      if(state.selected>=0){
+        const zone=state.zones[state.selected], threshold=14/Math.min(canvas.width,canvas.height)/state.zoom;
+        const vertex=zone.points.findIndex(item=>distance(item,p)<threshold);
+        if(vertex>=0){ state.dragPoint=vertex; canvas.setPointerCapture(event.pointerId); return; }
+      }
+      for(let i=state.zones.length-1;i>=0;i--){ if(pointInPolygon(p,state.zones[i].points)){ selectZone(i); return; } }
+      if(state.selected>=0) newZone();
+      state.draft.push(p); draw(); persistDraft();
+    });
+    canvas.addEventListener('pointermove',event=>{
+      if(state.selected<0||state.dragPoint<0) return;
+      state.zones[state.selected].points[state.dragPoint]=pointer(event); draw();
+    });
+    canvas.addEventListener('pointerup',event=>{
+      if(state.dragPoint>=0){ state.dragPoint=-1; canvas.releasePointerCapture(event.pointerId); persistDraft(); emit(); }
+    });
+    $('label').addEventListener('input',()=>{ if(!$('zoneId').dataset.manual) $('zoneId').value=slug($('label').value); persistDraft(); });
+    $('zoneId').addEventListener('input',()=>{$('zoneId').dataset.manual='1';persistDraft();});
+    $('kind').addEventListener('change',()=>{ if($('kind').value==='restroom') $('privacy').checked=true; persistDraft(); });
+    $('color').addEventListener('input',()=>{draw();persistDraft();});
+    $('privacy').addEventListener('change',persistDraft);
+    $('save').onclick=saveZone; $('newZone').onclick=newZone;
+    $('remove').onclick=()=>{ if(state.selected<0)return; const name=state.zones[state.selected].label; if(!confirm(`Xóa vùng “${name}”?`))return; state.zones.splice(state.selected,1); newZone(); emit(); };
+    $('undo').onclick=()=>{ if(state.draft.length) state.draft.pop(); draw(); persistDraft(); };
+    $('clearDraft').onclick=()=>{ if(state.selected>=0)newZone(); else {state.draft=[];draw();persistDraft();} };
+    function setZoom(value){ state.zoom=Math.max(.5,Math.min(2.5,value)); $('zoomValue').textContent=`${Math.round(state.zoom*100)}%`; fitCanvas(); }
+    $('zoomIn').onclick=()=>setZoom(state.zoom+.25); $('zoomOut').onclick=()=>setZoom(state.zoom-.25); $('fit').onclick=()=>setZoom(1);
+    $('fullscreen').onclick=()=>$('stageCard').requestFullscreen?.();
+    window.addEventListener('resize',()=>{ if(state.zoom===1) fitCanvas(); frameHeight(); });
+    window.addEventListener('message',event=>{
+      if(event.data?.type!=='streamlit:render') return;
+      const args=event.data.args || {}, camera=String(args.camera||'A');
+      const cameraChanged=camera!==state.camera;
+      if(cameraChanged){ state.camera=camera; state.selected=-1; state.draft=[]; $('cameraLabel').textContent=camera; }
+      state.zones=Array.isArray(args.zones)?JSON.parse(JSON.stringify(args.zones)):[];
+      if(cameraChanged) restoreDraft();
+      if(args.image && args.image!==state.source){ state.source=args.image; image.onload=()=>{setZoom(1);renderList();}; image.src=args.image; }
+      renderList(); draw(); frameHeight();
+    });
+    ready(); frameHeight();
+  </script>
+</body>
+</html>

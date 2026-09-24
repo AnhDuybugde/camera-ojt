@@ -23,17 +23,21 @@ class StageMetrics:
     def __init__(self) -> None:
         self._stages: dict[str, StageMetric] = {}
 
+    def observe(self, name: str, elapsed_s: float) -> None:
+        """Record an already-measured duration without nesting a large block."""
+        elapsed = max(0.0, float(elapsed_s))
+        metric = self._stages.setdefault(name, StageMetric())
+        metric.count += 1
+        metric.total_s += elapsed
+        metric.max_s = max(metric.max_s, elapsed)
+
     @contextmanager
     def measure(self, name: str) -> Iterator[None]:
         started = time.perf_counter()
         try:
             yield
         finally:
-            elapsed = time.perf_counter() - started
-            metric = self._stages.setdefault(name, StageMetric())
-            metric.count += 1
-            metric.total_s += elapsed
-            metric.max_s = max(metric.max_s, elapsed)
+            self.observe(name, time.perf_counter() - started)
 
     def snapshot(self) -> dict[str, dict[str, float]]:
         return {

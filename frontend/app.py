@@ -11,13 +11,13 @@ from auth.permissions import ADMIN, EMPLOYEE, require_permission
 from config import settings
 import ui.components as ui_components
 from ui import (
-    audit_log, dashboard, employees, google_sync, history, live_attendance, login,
+    audit_log, dashboard, employees, history, live_attendance, login,
     register_face, settings as settings_page, spatial_analytics, statistics,
-    work_schedule, my_attendance,
+    work_schedule, my_attendance, zone_labeler,
 )
 from ui.common import (
     get_attendance_admin_service, get_attendance_service, get_auth_service, get_db,
-    get_detector, get_recognizer, get_sync_service, get_sync_worker,
+    get_daily_attendance_worker, get_detector, get_recognizer, get_sync_service, get_sync_worker,
 )
 from ui.theme import apply_theme
 from utils.logger import setup_logging
@@ -33,17 +33,19 @@ apply_theme()
 # Refresh presentation-only modules once per browser session. This is required
 # for long-running Streamlit processes, which may otherwise retain imported page
 # modules even after their table implementation changes on disk.
-_TABLE_UI_VERSION = "reports-segmented-v7"
+_TABLE_UI_VERSION = "history-stitch-v11"
 if st.session_state.get("_table_ui_version") != _TABLE_UI_VERSION:
     importlib.reload(ui_components)
     for page_module in (
-        employees, history, dashboard, statistics, google_sync, audit_log,
+        employees, history, dashboard, statistics, audit_log,
         live_attendance, spatial_analytics, work_schedule, register_face, login, my_attendance,
+        zone_labeler,
     ):
         importlib.reload(page_module)
     st.session_state._table_ui_version = _TABLE_UI_VERSION
 
 db = get_db(4)
+get_daily_attendance_worker()
 auth_service = get_auth_service(2)
 role = st.session_state.get("role")
 if role == EMPLOYEE and st.session_state.get("authenticated"):
@@ -63,10 +65,10 @@ ALL_PAGES = (
     ("Đăng ký", "Registration", "badge", "registration"),
     ("Lịch làm việc", "Work Schedule", "calendar_month", "work_schedule"),
     ("Điểm danh trực tiếp", "Live Attendance", "videocam", "live"),
+    ("Gắn nhãn vùng", "Zone Labeler", "gesture", "zone_labeler"),
     ("Lịch sử chấm công", "Attendance History", "event_available", "history"),
     ("Nhật ký chỉnh sửa", "Audit Log", "history_edu", "audit"),
     ("Báo cáo & Phân tích", "Reports", "insights", "reports"),
-    ("Đồng bộ Google Sheets", "Google Sheets Sync", "sync", "sheets"),
     ("Cài đặt", "Settings", "settings", "settings"),
 )
 EMPLOYEE_PAGE_KEYS = {
@@ -171,6 +173,8 @@ elif page == "Live Attendance":
     _render_current(
         live_attendance, 4, get_detector(), get_recognizer(), attendance_service, role
     )
+elif page == "Zone Labeler":
+    _render_current(zone_labeler, 1, role)
 elif page == "Attendance History":
     _render_current(history, 3, db, role, get_attendance_admin_service())
 elif page == "Audit Log":
@@ -187,7 +191,5 @@ elif page == "Reports":
     else:
         st.caption("CHECK-IN/OUT là dữ liệu chấm công; mật độ và luồng di chuyển thực tế lấy từ camera phân tích.")
         _render_current(spatial_analytics, 4, db, role, get_detector(), get_recognizer())
-elif page == "Google Sheets Sync":
-    _render_current(google_sync, 3, db, get_sync_service(), role)
 else:
-    _render_current(settings_page, 1, role)
+    _render_current(settings_page, 3, db, get_sync_service(), role)

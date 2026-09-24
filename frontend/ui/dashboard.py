@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from html import escape
 
 import altair as alt
@@ -8,7 +8,8 @@ import cv2
 import pandas as pd
 import streamlit as st
 
-from attendance.attendance_rules import scheduled_absent_ids, work_session_at
+from attendance.daily_service import daily_attendance_counts
+from attendance.schedule_policy import get_next_week_range, get_week_schedule_completion
 from config import settings
 from database.db import Database
 from ui.components import (
@@ -23,31 +24,24 @@ def render(db: Database) -> None:
     employees = db.list_employees()
     records = db.list_attendance(today_iso, today_iso)
     schedules = db.list_work_schedules(today_iso, today_iso)
-    current_session = work_session_at(
-        datetime.now(), settings.morning_end_time, settings.afternoon_start_time
-    )
-    current_schedules = (
-        [row for row in schedules if row["work_session"] == current_session]
-        if today.weekday() < 5 and current_session else []
-    )
     week_records = db.list_attendance(
         (today - timedelta(days=6)).isoformat(), today_iso
     )
     scheduled_on_ids = {
-        row["employee_id"] for row in current_schedules if row["work_status"] == "ON"
+        row["employee_id"] for row in schedules if row["work_status"] == "ON"
     }
     wfh_ids = {
-        row["employee_id"] for row in current_schedules if row["work_status"] == "WFH"
+        row["employee_id"] for row in schedules
+        if row["work_status"] == "WFH" and row["employee_id"] not in scheduled_on_ids
     }
-    checked_in_ids = {row["employee_id"] for row in records}
-    present_ids = checked_in_ids & scheduled_on_ids
-    absent_ids = scheduled_absent_ids(scheduled_on_ids, present_ids)
-    total, present = len(employees), len(present_ids)
-    late = sum(
-        row["status"] == "LATE" and row["employee_id"] in scheduled_on_ids
-        for row in records
-    )
-    absent = len(absent_ids)
+    counts = daily_attendance_counts(records, scheduled_on_ids)
+    absent_ids = {
+        row["employee_id"] for row in records
+        if row["employee_id"] in scheduled_on_ids
+        and row["status"] == "ABSENT"
+    }
+    total, present = len(employees), counts["present"]
+    late, absent = counts["late"], counts["absent"]
     engines = st.session_state.get("live_engines", {})
     connected = sum(bool(engine.camera.connected) for engine in engines.values())
 
@@ -56,6 +50,26 @@ def render(db: Database) -> None:
         f"{vietnamese_date(today)} · Dữ liệu vận hành theo thời gian thực",
         status=f"{connected}/{len(settings.camera_sources)} camera trực tuyến",
     )
+
+    next_start, next_end = get_next_week_range(today)
+    next_rows = db.list_work_schedules(next_start.isoformat(), next_end.isoformat())
+    incomplete = [
+        employee for employee in employees
+        if get_week_schedule_completion(next_rows, employee["employee_id"], next_start).status != "COMPLETE"
+    ]
+    completed = len(employees) - len(incomplete)
+    if incomplete:
+        st.warning(
+            f"Lịch tuần sau ({next_start:%d/%m} – {next_end:%d/%m/%Y}): "
+            f"{completed}/{len(employees)} nhân viên đã hoàn tất; "
+            f"{len(incomplete)} nhân viên chưa hoàn tất."
+        )
+        with st.expander("Xem nhân viên chưa hoàn tất lịch"):
+            for employee in incomplete:
+                completion = get_week_schedule_completion(next_rows, employee["employee_id"], next_start)
+                st.write(f"{employee['employee_id']} · {employee['full_name']} — {completion.registered_days}/5 ngày")
+    elif employees:
+        st.success(f"Lịch tuần sau: {completed}/{len(employees)} nhân viên đã hoàn tất.")
 
     # ── KPI cards ────────────────────────────────────────────────────────────
     # Stitch card colors exactly:
@@ -187,8 +201,10 @@ def render(db: Database) -> None:
                 "check_in": _clock(row["check_in"]),
                 "check_out": _clock(row["check_out"]),
                 "status": status_badge(
-                    "Đúng giờ" if row["status"] == "ON_TIME" else "Đi muộn",
-                    "success" if row["status"] == "ON_TIME" else "warning",
+                    {"ON_TIME": "Đúng giờ", "LATE": "Đi muộn", "WAITING": "Chờ chấm công",
+                     "ABSENT": "Vắng mặt"}.get(row["status"], row["status"]),
+                    {"ON_TIME": "success", "LATE": "warning", "WAITING": "neutral",
+                     "ABSENT": "danger"}.get(row["status"], "neutral"),
                 ),
             } for row in recent],
             compact=True,
