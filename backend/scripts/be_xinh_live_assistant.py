@@ -18,6 +18,10 @@ import asyncio
 import hashlib
 import os
 from pathlib import Path
+import re
+import shutil
+import socket
+import subprocess
 import sys
 import time
 
@@ -58,7 +62,11 @@ except ModuleNotFoundError:  # imported as scripts.be_xinh_live_assistant in tes
         release_chat_lock,
         strip_wake_command,
     )
-from camera_tracking.voice.rtsp_voice_listener import TARGET_RATE, transcribe_segment_fw
+from camera_tracking.voice.rtsp_voice_listener import (
+    TARGET_RATE,
+    find_ffmpeg,
+    transcribe_segment_fw,
+)
 
 LIVE_SYSTEM = """Bạn là Bé Xinh, người bạn đồng hành bằng giọng nói của hệ thống Camera-OJT.
 
@@ -82,6 +90,114 @@ chấm công, thời gian, thời tiết hoặc trạng thái hệ thống, hãy
 thay vì đoán. Nếu dữ liệu không đủ, nói rõ điều chưa chắc; không tự bịa danh tính
 hoặc trạng thái chấm công. Không dùng Markdown trong lời nói. Tự xưng là Bé Xinh.
 """
+
+
+class LaptopSpeaker:
+    """Small synchronous speaker adapter backed by ffplay."""
+
+    def __init__(self) -> None:
+        ffmpeg = find_ffmpeg()
+        sibling = Path(ffmpeg).with_name(
+            "ffplay.exe" if os.name == "nt" else "ffplay"
+        ) if ffmpeg else None
+        self.ffplay = (
+            str(sibling) if sibling and sibling.is_file()
+            else shutil.which("ffplay")
+        )
+        if not self.ffplay:
+            raise RuntimeError("Không tìm thấy ffplay để phát loa laptop")
+        self.gain = 0.85
+        self._process: subprocess.Popen | None = None
+
+    def play_file_sync(self, audio_path: str | Path) -> None:
+        volume = max(10, min(100, round(float(self.gain) * 100)))
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        self._process = subprocess.Popen(
+            [
+                self.ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet",
+                "-volume", str(volume), str(audio_path),
+            ],
+            creationflags=flags,
+        )
+        try:
+            code = self._process.wait()
+            if code != 0:
+                raise RuntimeError(f"ffplay thoát với mã {code}")
+        finally:
+            self._process = None
+
+    def cancel_playback(self) -> None:
+        process = self._process
+        if process is not None and process.poll() is None:
+            process.kill()
+
+    def open_pcm_stream(self, *, input_sample_rate: int = 24_000):
+        raise RuntimeError(
+            "Loa laptop chưa hỗ trợ native PCM stream; dùng edge/zerotts"
+        )
+
+    def close(self) -> None:
+        self.cancel_playback()
+
+
+def _laptop_mic_input() -> tuple[list[str], str]:
+    """Resolve a Windows microphone for ffmpeg DirectShow capture."""
+    configured = os.getenv("BE_XINH_LAPTOP_MIC", "").strip()
+    if configured:
+        return [
+            "-f", "dshow", "-audio_buffer_size", "50",
+            "-i", f"audio={configured}",
+        ], configured
+    if os.name != "nt":
+        return ["-f", "pulse", "-i", "default"], "default"
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("Không tìm thấy ffmpeg để mở microphone laptop")
+    probe = subprocess.run(
+        [ffmpeg, "-hide_banner", "-list_devices", "true", "-f", "dshow",
+         "-i", "dummy"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=subprocess.CREATE_NO_WINDOW,
+        timeout=8,
+        check=False,
+    )
+    names = re.findall(r'"([^"]+)"\s+\(audio\)', probe.stderr)
+    physical = [
+        name for name in names
+        if "microphone" in name.lower() and "vmix" not in name.lower()
+    ]
+    if not physical:
+        physical = [name for name in names if "vmix" not in name.lower()]
+    if not physical:
+        raise RuntimeError(
+            "Không tìm thấy microphone laptop; đặt BE_XINH_LAPTOP_MIC"
+        )
+    selected = physical[0]
+    return [
+        "-f", "dshow", "-audio_buffer_size", "50",
+        "-i", f"audio={selected}",
+    ], selected
+
+
+def _camera_audio_reachable() -> bool:
+    """Quickly verify both camera input and output transports for auto mode."""
+    host = os.getenv("IMOU_IP", "").strip()
+    if not host:
+        return False
+    try:
+        talk_port = int(os.getenv("IMOU_TALK_PORT", "8086"))
+    except ValueError:
+        talk_port = 8086
+    for port in (554, talk_port):
+        try:
+            with socket.create_connection((host, port), timeout=0.7):
+                pass
+        except OSError:
+            return False
+    return True
 
 
 def _build_live_config(output_mode: str, voice_name: str) -> dict:
@@ -301,7 +417,7 @@ async def _send_audio_turn(session, pcm: bytes, types) -> None:
 
 
 async def _receive_turn(session, speaker: CameraCheckInAnnouncer, types,
-                        timeout_s: float = 12.0, *,
+                        timeout_s: float = 18.0, *,
                         stream_native_audio: bool = True) -> tuple[str, str, float]:
     """Receive one Live turn and service native audio/text plus tool calls.
 
@@ -315,60 +431,84 @@ async def _receive_turn(session, speaker: CameraCheckInAnnouncer, types,
     started = time.monotonic()
     try:
         async with asyncio.timeout(timeout_s):
-            async for response in session.receive():
+            # A tool call closes one server turn. After sending its result the
+            # SDK exposes the spoken answer through a new receive() iterator,
+            # so keep receiving until the final non-tool turn completes.
+            tool_result_pending = False
+            final_turn_complete = False
+            while not final_turn_complete:
+                received_any = False
+                async for response in session.receive():
+                    received_any = True
                 # The SDK exposes response.data as the native 24 kHz PCM shortcut.
-                data = getattr(response, "data", None)
-                audio_chunks = [bytes(data)] if data else []
-                content = getattr(response, "server_content", None)
-                if not audio_chunks and content is not None:
-                    model_turn = getattr(content, "model_turn", None)
-                    for part in getattr(model_turn, "parts", None) or []:
-                        inline = getattr(part, "inline_data", None)
-                        inline_data = getattr(inline, "data", None)
-                        mime = str(getattr(inline, "mime_type", "") or "")
-                        if inline_data and (not mime or mime.startswith("audio/")):
-                            audio_chunks.append(bytes(inline_data))
-                for audio_chunk in audio_chunks if stream_native_audio else []:
-                    if stream is None:
-                        first_output_at = time.monotonic()
-                        stream = speaker.open_pcm_stream(input_sample_rate=24_000)
-                    stream.write(audio_chunk)
-
-                tool_call = getattr(response, "tool_call", None)
-                if tool_call:
-                    function_responses = []
-                    for fc in getattr(tool_call, "function_calls", None) or []:
-                        result = _safe_tool_call(fc.name, getattr(fc, "args", None))
-                        print(f"[Bé Xinh Live] tool {fc.name} -> {result}", flush=True)
-                        function_responses.append(types.FunctionResponse(
-                            id=fc.id, name=fc.name, response={"result": result}
-                        ))
-                    if function_responses:
-                        await session.send_tool_response(function_responses=function_responses)
-
-                if content is not None:
-                    in_tx = getattr(content, "input_transcription", None)
-                    out_tx = getattr(content, "output_transcription", None)
-                    if in_tx is not None and getattr(in_tx, "text", None):
-                        user_text = str(in_tx.text).strip()
-                    if out_tx is not None and getattr(out_tx, "text", None):
-                        assistant_text += str(out_tx.text)
-                        if first_output_at is None:
+                    data = getattr(response, "data", None)
+                    audio_chunks = [bytes(data)] if data else []
+                    content = getattr(response, "server_content", None)
+                    if not audio_chunks and content is not None:
+                        model_turn = getattr(content, "model_turn", None)
+                        for part in getattr(model_turn, "parts", None) or []:
+                            inline = getattr(part, "inline_data", None)
+                            inline_data = getattr(inline, "data", None)
+                            mime = str(getattr(inline, "mime_type", "") or "")
+                            if inline_data and (not mime or mime.startswith("audio/")):
+                                audio_chunks.append(bytes(inline_data))
+                    for audio_chunk in audio_chunks if stream_native_audio else []:
+                        if stream is None:
                             first_output_at = time.monotonic()
-                    # TEXT response mode exposes the answer through model-turn
-                    # parts instead of output_audio_transcription.
-                    model_turn = getattr(content, "model_turn", None)
-                    for part in getattr(model_turn, "parts", None) or []:
-                        part_text = getattr(part, "text", None)
-                        if part_text:
-                            assistant_text += str(part_text)
+                            stream = speaker.open_pcm_stream(input_sample_rate=24_000)
+                        stream.write(audio_chunk)
+
+                    tool_call = getattr(response, "tool_call", None)
+                    if tool_call:
+                        function_responses = []
+                        for fc in getattr(tool_call, "function_calls", None) or []:
+                            result = _safe_tool_call(fc.name, getattr(fc, "args", None))
+                            print(f"[Bé Xinh Live] tool {fc.name} -> {result}", flush=True)
+                            function_responses.append(types.FunctionResponse(
+                                id=fc.id, name=fc.name, response={"result": result}
+                            ))
+                        if function_responses:
+                            await session.send_tool_response(
+                                function_responses=function_responses
+                            )
+                            tool_result_pending = True
+
+                    model_output_seen = bool(audio_chunks)
+                    if content is not None:
+                        in_tx = getattr(content, "input_transcription", None)
+                        out_tx = getattr(content, "output_transcription", None)
+                        if in_tx is not None and getattr(in_tx, "text", None):
+                            user_text = str(in_tx.text).strip()
+                        if out_tx is not None and getattr(out_tx, "text", None):
+                            assistant_text += str(out_tx.text)
+                            model_output_seen = True
                             if first_output_at is None:
                                 first_output_at = time.monotonic()
-                    if bool(getattr(content, "interrupted", False)) and stream is not None:
-                        stream.close(abort=True)
-                        stream = None
-                    if bool(getattr(content, "turn_complete", False)):
-                        break
+                        # TEXT response mode exposes the answer through model-turn
+                        # parts instead of output_audio_transcription.
+                        model_turn = getattr(content, "model_turn", None)
+                        for part in getattr(model_turn, "parts", None) or []:
+                            part_text = getattr(part, "text", None)
+                            if part_text:
+                                assistant_text += str(part_text)
+                                model_output_seen = True
+                                if first_output_at is None:
+                                    first_output_at = time.monotonic()
+                        if model_output_seen and not tool_call:
+                            tool_result_pending = False
+                        if (bool(getattr(content, "interrupted", False))
+                                and stream is not None):
+                            stream.close(abort=True)
+                            stream = None
+                        if bool(getattr(content, "turn_complete", False)):
+                            if tool_result_pending:
+                                break
+                            final_turn_complete = True
+                            break
+                if final_turn_complete:
+                    break
+                if not tool_result_pending or not received_any:
+                    break
     except TimeoutError:
         print(f"[Bé Xinh Live] Live im lang qua {timeout_s:.0f}s "
               f"(mic on/yeu?) - ve cho goi.", flush=True)
@@ -462,15 +602,41 @@ async def run_live(args: argparse.Namespace) -> int:
 
     config = load_config(args.config)
     voice_cfg = config.voice
-    rtsp = imou_url(int(voice_cfg.voice_listen_channel), int(voice_cfg.voice_listen_subtype))
-    if not rtsp:
-        raise RuntimeError("Thiếu IMOU_IP/USER/PASSWORD cho mic RTSP")
-    mic_input = ["-fflags", "nobuffer", "-flags", "low_delay",
-                 "-rtsp_transport", "tcp", "-i", rtsp]
-
-    speaker = CameraCheckInAnnouncer.from_env()
-    if speaker is None:
-        raise RuntimeError("Không mở được IMOU direct speaker; kiểm tra IMOU_TALK_HELPER")
+    requested_audio_mode = os.getenv("BE_XINH_AUDIO_MODE", "auto").strip().lower()
+    if requested_audio_mode not in {"auto", "camera", "laptop"}:
+        raise RuntimeError(
+            "BE_XINH_AUDIO_MODE chỉ nhận auto, camera hoặc laptop"
+        )
+    audio_mode = requested_audio_mode
+    if audio_mode == "auto":
+        audio_mode = "camera" if _camera_audio_reachable() else "laptop"
+        print(
+            f"[Bé Xinh Live] audio auto -> {audio_mode}",
+            flush=True,
+        )
+    if audio_mode == "laptop":
+        mic_input, microphone_name = _laptop_mic_input()
+        speaker = LaptopSpeaker()
+        print(
+            f"[Bé Xinh Live] Laptop Test | mic={microphone_name} | loa=default",
+            flush=True,
+        )
+    else:
+        rtsp = imou_url(
+            int(voice_cfg.voice_listen_channel),
+            int(voice_cfg.voice_listen_subtype),
+        )
+        if not rtsp:
+            raise RuntimeError("Thiếu IMOU_IP/USER/PASSWORD cho mic RTSP")
+        mic_input = [
+            "-fflags", "nobuffer", "-flags", "low_delay",
+            "-rtsp_transport", "tcp", "-i", rtsp,
+        ]
+        speaker = CameraCheckInAnnouncer.from_env()
+        if speaker is None:
+            raise RuntimeError(
+                "Không mở được IMOU direct speaker; kiểm tra IMOU_TALK_HELPER"
+            )
 
     stt_lang = str(voice_cfg.voice_stt_lang)
     wake = _wake_transcriber(args.wake_model, stt_lang)
@@ -499,6 +665,12 @@ async def run_live(args: argparse.Namespace) -> int:
         print(
             f"[Bé Xinh Live] BE_XINH_LIVE_OUTPUT={output_mode!r} không hợp lệ; "
             "dùng edge.", flush=True,
+        )
+        output_mode = "edge"
+    if audio_mode == "laptop" and output_mode == "native":
+        print(
+            "[Bé Xinh Live] Laptop Test chuyển native -> edge để phát loa local.",
+            flush=True,
         )
         output_mode = "edge"
     voice_name = os.getenv("BE_XINH_LIVE_VOICE", "Leda").strip() or "Leda"
@@ -540,7 +712,7 @@ async def run_live(args: argparse.Namespace) -> int:
     print(
         f"[Bé Xinh Live] READY | model={model_chain[model_index]} "
         f"| fallback={model_chain[1:]} | output={output_mode} "
-        f"| voice={active_voice} | command-stt="
+        f"| audio={audio_mode} | voice={active_voice} | command-stt="
         f"{command_model if command_stt is not None else 'gemini-audio'} "
         f"| session idle={idle_s:.0f}s"
     )
