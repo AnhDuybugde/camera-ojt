@@ -47,7 +47,9 @@ answering “how many people are in the room?”. The API also exposes:
 - `count_stale`: logical tracks older than `OCCUPANCY_STALE_SECONDS`.
 
 This prevents an old track from inflating the live occupancy while preserving
-enough information for audit and tuning.
+enough information for audit and tuning. The office-camera baseline is 15
+seconds; tune it from recorded occlusion/exit tests rather than increasing it to
+hide identity churn.
 
 ## 6. Authentication and sessions
 

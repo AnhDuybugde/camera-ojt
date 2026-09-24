@@ -31,7 +31,7 @@ def summarize_presence(
     people: Sequence[Mapping[str, Any]],
     *,
     aliases: Mapping[int, int] | None = None,
-    stale_after_s: float = 120.0,
+    stale_after_s: float = 15.0,
 ) -> PresenceSummary:
     """Deduplicate aliases and separate visible, fresh and logical occupancy.
 

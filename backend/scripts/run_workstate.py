@@ -969,7 +969,7 @@ def main() -> None:
     args = parse_args()
     config = load_config(args.config)
     occupancy_stale_s = _runtime_env_float(
-        "OCCUPANCY_STALE_SECONDS", 120.0, 5.0
+        "OCCUPANCY_STALE_SECONDS", 15.0, 5.0
     )
 
     source_a = normalize_source(
