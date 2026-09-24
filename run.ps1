@@ -106,7 +106,18 @@ if ($null -ne $geminiLine) {
     $geminiValue = (($geminiLine -split '=', 2)[1]).Trim().Trim('"').Trim("'")
     $geminiKeyConfigured = $geminiValue.Length -gt 10 -and $geminiValue -notmatch '^your_'
 }
-if ($geminiKeyConfigured -and $audioEnabled) {
+$chatEnabled = $false
+$chatPreferencePath = Join-Path $runtimeDir "be-xinh-chat.json"
+if (Test-Path -LiteralPath $chatPreferencePath) {
+    try {
+        $chatPreference = Get-Content -LiteralPath $chatPreferencePath -Raw | ConvertFrom-Json
+        $chatEnabled = [bool]$chatPreference.enabled
+    }
+    catch {
+        Write-Warning "Cannot read $chatPreferencePath; voice chat stays disabled."
+    }
+}
+if ($geminiKeyConfigured -and $chatEnabled -and $audioEnabled) {
     $audioEnabled = $false
     $audioSuppressedByChat = $true
 }
@@ -129,7 +140,7 @@ if ($audioEnabled) {
 }
 
 $chatProcess = $null
-if ($geminiKeyConfigured) {
+if ($geminiKeyConfigured -and $chatEnabled) {
     $chatProcess = Start-Process `
         -FilePath $backendPython `
         -ArgumentList @("-X", "utf8", "-u", "scripts/be_xinh_assistant.py", "--model", "gemini-3.5-flash-lite") `
@@ -180,6 +191,6 @@ Write-Host "UI:      http://$UiHost`:$UiPort"
 Write-Host "Model:   http://127.0.0.1:$StreamPort/status.json"
 Write-Host "Health:  http://127.0.0.1:$StreamPort/readyz"
 Write-Host "Be Xinh greeting: $(if ($audioEnabled) { 'enabled' } elseif ($audioSuppressedByChat) { 'disabled while voice chat is active' } else { 'disabled by dashboard' })"
-Write-Host "Voice chat: $(if ($null -ne $chatProcess) { 'enabled (Gemini 3.5 Flash)' } else { 'disabled - add GEMINI_API_KEY' })"
+Write-Host "Voice chat: $(if ($null -ne $chatProcess) { 'enabled (Gemini 3.5 Flash)' } elseif (-not $geminiKeyConfigured) { 'disabled - add GEMINI_API_KEY' } else { 'disabled by dashboard' })"
 Write-Host "Logs:    $logDir"
 Write-Host "Stop:    .\stop.ps1"

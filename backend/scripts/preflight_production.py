@@ -270,7 +270,10 @@ def run(config_path: Path, *, strict: bool) -> int:
     else:
         report.blocker("Production DB migration is missing")
 
-    automatic_attendance = _env_enabled("ATTENDANCE_AUTOMATION_ENABLED")
+    automatic_attendance = os.getenv(
+        "ATTENDANCE_AUTOMATION_ENABLED",
+        "false" if app_env == "production" else "true",
+    ).strip().lower() in {"1", "true", "yes", "on"}
     liveness_provider = os.getenv("BIOMETRIC_LIVENESS_PROVIDER", "").strip()
     if automatic_attendance and strict:
         report.blocker(

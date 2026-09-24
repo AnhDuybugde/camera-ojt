@@ -11,6 +11,7 @@ $python = Join-Path $backend ".venv\Scripts\python.exe"
 $script = Join-Path $backend "scripts\be_xinh_assistant.py"
 $runtimeDir = Join-Path $workspace ".runtime"
 $statePath = Join-Path $runtimeDir "processes.json"
+$preferencePath = Join-Path $runtimeDir "be-xinh-chat.json"
 $logDir = Join-Path $workspace "logs"
 
 function Read-State {
@@ -37,6 +38,14 @@ function Write-ChatPid($state, [int]$ProcessId) {
     $state | ConvertTo-Json | Set-Content -LiteralPath $statePath -Encoding utf8
 }
 
+function Write-ChatPreference([bool]$Enabled) {
+    New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
+    @{
+        enabled = $Enabled
+        updated_at = (Get-Date).ToString("o")
+    } | ConvertTo-Json | Set-Content -LiteralPath $preferencePath -Encoding utf8
+}
+
 $state = Read-State
 $chatPid = if ($null -ne $state.PSObject.Properties["chat"]) { [int]$state.chat } else { 0 }
 $running = Test-ChatProcess $chatPid
@@ -51,11 +60,13 @@ if ($Action -eq "stop") {
         taskkill.exe /PID $chatPid /T /F | Out-Null
     }
     Write-ChatPid $state 0
+    Write-ChatPreference $false
     Write-Host "Bé Xinh voice chat stopped."
     exit 0
 }
 
 if ($running) {
+    Write-ChatPreference $true
     Write-Host "Bé Xinh voice chat is already running (PID $chatPid)."
     exit 0
 }
@@ -106,6 +117,7 @@ if ($Action -eq "foreground") {
         -NoNewWindow `
         -PassThru
     Write-ChatPid $state $process.Id
+    Write-ChatPreference $true
     try {
         Wait-Process -Id $process.Id
     }
@@ -116,6 +128,7 @@ if ($Action -eq "foreground") {
         }
         $latestState = Read-State
         Write-ChatPid $latestState 0
+        Write-ChatPreference $false
         Write-Host "Bé Xinh voice chat stopped."
     }
     exit 0
@@ -130,6 +143,7 @@ $process = Start-Process `
     -RedirectStandardError (Join-Path $logDir "be-xinh-chat.err.log") `
     -PassThru
 Write-ChatPid $state $process.Id
+Write-ChatPreference $true
 Write-Host "Stop background mode: .\chat.ps1 stop"
 Write-Host "For Ctrl+C mode: .\chat.ps1 foreground"
 Write-Host "Bé Xinh voice chat started (PID $($process.Id))."

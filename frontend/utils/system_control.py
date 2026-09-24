@@ -40,8 +40,9 @@ class SystemController:
         self.runtime_dir = self.workspace / ".runtime"
         self.state_path = self.runtime_dir / "processes.json"
         self.volume_path = self.runtime_dir / "be-xinh-volume.json"
+        self.chat_preference_path = self.runtime_dir / "be-xinh-chat.json"
         self.log_dir = self.workspace / "logs"
-        self.backend_url = "http://127.0.0.1:8765/status.json"
+        self.backend_url = "http://127.0.0.1:8765/readyz"
 
     def voice_volume(self) -> VoiceVolumeSettings:
         try:
@@ -101,7 +102,7 @@ class SystemController:
             "backend",
             [
                 "-X", "utf8", "-u", "scripts/run_workstate.py",
-                "--stream-host", "0.0.0.0", "--stream-port", "8765",
+                "--stream-host", "127.0.0.1", "--stream-port", "8765",
                 "--no-greet", "--no-halinh", "--no-supervisor",
             ],
             "backend.out.log", "backend.err.log",
@@ -121,6 +122,7 @@ class SystemController:
     def start_chat(self) -> ServiceStatus:
         current = self.chat_status()
         if current.running:
+            self._write_chat_preference(True)
             return current
         self._validate_runtime()
         env_path = self.backend_dir / ".env"
@@ -143,10 +145,12 @@ class SystemController:
             "be-xinh-chat.out.log", "be-xinh-chat.err.log",
         )
         self._write_pid("chat", process.pid)
+        self._write_chat_preference(True)
         return ServiceStatus(True, True, process.pid, "Đang khởi động")
 
     def stop_chat(self) -> ServiceStatus:
         self._stop_verified("chat", "be_xinh_assistant.py")
+        self._write_chat_preference(False)
         return ServiceStatus(False, False, None, "Đã tắt")
 
     def restart_chat(self) -> ServiceStatus:
@@ -224,6 +228,18 @@ class SystemController:
         except (OSError, json.JSONDecodeError):
             return {}
         return value if isinstance(value, dict) else {}
+
+    def _write_chat_preference(self, enabled: bool) -> None:
+        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        temporary = self.chat_preference_path.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps({
+                "enabled": bool(enabled),
+                "updated_at": datetime.now().astimezone().isoformat(),
+            }, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(self.chat_preference_path)
 
     def _is_named_process(self, pid: int, script_name: str) -> bool:
         if pid <= 0:

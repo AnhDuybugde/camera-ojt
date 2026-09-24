@@ -28,7 +28,7 @@ def test_backend_status_distinguishes_running_from_healthy(tmp_path, monkeypatch
     assert status.pid == 1234
 
 
-def test_start_backend_records_pid_and_lan_binding(tmp_path, monkeypatch):
+def test_start_backend_records_pid_and_safe_local_binding(tmp_path, monkeypatch):
     controller = SystemController(_workspace(tmp_path))
     monkeypatch.setattr(controller, "backend_status", lambda: SimpleNamespace(running=False))
     captured = {}
@@ -42,7 +42,7 @@ def test_start_backend_records_pid_and_lan_binding(tmp_path, monkeypatch):
 
     assert status.pid == 4321
     assert controller._pid("backend") == 4321
-    assert "0.0.0.0" in captured["args"]
+    assert "127.0.0.1" in captured["args"]
 
 
 def test_stop_chat_only_kills_verified_process(tmp_path, monkeypatch):
@@ -60,6 +60,9 @@ def test_stop_chat_only_kills_verified_process(tmp_path, monkeypatch):
     assert killed == [9876]
     assert status.running is False
     assert controller._pid("chat") is None
+    assert '"enabled": false' in controller.chat_preference_path.read_text(
+        encoding="utf-8"
+    ).lower()
 
 
 def test_voice_volume_persists_single_adjustable_level(tmp_path):
