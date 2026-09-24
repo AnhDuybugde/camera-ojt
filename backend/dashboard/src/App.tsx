@@ -231,7 +231,7 @@ export default function App() {
     if (!STREAM_URL || pendingAttendance.length === 0) return
     setSendingAttendance(true)
     try {
-      const res = await fetch(STREAM_URL + '/attendance/send')
+      const res = await fetch(STREAM_URL + '/attendance/send', { method: 'POST' })
       const data = await res.json()
       note('Sent ' + (data.sent ?? 0) + ' attendance record(s).' +
         (data.failed ? ' Failed: ' + data.failed + '.' : ''))

@@ -1,8 +1,9 @@
 [CmdletBinding()]
 param(
-    [string]$StreamHost = "0.0.0.0",
+    [string]$StreamHost = "127.0.0.1",
     [int]$StreamPort = 8765,
-    [int]$UiPort = 8501
+    [int]$UiPort = 8501,
+    [string]$UiHost = "127.0.0.1"
 )
 
 $ErrorActionPreference = "Stop"
@@ -108,7 +109,7 @@ $uiProcess = Start-Process `
         "-u",
         "-m", "streamlit", "run", "app.py",
         "--server.port", "$UiPort",
-        "--server.address", "0.0.0.0",
+        "--server.address", $UiHost,
         "--server.headless", "true"
     ) `
     -WorkingDirectory $frontend `
@@ -126,7 +127,7 @@ $uiProcess = Start-Process `
 } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $runtimeDir "processes.json") -Encoding UTF8
 
 Write-Host "Integrated system started."
-Write-Host "UI:      http://127.0.0.1:$UiPort"
+Write-Host "UI:      http://$UiHost`:$UiPort"
 Write-Host "Model:   http://127.0.0.1:$StreamPort/status.json"
 Write-Host "Be Xinh greeting: $(if ($audioEnabled) { 'enabled' } elseif ($audioSuppressedByChat) { 'disabled while voice chat is active' } else { 'disabled by dashboard' })"
 Write-Host "Voice chat: $(if ($null -ne $chatProcess) { 'enabled (Gemini 3.5 Flash)' } else { 'disabled - add GEMINI_API_KEY' })"

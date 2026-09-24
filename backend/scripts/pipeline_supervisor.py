@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -199,6 +200,15 @@ def serve(
     managed_stream_port: int | None = None,
     managed_args: list[str] | None = None,
 ) -> ThreadingHTTPServer:
+    if (
+        host.strip().lower() not in {"127.0.0.1", "localhost", "::1"}
+        and os.getenv("CAMERA_ALLOW_REMOTE_CONTROL", "").strip() != "1"
+    ):
+        raise ValueError(
+            "Refusing to expose pipeline control on a non-loopback host. "
+            "Use a reverse proxy or set CAMERA_ALLOW_REMOTE_CONTROL=1 explicitly."
+        )
+
     if supervisor is None:
         if managed_pid is not None:
             supervisor = ManagedSupervisor(
@@ -216,18 +226,41 @@ def serve(
         def log_message(self, *args) -> None:
             pass
 
+        def _allowed_origins(self) -> set[str]:
+            return {
+                item.strip().rstrip("/")
+                for item in os.getenv(
+                    "CAMERA_CORS_ORIGINS",
+                    "http://localhost:5173,http://127.0.0.1:5173,"
+                    "http://localhost:4173,http://127.0.0.1:4173",
+                ).split(",")
+                if item.strip()
+            }
+
+        def _origin_is_allowed(self) -> bool:
+            origin = (self.headers.get("Origin") or "").rstrip("/")
+            return not origin or origin in self._allowed_origins()
+
         def _json(self, payload: dict, code: int = 200) -> None:
             body = json.dumps(payload).encode("utf-8")
             self.send_response(code)
-            self.send_header("Access-Control-Allow-Origin", "*")
+            origin = (self.headers.get("Origin") or "").rstrip("/")
+            if origin and origin in self._allowed_origins():
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Vary", "Origin")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type")
             self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
 
         def do_OPTIONS(self) -> None:
+            if not self._origin_is_allowed():
+                self._json({"error": "forbidden_origin"}, 403)
+                return
             self._json({})
 
         def do_GET(self) -> None:
@@ -248,6 +281,9 @@ def serve(
                 self._json({"error": "not found"}, 404)
 
         def do_POST(self) -> None:
+            if not self._origin_is_allowed():
+                self._json({"error": "forbidden_origin"}, 403)
+                return
             path = self.path.split("?", 1)[0]
             try:
                 length = int(self.headers.get("Content-Length") or 0)

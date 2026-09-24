@@ -127,9 +127,13 @@ Gallery nằm ở `data/images/` + `data/images/registry.json` — là dữ li�
 
 Máy gắn camera:
 
-```bash
+```powershell
+$env:CAMERA_ALLOW_REMOTE_STREAM = "1"
 python scripts/run_workstate.py --stream-host 0.0.0.0
 ```
+
+Chỉ bật chế độ này trong mạng nội bộ đã được bảo vệ. Với môi trường production,
+hãy giữ dịch vụ ở `127.0.0.1` và truy cập qua reverse proxy/VPN có xác thực.
 
 Máy chạy dashboard sửa `dashboard/.env`:
 

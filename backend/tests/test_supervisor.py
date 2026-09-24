@@ -7,6 +7,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import pytest
+
 _SUPERVISOR = Path(__file__).resolve().parents[1] / "scripts" / "pipeline_supervisor.py"
 _ROOT = Path(__file__).resolve().parents[1]
 
@@ -37,6 +39,13 @@ def test_build_start_args() -> None:
         {"imgsz": 640, "no_face": True, "display": True, "stream_port": 0})
     assert args == ["--no-stream", "--imgsz", "640", "--no-face", "--display"]
     assert port is None
+
+
+def test_remote_control_requires_explicit_opt_in(monkeypatch) -> None:
+    mod = _load()
+    monkeypatch.delenv("CAMERA_ALLOW_REMOTE_CONTROL", raising=False)
+    with pytest.raises(ValueError, match="non-loopback"):
+        mod.serve("0.0.0.0", 0)
 
 
 def test_start_stop_lifecycle() -> None:

@@ -29,6 +29,7 @@ create table if not exists public.attendance_daily (
   global_id integer,
   attended boolean not null default true,
   check_in_at timestamptz,
+  check_out_at timestamptz,
   face_score double precision,
   needs_review boolean not null default false,
   updated_at timestamptz not null default now(),
@@ -41,6 +42,7 @@ create table if not exists public.room_status_daily (
   global_id integer not null,
   person_id text references public.persons(person_id) on delete set null,
   person_name text,
+  merged_into integer,
   in_room boolean not null default true,
   label text not null default 'Unknown',
   last_leave_at timestamptz,
@@ -66,7 +68,7 @@ create table if not exists public.room_events (
   global_id integer not null,
   person_id text,
   event text not null check (event in (
-    'ENTER_ROOM','LEAVE_SEAT','LEAVE_OFFICE','RETURN','CHECK_IN')),
+    'ENTER_ROOM','LEAVE_SEAT','LEAVE_OFFICE','RETURN','CHECK_IN','CHECK_OUT','TEMP_OUT')),
   channel text not null default 'A',
   at timestamptz not null default now()
 );

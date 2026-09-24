@@ -370,7 +370,9 @@ def supervise_halinh(
     Mic RTSP camera + loa camera P2P (doi lap voi ban _local).
     """
     restarts = 0
-    cmd = [sys.executable, "-u", str(script), *(extra_args or [])]
+    # Force UTF-8 even when the Windows console code page is cp1258. The
+    # assistant logs Vietnamese text and must not crash merely while printing.
+    cmd = [sys.executable, "-X", "utf8", "-u", str(script), *(extra_args or [])]
     while not stop_event.is_set():
         print(f"[HaLinh-sup] khoi dong voice ({' '.join(cmd)})...", flush=True)
         try:
@@ -2635,18 +2637,34 @@ def main() -> None:
         now_wall = time.time()
         people = []
         try:
+            canonical: dict[int, dict] = {}
             for gid, st in room_status_now.items():
-                wgid = gid_alias.get(gid, gid)
+                wgid = int(gid_alias.get(gid, gid))
                 record = manager.identities.get(wgid)
                 last_s = record.last_seen_s if record is not None else None
                 ago = (now_s - last_s) if last_s is not None else None
-                people.append({
-                    "gid": int(wgid),
+                candidate = {
+                    "gid": wgid,
                     "name": str(getattr(st, "display_name", "") or ""),
                     "label": str(getattr(st, "label", "") or ""),
                     "in_room": bool(getattr(st, "in_room", False)),
                     "last_seen_ago_s": ago,
-                })
+                }
+                existing = canonical.get(wgid)
+                if existing is None:
+                    canonical[wgid] = candidate
+                else:
+                    # Multiple camera/local IDs may alias the same human.
+                    existing["in_room"] = bool(existing["in_room"] or candidate["in_room"])
+                    if not existing.get("name") and candidate.get("name"):
+                        existing["name"] = candidate["name"]
+                    if (
+                        candidate["last_seen_ago_s"] is not None
+                        and (existing["last_seen_ago_s"] is None
+                             or candidate["last_seen_ago_s"] < existing["last_seen_ago_s"])
+                    ):
+                        existing["last_seen_ago_s"] = candidate["last_seen_ago_s"]
+            people = list(canonical.values())
         except Exception:
             people = []
         try:
@@ -2694,7 +2712,7 @@ def main() -> None:
             "uptime_s": now_s,
             "camera_a": _stream_state(stream_a, True),
             "camera_b": _stream_state(stream_b, True),
-            "count": int(count_a.value + count_b.value),
+            "count": int(sum(1 for person in people if person.get("in_room"))),
             "count_a": int(count_a.value),
             "count_b": int(count_b.value),
             "people": people,
@@ -3593,6 +3611,11 @@ def main() -> None:
                         "attendance_today": attendance_today,
                         "recent_events": list(recent_events),
                         "pending_attendance": pending_attendance(),
+                        "count": len({
+                            int(gid_alias.get(gid, gid))
+                            for gid, state in room_status_now.items()
+                            if state.in_room
+                        }),
                         "count_a": count_a.value,
                         "count_b": count_b.value,
                         "audio_events": zone_observer.active_events(now_s),

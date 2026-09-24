@@ -408,10 +408,16 @@ def _tracking_backend_fragment(base_url: str) -> None:
     }
     count_a = int(payload.get("count_a") or 0)
     count_b = int(payload.get("count_b") or 0)
+    raw_count_total = payload.get("count")
+    count_total = (
+        count_a + count_b
+        if raw_count_total is None
+        else int(raw_count_total)
+    )
     metric_a, metric_b, metric_total, metric_checked = st.columns(4)
     metric_a.metric("Camera A", count_a)
     metric_b.metric("Camera B", count_b)
-    metric_total.metric("Tổng hiện diện", count_a + count_b)
+    metric_total.metric("Tổng hiện diện", count_total)
     metric_checked.metric("Đã check-in", len(checked_ids))
 
     present_tab, checkin_tab, states_tab = st.tabs([

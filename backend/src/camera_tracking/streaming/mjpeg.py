@@ -1,16 +1,35 @@
 """Live MJPEG streaming for the web dashboard (stdlib only, no new deps).
 
-The pipeline pushes annotated JPEG frames per channel; browsers show them
-as plain <img> tags (no CORS needed for <img>). /status.json carries the
-Global-ID labels and is served with CORS `*` for dashboard polling.
+Security model:
+- localhost binding is the production-safe default; expose through a reverse
+  proxy when remote access is required.
+- non-loopback binding is refused unless CAMERA_ALLOW_REMOTE_STREAM=1.
+- CORS uses CAMERA_CORS_ORIGINS (comma-separated), never wildcard by default.
+- state-changing endpoints use POST.
 """
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+def _is_loopback_host(host: str) -> bool:
+    value = (host or "").strip().lower()
+    return value in {"127.0.0.1", "localhost", "::1"}
+
+
+def _allowed_origins() -> set[str]:
+    raw = os.getenv(
+        "CAMERA_CORS_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173,"
+        "http://localhost:4173,http://127.0.0.1:4173,"
+        "http://localhost:8501,http://127.0.0.1:8501",
+    )
+    return {item.strip().rstrip("/") for item in raw.split(",") if item.strip()}
 
 
 class MjpegStreamer:
@@ -74,18 +93,30 @@ class MjpegStreamer:
                 pass
 
             def _send_cors(self) -> None:
-                self.send_header("Access-Control-Allow-Origin", "*")
+                origin = (self.headers.get("Origin") or "").rstrip("/")
+                if origin and origin in _allowed_origins():
+                    self.send_header("Access-Control-Allow-Origin", origin)
+                    self.send_header("Vary", "Origin")
+
+            def _origin_is_allowed(self) -> bool:
+                origin = (self.headers.get("Origin") or "").rstrip("/")
+                return not origin or origin in _allowed_origins()
 
             def _send_json(self, payload: dict, status: int = 200) -> None:
                 body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                 self.send_response(status)
                 self._send_cors()
                 self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
 
             def do_OPTIONS(self) -> None:
+                if not self._origin_is_allowed():
+                    self._send_json({"error": "forbidden_origin"}, 403)
+                    return
                 self.send_response(204)
                 self._send_cors()
                 self.send_header("Access-Control-Allow-Headers", "Content-Type")
@@ -93,10 +124,19 @@ class MjpegStreamer:
                 self.end_headers()
 
             def do_POST(self) -> None:
+                if not self._origin_is_allowed():
+                    self._send_json({"error": "forbidden_origin"}, 403)
+                    return
                 path = self.path.split("?", 1)[0]
+                if path == "/attendance/send":
+                    try:
+                        result = dict(streamer._attendance_send())
+                        self._send_json(result)
+                    except Exception:  # noqa: BLE001 - keep HTTP worker alive
+                        self._send_json({"ok": False, "message": "Không thể gửi điểm danh."}, 500)
+                    return
                 if path != "/enrollment/register":
-                    self.send_response(404)
-                    self.end_headers()
+                    self._send_json({"error": "not found"}, 404)
                     return
                 try:
                     content_length = int(self.headers.get("Content-Length", "0"))
@@ -145,8 +185,10 @@ class MjpegStreamer:
                         "pending": streamer._attendance_pending(),
                     })
                 elif path == "/attendance/send":
-                    result = streamer._attendance_send()
-                    self._send_json(result)
+                    self._send_json({
+                        "error": "method_not_allowed",
+                        "message": "Use POST /attendance/send.",
+                    }, 405)
                 elif path == "/":
                     body = (
                         b"<html><body><h3>Camera OJT live</h3>"
@@ -196,6 +238,16 @@ class MjpegStreamer:
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                     pass
 
+        if (
+            not _is_loopback_host(self.host)
+            and os.getenv("CAMERA_ALLOW_REMOTE_STREAM", "").strip() != "1"
+        ):
+            print(
+                "Refusing to expose camera stream on a non-loopback host. "
+                "Bind to 127.0.0.1 and use a reverse proxy, or explicitly set "
+                "CAMERA_ALLOW_REMOTE_STREAM=1."
+            )
+            return False
         try:
             server = ThreadingHTTPServer((self.host, self.port), _Handler)
             server.daemon_threads = True
