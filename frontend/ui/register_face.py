@@ -11,6 +11,7 @@ from config import settings
 from database.db import Database
 from face.detector import FaceDetector
 from face.face_registration import FaceRegistrationService
+from face.tracking_enrollment import TrackingEnrollmentClient, TrackingEnrollmentError
 from face.recognizer import FaceRecognizer
 from ui.components import page_header, section_header, translate_message
 
@@ -135,6 +136,10 @@ def _register_camera(
     detector: FaceDetector,
     recognizer: FaceRecognizer,
 ) -> None:
+    employee = db.get_employee(employee_id)
+    if not employee:
+        st.error("Không tìm thấy nhân viên cần đăng ký.")
+        return
     camera = CameraManager(source).start()
     preview, bar, status = st.empty(), st.progress(0), st.empty()
     try:
@@ -156,7 +161,10 @@ def _register_camera(
                           channels="RGB", width="stretch")
 
         FaceRegistrationService(db, detector, actor_role=st.session_state.role, actor_employee_id=st.session_state.get("employee_id")).register_from_capture(
-            employee_id, camera, progress=update
+            employee_id, camera, progress=update,
+            before_save=_tracking_enrollment_callback(
+                employee_id, employee["full_name"], overwrite=False
+            ),
         )
         recognizer.reload()
         st.success("Đăng ký khuôn mặt thành công.")
@@ -282,8 +290,14 @@ def _register_upload(
     with st.spinner("Đang phân tích ảnh và trích xuất khuôn mặt…"):
         try:
             result = service.register_from_images(
-                employee_id, image_bytes_list, overwrite=overwrite
+                employee_id, image_bytes_list, overwrite=overwrite,
+                before_save=_tracking_enrollment_callback(
+                    employee_id, full_name, overwrite=overwrite
+                ),
             )
+        except TrackingEnrollmentError as exc:
+            st.error(f"Không thể đồng bộ khuôn mặt với Camera OJT: {exc}")
+            return
         except ValueError as exc:
             msg = str(exc)
             if msg == "ALREADY_HAS_FACE":
@@ -312,6 +326,21 @@ def _register_upload(
             with st.expander("Xem chi tiết lỗi từng ảnh"):
                 for i, reason in enumerate(result["rejected_reasons"], 1):
                     st.markdown(f"- Ảnh #{i}: {reason}")
+
+
+def _tracking_enrollment_callback(
+    employee_id: str, full_name: str, *, overwrite: bool
+):
+    if not settings.tracking_backend_url:
+        return None
+    client = TrackingEnrollmentClient(settings.tracking_backend_url)
+
+    def sync(image_bytes: bytes) -> None:
+        client.register(
+            employee_id, full_name, image_bytes, overwrite=overwrite
+        )
+
+    return sync
 
 
 def _render_image_previews(uploaded_files: list) -> None:

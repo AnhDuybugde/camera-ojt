@@ -1481,6 +1481,7 @@ def main() -> None:
             employee_id = str(payload.get("employee_id", "")).strip()
             display_name = " ".join(str(payload.get("display_name", "")).split())
             image_data = payload.get("image")
+            overwrite = payload.get("overwrite") is True
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", employee_id):
                 return {
                     "ok": False,
@@ -1516,11 +1517,12 @@ def main() -> None:
                 )
 
             with enrollment_lock:
-                if any(
-                    person.employee_id == employee_id
+                existing_person = next((
+                    person for person in face_gallery.people
+                    if person.employee_id == employee_id
                     or person.person_id == employee_id
-                    for person in face_gallery.people
-                ):
+                ), None)
+                if existing_person is not None and not overwrite:
                     return {
                         "ok": False,
                         "status": 409,
@@ -1529,6 +1531,13 @@ def main() -> None:
                 try:
                     with face_model_lock:
                         detections = face_embedder.detect_embed(image)
+                        if not detections:
+                            pad = max(1, int(min(image.shape[:2]) * 0.35))
+                            padded = cv2.copyMakeBorder(
+                                image, pad, pad, pad, pad,
+                                cv2.BORDER_REPLICATE,
+                            )
+                            detections = face_embedder.detect_embed(padded)
                 except RuntimeError as error:
                     return {"ok": False, "status": 503, "message": str(error)}
                 if len(detections) == 0:
@@ -1544,18 +1553,28 @@ def main() -> None:
 
                 gallery_root = Path(face_cfg.gallery_dir)
                 gallery_root.mkdir(parents=True, exist_ok=True)
-                image_path = gallery_root / f"{employee_id}.jpg"
+                person_key = (
+                    existing_person.person_id
+                    if existing_person is not None
+                    else employee_id
+                )
+                person_dir = gallery_root / person_key
+                image_path = (
+                    person_dir / "web_enrollment.jpg"
+                    if person_dir.is_dir()
+                    else gallery_root / f"{person_key}.jpg"
+                )
                 ok, jpeg = cv2.imencode(
                     ".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 92]
                 )
                 if not ok:
                     return {"ok": False, "message": "Không thể lưu ảnh đăng ký."}
-                temp_image = gallery_root / f".{employee_id}.tmp.jpg"
+                temp_image = image_path.with_name(f".{image_path.stem}.tmp.jpg")
                 temp_image.write_bytes(jpeg.tobytes())
                 temp_image.replace(image_path)
 
                 registry = load_registry(gallery_root)
-                registry[employee_id] = {
+                registry[person_key] = {
                     "display_name": display_name,
                     "employee_id": employee_id,
                 }
@@ -1568,13 +1587,26 @@ def main() -> None:
                 temp_registry.replace(registry_path)
 
                 detection = detections[0]
+                if existing_person is not None:
+                    face_gallery.people.remove(existing_person)
                 face_gallery.people.append(EnrolledPerson(
-                    person_id=employee_id,
+                    person_id=person_key,
                     display_name=display_name,
                     embedding=np.asarray(detection.embedding, dtype=np.float32),
                     source_path=str(image_path),
                     employee_id=employee_id,
                 ))
+                face_roster[:] = [
+                    {
+                        "person_id": person.employee_id or person.person_id,
+                        "person_name": person.display_name,
+                        "gallery_samples": (
+                            (1 if person.embedding is not None else 0)
+                            + len(person.prototypes)
+                        ),
+                    }
+                    for person in face_gallery.people
+                ]
                 _store_or_queue(write_queue, supabase, "person", {
                     "person_id": employee_id,
                     "display_name": display_name,

@@ -139,3 +139,38 @@ def test_upload_nonexistent_employee(db):
         service.register_from_images("NON_EXISTENT", [img])
     assert "Employee does not exist" in str(excinfo.value)
 
+
+def test_backend_sync_runs_before_local_face_is_saved(db):
+    db.add_employee({"employee_id": "NV006", "full_name": "Nhan vien moi"})
+    detector = MockDetector([
+        DummyFace(bbox=(10, 10, 120, 120), embedding=[1.0, 0.0, 0.0])
+    ])
+    service = FaceRegistrationService(db, detector)
+    image = _make_valid_image_bytes()
+    observed = []
+
+    result = service.register_from_images(
+        "NV006", [image], before_save=lambda raw: observed.append(raw)
+    )
+
+    assert result["success"] is True
+    assert observed == [image]
+    assert db.get_employee("NV006")["has_face"] == 1
+
+
+def test_backend_sync_failure_does_not_mark_local_face_registered(db):
+    db.add_employee({"employee_id": "NV007", "full_name": "Nhan vien loi"})
+    detector = MockDetector([
+        DummyFace(bbox=(10, 10, 120, 120), embedding=[1.0, 0.0, 0.0])
+    ])
+    service = FaceRegistrationService(db, detector)
+
+    def fail_sync(_raw: bytes) -> None:
+        raise RuntimeError("Camera backend unavailable")
+
+    with pytest.raises(RuntimeError, match="Camera backend unavailable"):
+        service.register_from_images(
+            "NV007", [_make_valid_image_bytes()], before_save=fail_sync
+        )
+
+    assert db.get_employee("NV007")["has_face"] == 0

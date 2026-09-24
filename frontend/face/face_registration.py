@@ -46,6 +46,7 @@ class FaceRegistrationService:
     def register_from_capture(
         self, employee_id: str, capture: object, samples: int | None = None,
         progress: Callable[[int, int, np.ndarray, str], None] | None = None,
+        before_save: Callable[[bytes], None] | None = None,
         timeout_seconds: int = 60,
     ) -> np.ndarray:
         self._authorize(employee_id)
@@ -56,6 +57,7 @@ class FaceRegistrationService:
             raise ValueError("Employee already has a face embedding. Delete/replace it first.")
         target = samples or settings.registration_samples
         collected: list[np.ndarray] = []
+        representative_image: bytes | None = None
         started, last_capture = time.monotonic(), 0.0
         while len(collected) < target and time.monotonic() - started < timeout_seconds:
             ok, frame = capture.read()
@@ -70,6 +72,12 @@ class FaceRegistrationService:
                 valid, message = self.validate_face(frame, faces[0])
                 if valid and time.monotonic() - last_capture >= settings.registration_interval:
                     collected.append(np.asarray(faces[0].embedding, dtype=np.float32))
+                    if representative_image is None:
+                        encoded, jpeg = cv2.imencode(
+                            ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 92]
+                        )
+                        if encoded:
+                            representative_image = jpeg.tobytes()
                     last_capture = time.monotonic()
                     message = "Captured - slowly change your head angle"
             if progress:
@@ -78,6 +86,10 @@ class FaceRegistrationService:
             raise TimeoutError(f"Captured only {len(collected)}/{target} valid samples before timeout.")
         embedding = representative_embedding(collected)
         blob, dimension = embedding_to_blob(embedding)
+        if before_save:
+            if representative_image is None:
+                raise RuntimeError("Không thể tạo ảnh đại diện để đồng bộ Camera OJT.")
+            before_save(representative_image)
         self.db.save_embedding(employee_id, blob, dimension, actor_role=self.actor_role, actor_employee_id=self.actor_employee_id)
         return embedding
 
@@ -131,6 +143,7 @@ class FaceRegistrationService:
         employee_id: str,
         image_bytes_list: list[bytes],
         overwrite: bool = False,
+        before_save: Callable[[bytes], None] | None = None,
     ) -> dict:
         """Register (or replace) a face embedding from uploaded image bytes.
 
@@ -147,12 +160,14 @@ class FaceRegistrationService:
             raise ValueError("ALREADY_HAS_FACE")
 
         valid_embeddings: list[np.ndarray] = []
+        valid_images: list[bytes] = []
         rejected_reasons: list[str] = []
 
         for raw in image_bytes_list:
             ok, msg, emb = self.process_uploaded_image(raw)
             if ok and emb is not None:
                 valid_embeddings.append(emb)
+                valid_images.append(raw)
             else:
                 rejected_reasons.append(msg)
 
@@ -165,6 +180,8 @@ class FaceRegistrationService:
                 "message": "Không có ảnh hợp lệ để đăng ký.",
             }
 
+        if before_save:
+            before_save(valid_images[0])
         self.replace_from_embeddings(employee_id, valid_embeddings)
         return {
             "success": True,
