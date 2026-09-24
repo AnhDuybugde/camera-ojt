@@ -17,6 +17,7 @@ Wake giu faster-whisper small (can initial_prompt bias + cua chat luong).
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 MODEL_DIR_NAME = "sherpa-onnx-zipformer-vi-30M-int8-2026-02-09"
@@ -25,12 +26,15 @@ SAMPLE_RATE = 16000
 
 def default_model_dir() -> Path:
     """Thu muc model: models/stt/<MODEL_DIR_NAME> (tu repo root)."""
+    configured = os.getenv("BE_XINH_ZIPFORMER_MODEL_DIR", "").strip()
+    if configured:
+        return Path(configured).expanduser()
     here = Path(__file__).resolve()
-    for parent in (here.parents[2], here.parents[3]):
+    for parent in (here.parents[3], here.parents[2]):
         candidate = parent / "models" / "stt" / MODEL_DIR_NAME
         if candidate.is_dir():
             return candidate
-    return here.parents[2] / "models" / "stt" / MODEL_DIR_NAME
+    return here.parents[3] / "models" / "stt" / MODEL_DIR_NAME
 
 
 class SherpaZipformerSTT:

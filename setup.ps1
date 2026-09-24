@@ -171,6 +171,11 @@ finally {
     Pop-Location
 }
 
+Write-Host "Installing Vietnamese Zipformer INT8 speech model..."
+Invoke-Checked -FilePath $backendPython `
+    -ArgumentList @((Join-Path $backend "scripts\install_zipformer_model.py")) `
+    -Description "Zipformer Vietnamese model installation"
+
 if ($useNvidia) {
     # faster-whisper declares the CPU distribution name ``onnxruntime`` even
     # though the GPU wheel exposes the same module. Pip may therefore install
