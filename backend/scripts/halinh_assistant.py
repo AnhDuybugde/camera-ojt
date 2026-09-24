@@ -138,7 +138,9 @@ Luật:
  * type=tool: chỉ dùng tool trong danh sách dưới; điền đủ tham số bắt buộc; tham số tùy chọn không biết thì bỏ qua (tool có giá trị mặc định).
  * Không bịa tham số: nghe "mấy giờ" thì gọi get_current_time không tham số; nghe thiếu thông tin bắt buộc thì type=direct với câu trả lời tốt nhất theo giả định mặc định (nêu giả định), KHÔNG hỏi lại.
 * Ví dụ: "Python là gì" -> {"type":"direct","tool":null,"args":{},"text":"Python là ngôn ngữ lập trình phổ biến, dễ đọc và dùng nhiều cho AI."}
-* Ví dụ: "Đà Nẵng hôm nay bao nhiêu độ" -> {"type":"tool","tool":"get_weather","args":{"city":"Đà Nẵng"},"text":""}
+ * Ví dụ: "Đà Nẵng hôm nay bao nhiêu độ" -> {"type":"tool","tool":"get_weather","args":{"city":"Đà Nẵng"},"text":""}
+ * Ví dụ: "giá bitcoin hôm nay thế nào" -> {"type":"tool","tool":"get_crypto_price","args":{"coin":"bitcoin"},"text":""}
+ * Chú ý: "bitcoin/giá coin/tiền ảo" LUÔN gọi get_crypto_price, KHÔNG gọi get_current_time.
 
 Danh sách tool:
 """
@@ -160,6 +162,65 @@ FILLER_TEXTS = {
     "got_it": "Bé Xinh hiểu rồi nè.",
     "missed": "Bé Xinh nghe chưa rõ. Bạn gọi Bé Xinh ơi rồi nói lại nha.",
 }
+
+
+def _chat_lock_path() -> Path:
+    return ROOT.parent / ".runtime" / "be-xinh-chat.lock"
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def acquire_chat_lock(tag: str) -> bool:
+    """Chi cho 1 voice chat chay (live hay classic).
+
+    Tra True khi giu khoa; False khi ban khac (live/classic) dang song
+    thi caller nen thoat ngay de khoi gianh mic/loa/log. Khoa chet
+    (PID khong con) thi duoc tiep quan.
+    """
+    import sys
+
+    path = _chat_lock_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+        old_pid = int(raw.split()[0]) if raw else 0
+    except (OSError, ValueError):
+        old_pid = 0
+    if _pid_alive(old_pid) and old_pid != os.getpid():
+        print(f"[{tag}] da co voice chat chay (PID {old_pid}); "
+              f"ban nay (PID {os.getpid()}) thoat de khoi gianh mic/loa.",
+              flush=True)
+        return False
+    try:
+        path.write_text(f"{os.getpid()} {tag} {sys.executable}",
+                        encoding="utf-8")
+    except OSError:
+        pass
+    return True
+
+
+def release_chat_lock() -> None:
+    try:
+        raw = _chat_lock_path().read_text(encoding="utf-8").strip()
+        if raw.split()[0] == str(os.getpid()):
+            _chat_lock_path().unlink(missing_ok=True)
+    except (OSError, ValueError, IndexError):
+        pass
 
 
 def ack_via_camera(talk, filler_dir: Path, channel: int) -> None:
@@ -560,7 +621,8 @@ def think(question: str, model: str, max_tokens: int,
         glossary = os.getenv(
             "BE_XINH_SPEECH_GLOSSARY",
             "Bé Xinh, Anh Quốc Ngọc, Quốc Ngọc, Anh Khoa 617, Đà Nẵng, "
-            "Camera OJT, AI Mind",
+            "Camera OJT, AI Mind, Bitcoin, Ethereum, Solana, tiền ảo, "
+            "dự báo thời tiết, giá vàng",
         ).strip()
         contents = [
             (
@@ -631,6 +693,8 @@ def main() -> None:
     model = args.model or os.getenv("GEMINI_MODEL", "").strip() or "gemini-3.5-flash"
     if not os.getenv("GEMINI_API_KEY", "").strip():
         raise SystemExit("Thieu GEMINI_API_KEY: them vao .env roi chay lai.")
+    if not acquire_chat_lock("BeXinhChat"):
+        raise SystemExit(0)
     from camera_tracking.camera.camera_imou import imou_url
 
     rtsp = imou_url(int(voice_cfg.voice_listen_channel),
@@ -937,7 +1001,7 @@ def main() -> None:
             pcm = capture_utterance(
                 mic_input, voice_cfg,
                 prompt="[BeXinhChat] ... nghe (gọi 'Bé Xinh ơi') ...",
-                end_silence_ms=700, max_len_s=4.0, max_wait_s=None,
+                end_silence_ms=700, max_len_s=6.0, max_wait_s=None,
                 meter_s=3.0, respect_speaker_busy=True)
             if not pcm:
                 time.sleep(1.0)
@@ -1008,11 +1072,11 @@ def main() -> None:
                         mic_input, voice_cfg,
                         prompt="[BeXinhChat] NÓI NGAY (Bé Xinh đang nghe)...",
                         end_silence_ms=700,
-                        max_len_s=7.0,
-                        max_wait_s=6.0, respect_speaker_busy=True)
+                        max_len_s=10.0,
+                        max_wait_s=10.0, respect_speaker_busy=True)
                     if not pcm:
                         print(f"[BeXinhChat] lan {attempt}: khong nghe thay "
-                              f"cau hoi trong 6s.", flush=True)
+                              f"cau hoi trong 10s.", flush=True)
                         continue
                     total0 = time.monotonic()
                     t0 = time.monotonic()
@@ -1182,6 +1246,10 @@ def main() -> None:
     finally:
         try:
             clear_turn()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            release_chat_lock()
         except Exception:  # noqa: BLE001
             pass
         zone_bridge_stop.set()

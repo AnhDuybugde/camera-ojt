@@ -35,13 +35,26 @@ from camera_tracking.voice.qa_tools import TOOL_DECLARATIONS, TOOL_FUNCS
 from camera_tracking.voice.turn_guard import clear_turn, mark_turn
 from camera_tracking.voice.voice_trigger import normalize_trigger_text
 
-from halinh_assistant import (
-    BE_XINH_PHRASES,
-    WAKE_STT_PROMPT,
-    capture_utterance,
-    is_wake,
-    strip_wake_command,
-)
+try:
+    from halinh_assistant import (
+        BE_XINH_PHRASES,
+        WAKE_STT_PROMPT,
+        acquire_chat_lock,
+        capture_utterance,
+        is_wake,
+        release_chat_lock,
+        strip_wake_command,
+    )
+except ModuleNotFoundError:  # imported as scripts.be_xinh_live_assistant in tests
+    from scripts.halinh_assistant import (
+        BE_XINH_PHRASES,
+        WAKE_STT_PROMPT,
+        acquire_chat_lock,
+        capture_utterance,
+        is_wake,
+        release_chat_lock,
+        strip_wake_command,
+    )
 from camera_tracking.voice.rtsp_voice_listener import TARGET_RATE, transcribe_segment_fw
 
 LIVE_SYSTEM = """Bạn là Bé Xinh, người bạn đồng hành bằng giọng nói của hệ thống Camera-OJT.
@@ -109,6 +122,42 @@ def _chunk_pcm(pcm: bytes, milliseconds: int = 100):
             yield part
 
 
+def _agc_pcm(pcm: bytes, peak_target: float = 0.5,
+             max_gain: float = 10.0, silence_peak: int = 100) -> bytes:
+    """Khuếch đại mic về mức Gemini Live nghe rõ.
+
+    Mic camera thường chỉ đạt đỉnh ~0.05 (-26dBFS); gửi thô khiến Live
+    không nhận ra tiếng nói và im luôn (treo turn). Chuẩn hoá đỉnh về
+    ~0.5, trần gain 10x; đoạn thật sự im (đỉnh < ~0.003) thì giữ nguyên
+    để khỏi khuyếch đại nền ồn.
+    """
+    import array
+
+    samples = array.array("h")
+    try:
+        samples.frombytes(bytes(pcm))
+    except (ValueError, OverflowError):
+        return pcm
+    if not samples:
+        return pcm
+    peak = 0
+    for sample in samples:
+        magnitude = abs(sample)
+        if magnitude > peak:
+            peak = magnitude
+    if peak <= silence_peak:
+        return pcm
+    gain = min((peak_target * 32768.0) / peak, max_gain)
+    if gain <= 1.0:
+        return pcm
+    print(f"[Bé Xinh Live] mic gain={gain:.1f}x (peak {peak}/32768).",
+          flush=True)
+    return array.array(
+        "h",
+        (max(-32768, min(32767, int(sample * gain))) for sample in samples),
+    ).tobytes()
+
+
 def _safe_tool_call(name: str, args: object) -> str:
     func = TOOL_FUNCS.get(str(name))
     if not callable(func) or str(name).startswith("_"):
@@ -126,66 +175,77 @@ def _safe_tool_call(name: str, args: object) -> str:
 
 
 async def _send_audio_turn(session, pcm: bytes, types) -> None:
+    # capture_utterance already returns one locally segmented utterance, so
+    # explicit boundaries are more reliable than asking server VAD to detect
+    # speech in a short burst that is uploaded faster than realtime.
+    await session.send_realtime_input(activity_start=types.ActivityStart())
     for chunk in _chunk_pcm(pcm, 100):
         await session.send_realtime_input(
             audio=types.Blob(data=chunk, mime_type="audio/pcm;rate=16000")
         )
-    await session.send_realtime_input(audio_stream_end=True)
+    await session.send_realtime_input(activity_end=types.ActivityEnd())
 
 
-async def _receive_turn(session, speaker: CameraCheckInAnnouncer, types) -> tuple[str, str, float]:
-    """Receive one Live turn, stream native audio, and service tool calls."""
+async def _receive_turn(session, speaker: CameraCheckInAnnouncer, types,
+                        timeout_s: float = 12.0) -> tuple[str, str, float]:
+    """Receive one Live turn, stream native audio, and service tool calls.
+
+    Có timeout: mic ồn/yếu khiến Live im luôn thì không treo turn vĩnh
+    viễn mà trả turn rỗng để caller về wake mode cho người dùng gọi lại.
+    """
     stream = None
     user_text = ""
     assistant_text = ""
     first_audio_at: float | None = None
     started = time.monotonic()
     try:
-        async for response in session.receive():
-            # The SDK exposes response.data as the native 24 kHz PCM shortcut.
-            data = getattr(response, "data", None)
-            audio_chunks = [bytes(data)] if data else []
-            content = getattr(response, "server_content", None)
-            # Keep compatibility with SDK releases that expose native audio
-            # only through server_content.model_turn.parts[].inline_data.
-            if not audio_chunks and content is not None:
-                model_turn = getattr(content, "model_turn", None)
-                for part in getattr(model_turn, "parts", None) or []:
-                    inline = getattr(part, "inline_data", None)
-                    inline_data = getattr(inline, "data", None)
-                    mime = str(getattr(inline, "mime_type", "") or "")
-                    if inline_data and (not mime or mime.startswith("audio/")):
-                        audio_chunks.append(bytes(inline_data))
-            for audio_chunk in audio_chunks:
-                if stream is None:
-                    first_audio_at = time.monotonic()
-                    stream = speaker.open_pcm_stream(input_sample_rate=24_000)
-                stream.write(audio_chunk)
+        async with asyncio.timeout(timeout_s):
+            async for response in session.receive():
+                # The SDK exposes response.data as the native 24 kHz PCM shortcut.
+                data = getattr(response, "data", None)
+                audio_chunks = [bytes(data)] if data else []
+                content = getattr(response, "server_content", None)
+                if not audio_chunks and content is not None:
+                    model_turn = getattr(content, "model_turn", None)
+                    for part in getattr(model_turn, "parts", None) or []:
+                        inline = getattr(part, "inline_data", None)
+                        inline_data = getattr(inline, "data", None)
+                        mime = str(getattr(inline, "mime_type", "") or "")
+                        if inline_data and (not mime or mime.startswith("audio/")):
+                            audio_chunks.append(bytes(inline_data))
+                for audio_chunk in audio_chunks:
+                    if stream is None:
+                        first_audio_at = time.monotonic()
+                        stream = speaker.open_pcm_stream(input_sample_rate=24_000)
+                    stream.write(audio_chunk)
 
-            tool_call = getattr(response, "tool_call", None)
-            if tool_call:
-                function_responses = []
-                for fc in getattr(tool_call, "function_calls", None) or []:
-                    result = _safe_tool_call(fc.name, getattr(fc, "args", None))
-                    print(f"[Bé Xinh Live] tool {fc.name} -> {result}", flush=True)
-                    function_responses.append(types.FunctionResponse(
-                        id=fc.id, name=fc.name, response={"result": result}
-                    ))
-                if function_responses:
-                    await session.send_tool_response(function_responses=function_responses)
+                tool_call = getattr(response, "tool_call", None)
+                if tool_call:
+                    function_responses = []
+                    for fc in getattr(tool_call, "function_calls", None) or []:
+                        result = _safe_tool_call(fc.name, getattr(fc, "args", None))
+                        print(f"[Bé Xinh Live] tool {fc.name} -> {result}", flush=True)
+                        function_responses.append(types.FunctionResponse(
+                            id=fc.id, name=fc.name, response={"result": result}
+                        ))
+                    if function_responses:
+                        await session.send_tool_response(function_responses=function_responses)
 
-            if content is not None:
-                in_tx = getattr(content, "input_transcription", None)
-                out_tx = getattr(content, "output_transcription", None)
-                if in_tx is not None and getattr(in_tx, "text", None):
-                    user_text = str(in_tx.text).strip()
-                if out_tx is not None and getattr(out_tx, "text", None):
-                    assistant_text += str(out_tx.text)
-                if bool(getattr(content, "interrupted", False)) and stream is not None:
-                    stream.close(abort=True)
-                    stream = None
-                if bool(getattr(content, "turn_complete", False)):
-                    break
+                if content is not None:
+                    in_tx = getattr(content, "input_transcription", None)
+                    out_tx = getattr(content, "output_transcription", None)
+                    if in_tx is not None and getattr(in_tx, "text", None):
+                        user_text = str(in_tx.text).strip()
+                    if out_tx is not None and getattr(out_tx, "text", None):
+                        assistant_text += str(out_tx.text)
+                    if bool(getattr(content, "interrupted", False)) and stream is not None:
+                        stream.close(abort=True)
+                        stream = None
+                    if bool(getattr(content, "turn_complete", False)):
+                        break
+    except TimeoutError:
+        print(f"[Bé Xinh Live] Live im lang qua {timeout_s:.0f}s "
+              f"(mic on/yeu?) - ve cho goi.", flush=True)
     finally:
         if stream is not None:
             stream.close()
@@ -203,6 +263,8 @@ async def run_live(args: argparse.Namespace) -> int:
     api_key = os.getenv("GEMINI_API_KEY", "").strip().strip("'\"")
     if not api_key:
         raise RuntimeError("Thiếu GEMINI_API_KEY trong backend/.env")
+    if not acquire_chat_lock("Bé Xinh Live"):
+        raise SystemExit(0)
 
     config = load_config(args.config)
     voice_cfg = config.voice
@@ -228,6 +290,9 @@ async def run_live(args: argparse.Namespace) -> int:
         "tools": [{"function_declarations": TOOL_DECLARATIONS}],
         "input_audio_transcription": {},
         "output_audio_transcription": {},
+        "realtime_input_config": {
+            "automatic_activity_detection": {"disabled": True},
+        },
     }
     print(f"[Bé Xinh Live] READY | model={model} | session idle={idle_s:.0f}s")
 
@@ -269,10 +334,35 @@ async def run_live(args: argparse.Namespace) -> int:
                             continue
 
                         sent_at = time.monotonic()
+                        raw_pcm = pending_pcm
+                        pending_pcm = _agc_pcm(raw_pcm)
                         await _send_audio_turn(session, pending_pcm, types)
                         user_text, assistant_text, response_latency = await _receive_turn(
                             session, speaker, types
                         )
+                        if not user_text and not assistant_text:
+                            # Safety net for weak/noisy camera microphones:
+                            # transcribe locally, then keep Gemini Live native
+                            # voice output and the current conversation context.
+                            fallback_text = await asyncio.to_thread(wake, raw_pcm)
+                            fallback_text = (
+                                strip_wake_command(fallback_text) or fallback_text
+                            ).strip()
+                            if fallback_text:
+                                print(
+                                    f"[Bé Xinh Live] audio fallback -> text: "
+                                    f"{fallback_text}", flush=True,
+                                )
+                                await session.send_client_content(
+                                    turns=types.Content(
+                                        role="user",
+                                        parts=[types.Part(text=fallback_text)],
+                                    ),
+                                    turn_complete=True,
+                                )
+                                user_text, assistant_text, response_latency = (
+                                    await _receive_turn(session, speaker, types)
+                                )
                         total = time.monotonic() - sent_at
                         if user_text:
                             print(f"[Bé Xinh Live] bạn: {user_text}", flush=True)
@@ -282,6 +372,10 @@ async def run_live(args: argparse.Namespace) -> int:
                             f"[Bé Xinh Live] first-audio={response_latency:.2f}s | "
                             f"turn={total:.2f}s", flush=True,
                         )
+                        if not user_text and not assistant_text:
+                            print("[Bé Xinh Live] turn rong (Gemini khong "
+                                  "nghe ro) - ve cho goi.", flush=True)
+                            break
                         conversation_started = time.monotonic()
                         pending_pcm = None
             except Exception as error:  # noqa: BLE001
@@ -293,6 +387,10 @@ async def run_live(args: argparse.Namespace) -> int:
         print("\n[Bé Xinh Live] dừng.")
     finally:
         clear_turn()
+        try:
+            release_chat_lock()
+        except Exception:  # noqa: BLE001
+            pass
         speaker.close()
     return 0
 
