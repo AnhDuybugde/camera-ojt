@@ -157,13 +157,9 @@ class InsightFaceEmbedder:
         if self._app is not None:
             return self._app
         ensure_cuda_dlls()
-        try:
-            from insightface.app import FaceAnalysis
-        except ImportError as error:
-            raise RuntimeError(
-                "insightface chua cai. Chay: pip install insightface onnxruntime "
-                "(~300MB model tai lan dau)."
-            ) from error
+        # Validate an explicit CUDA contract before importing InsightFace.
+        # This gives operators the actionable provider error even on a fresh
+        # machine where both optional packages may still be missing.
         want_cuda = self.device_name in ("auto", "cuda")
         use_cuda = want_cuda and self._cuda_provider_available()
         if self.device_name == "cuda" and not use_cuda:
@@ -172,6 +168,13 @@ class InsightFaceEmbedder:
                 "Cai CUDA Toolkit 12.x + cuDNN roi: pip install onnxruntime-gpu. "
                 "Tam dung face_device=cpu."
             )
+        try:
+            from insightface.app import FaceAnalysis
+        except ImportError as error:
+            raise RuntimeError(
+                "insightface chua cai. Chay: pip install insightface onnxruntime "
+                "(~300MB model tai lan dau)."
+            ) from error
         providers: list[str] | None = ["CUDAExecutionProvider", "CPUExecutionProvider"] \
             if use_cuda else None
         # InsightFace/ONNX in mot dong providers cho tung model va danh sach

@@ -31,6 +31,11 @@ create table if not exists public.attendance_daily (
   check_in_at timestamptz,
   check_out_at timestamptz,
   face_score double precision,
+  liveness_score double precision,
+  verification_method text,
+  automatic boolean not null default true,
+  status text not null default 'PRESENT'
+    check (status in ('PRESENT','TEMP_OUT','CHECKED_OUT')),
   needs_review boolean not null default false,
   updated_at timestamptz not null default now(),
   edited_by text,
@@ -75,6 +80,20 @@ create table if not exists public.room_events (
 create index if not exists room_events_date_idx on public.room_events (date);
 create index if not exists room_events_gid_idx on public.room_events (global_id);
 
+create table if not exists public.attendance_audit_log (
+  id bigint generated always as identity primary key,
+  date date not null,
+  person_id text not null,
+  action text not null,
+  before_value jsonb,
+  after_value jsonb,
+  reason text,
+  actor text not null default 'camera-system',
+  created_at timestamptz not null default now()
+);
+create index if not exists attendance_audit_day_person_idx
+  on public.attendance_audit_log (date, person_id);
+
 create table if not exists public.face_crops (
   id bigint generated always as identity primary key,
   date date not null,
@@ -98,6 +117,7 @@ alter table public.attendance_daily enable row level security;
 alter table public.room_status_daily enable row level security;
 alter table public.employee_current_state enable row level security;
 alter table public.room_events enable row level security;
+alter table public.attendance_audit_log enable row level security;
 alter table public.face_crops enable row level security;
 alter table public.roles enable row level security;
 
@@ -109,6 +129,10 @@ create policy "read all" on public.room_events for select to authenticated using
 create policy "read all" on public.face_crops for select to authenticated using (true);
 create policy "self role" on public.roles for select to authenticated
   using (auth.uid() = user_id);
+create policy "admin read audit" on public.attendance_audit_log
+  for select to authenticated using (
+    exists (select 1 from public.roles r where r.user_id = auth.uid() and r.role = 'admin')
+  );
 
 create policy "admin write persons" on public.persons
   for all to authenticated using (

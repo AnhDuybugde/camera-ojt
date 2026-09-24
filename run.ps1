@@ -27,6 +27,17 @@ if (-not (Test-Path -LiteralPath (Join-Path $backend ".env"))) {
 New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 
+function Get-DotEnvValue {
+    param([string]$Name, [string]$Default = "")
+    $inherited = [Environment]::GetEnvironmentVariable($Name)
+    if (-not [string]::IsNullOrWhiteSpace($inherited)) { return $inherited.Trim() }
+    $line = Get-Content -LiteralPath (Join-Path $backend ".env") |
+        Where-Object { $_ -match "^\s*$([regex]::Escape($Name))\s*=" } |
+        Select-Object -Last 1
+    if ($null -eq $line) { return $Default }
+    return (($line -split '=', 2)[1]).Trim().Trim('"').Trim("'")
+}
+
 function Wait-ServiceEndpoint {
     param(
         [Parameter(Mandatory = $true)][string]$Uri,
@@ -141,9 +152,21 @@ if ($audioEnabled) {
 
 $chatProcess = $null
 if ($geminiKeyConfigured -and $chatEnabled) {
+    $realtimeMode = (Get-DotEnvValue "BE_XINH_REALTIME_MODE" "classic").ToLowerInvariant()
+    if ($realtimeMode -eq "live") {
+        $chatScript = "scripts/be_xinh_live_assistant.py"
+        $chatModel = Get-DotEnvValue "GEMINI_LIVE_MODEL" "gemini-3.8-live"
+    }
+    elseif ($realtimeMode -eq "classic") {
+        $chatScript = "scripts/be_xinh_assistant.py"
+        $chatModel = Get-DotEnvValue "GEMINI_MODEL" "gemini-3.5-flash-lite"
+    }
+    else {
+        throw "Unsupported BE_XINH_REALTIME_MODE=$realtimeMode"
+    }
     $chatProcess = Start-Process `
         -FilePath $backendPython `
-        -ArgumentList @("-X", "utf8", "-u", "scripts/be_xinh_assistant.py", "--model", "gemini-3.5-flash-lite") `
+        -ArgumentList @("-X", "utf8", "-u", $chatScript, "--model", $chatModel) `
         -WorkingDirectory $backend `
         -WindowStyle Hidden `
         -RedirectStandardOutput (Join-Path $logDir "be-xinh-chat.out.log") `

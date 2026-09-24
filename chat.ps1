@@ -8,11 +8,34 @@ $ErrorActionPreference = "Stop"
 $workspace = Split-Path -Parent $MyInvocation.MyCommand.Path
 $backend = Join-Path $workspace "backend"
 $python = Join-Path $backend ".venv\Scripts\python.exe"
-$script = Join-Path $backend "scripts\be_xinh_assistant.py"
 $runtimeDir = Join-Path $workspace ".runtime"
 $statePath = Join-Path $runtimeDir "processes.json"
 $preferencePath = Join-Path $runtimeDir "be-xinh-chat.json"
 $logDir = Join-Path $workspace "logs"
+
+function Get-DotEnvValue {
+    param([string]$Name, [string]$Default = "")
+    $inherited = [Environment]::GetEnvironmentVariable($Name)
+    if (-not [string]::IsNullOrWhiteSpace($inherited)) { return $inherited.Trim() }
+    $line = Get-Content -LiteralPath (Join-Path $backend ".env") |
+        Where-Object { $_ -match "^\s*$([regex]::Escape($Name))\s*=" } |
+        Select-Object -Last 1
+    if ($null -eq $line) { return $Default }
+    return (($line -split '=', 2)[1]).Trim().Trim('"').Trim("'")
+}
+
+$realtimeMode = (Get-DotEnvValue "BE_XINH_REALTIME_MODE" "classic").ToLowerInvariant()
+if ($realtimeMode -eq "live") {
+    $script = Join-Path $backend "scripts\be_xinh_live_assistant.py"
+    $chatModel = Get-DotEnvValue "GEMINI_LIVE_MODEL" "gemini-3.8-live"
+}
+elseif ($realtimeMode -eq "classic") {
+    $script = Join-Path $backend "scripts\be_xinh_assistant.py"
+    $chatModel = Get-DotEnvValue "GEMINI_MODEL" "gemini-3.5-flash-lite"
+}
+else {
+    throw "Unsupported BE_XINH_REALTIME_MODE=$realtimeMode"
+}
 
 function Read-State {
     if (Test-Path -LiteralPath $statePath) {
@@ -24,7 +47,10 @@ function Read-State {
 function Test-ChatProcess([int]$ProcessId) {
     if ($ProcessId -le 0) { return $false }
     $process = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue
-    return $null -ne $process -and $process.CommandLine -like "*be_xinh_assistant.py*"
+    return $null -ne $process -and (
+        $process.CommandLine -like "*be_xinh_assistant.py*" -or
+        $process.CommandLine -like "*be_xinh_live_assistant.py*"
+    )
 }
 
 function Write-ChatPid($state, [int]$ProcessId) {
@@ -112,7 +138,7 @@ if ($Action -eq "foreground") {
     Write-Host "Bé Xinh is running in the foreground. Press Ctrl+C to stop immediately."
     $process = Start-Process `
         -FilePath $python `
-        -ArgumentList @("-X", "utf8", "-u", $script, "--model", "gemini-3.5-flash-lite") `
+        -ArgumentList @("-X", "utf8", "-u", $script, "--model", $chatModel) `
         -WorkingDirectory $backend `
         -NoNewWindow `
         -PassThru
@@ -136,7 +162,7 @@ if ($Action -eq "foreground") {
 
 $process = Start-Process `
     -FilePath $python `
-    -ArgumentList @("-X", "utf8", "-u", $script, "--model", "gemini-3.5-flash-lite") `
+    -ArgumentList @("-X", "utf8", "-u", $script, "--model", $chatModel) `
     -WorkingDirectory $backend `
     -WindowStyle Hidden `
     -RedirectStandardOutput (Join-Path $logDir "be-xinh-chat.out.log") `

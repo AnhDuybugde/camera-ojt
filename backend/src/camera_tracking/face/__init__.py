@@ -18,6 +18,7 @@ from camera_tracking.face.embeddings import (
     is_frontal_face,
 )
 from camera_tracking.face.gallery import EnrolledPerson, FaceGallery, load_gallery
+from camera_tracking.face.liveness import HttpLivenessGate, LivenessGate, LivenessResult
 from camera_tracking.face.matcher import FaceMatcher, MatchResult
 from camera_tracking.face.reid import FaceReIDEmbedding
 from camera_tracking.face.worker import FaceJob, FaceResult, FaceWorker
@@ -31,6 +32,7 @@ __all__ = [
     "FaceEmbedder",
     "FaceGallery",
     "FaceJob",
+    "HttpLivenessGate",
     "FaceMatcher",
     "FaceObservation",
     "FaceReIDEmbedding",
@@ -38,6 +40,8 @@ __all__ = [
     "FaceTrackConsumer",
     "FaceWorker",
     "InsightFaceEmbedder",
+    "LivenessGate",
+    "LivenessResult",
     "MatchResult",
     "cosine_similarity",
     "face_sharpness",

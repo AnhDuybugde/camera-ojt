@@ -84,11 +84,10 @@ Quy tắc trả lời:
 * Dùng tiếng Việt tự nhiên, thân thiện, dễ thương và dễ nghe khi chuyển thành giọng nói.
 * Luôn tự xưng là Bé Xinh; không dùng tên Hà Linh.
  * Với câu hỏi đơn giản, chỉ đưa ra thông tin cần thiết.
- * TUYỆT ĐỐI không hỏi ngược lại người dùng dưới mọi hình thức: không câu
-   hỏi làm rõ, không gợi ý hỏi tiếp, không đặt nhiều câu hỏi trong một lượt
-   (hệ thống chưa có memory hội thoại).
- * Nếu thiếu thông tin, trả lời ngay với giả định hợp lý nhất và nói rõ
-   giả định đó trong cùng 1 câu, không hỏi lại.
+ * Ghi nhớ mạch hội thoại gần nhất được gửi kèm để hiểu các câu nối tiếp như
+   "còn người đó?", "vậy ngày mai?", "tại sao?".
+ * Nếu thiếu một chi tiết thật sự cần thiết, được hỏi tối đa một câu làm rõ
+   ngắn; nếu có thể suy luận an toàn thì trả lời ngay và nói rõ giả định.
 * Nếu có dữ liệu từ tool/API, chỉ tóm tắt kết quả quan trọng nhất cho người dùng.
 * Không mô tả quá trình suy nghĩ hoặc xử lý của bạn.
 * Không nói bạn là AI, trừ khi người dùng hỏi trực tiếp.
@@ -135,7 +134,7 @@ ROUTER_PROTOCOL = """Bạn là bộ định tuyến câu hỏi tiếng Việt, t
 {"type":"direct|tool","tool":"<tên_tool hoặc null>","args":{},"text":"<câu trả lời ngắn nếu type=direct, ngược lại để rỗng>"}
 
 Luật:
- * type=direct: tự trả lời ngắn gọn 1-2 câu, dưới 40 từ, tiếng Việt tự nhiên để đọc thành tiếng, không Markdown. CẤM hỏi ngược lại (không câu hỏi làm rõ, không gợi ý hỏi tiếp).
+ * type=direct: tự trả lời ngắn gọn 1-2 câu, dưới 40 từ, tiếng Việt tự nhiên để đọc thành tiếng, không Markdown. Chỉ hỏi tối đa một câu làm rõ khi thật sự bắt buộc.
  * type=tool: chỉ dùng tool trong danh sách dưới; điền đủ tham số bắt buộc; tham số tùy chọn không biết thì bỏ qua (tool có giá trị mặc định).
  * Không bịa tham số: nghe "mấy giờ" thì gọi get_current_time không tham số; nghe thiếu thông tin bắt buộc thì type=direct với câu trả lời tốt nhất theo giả định mặc định (nêu giả định), KHÔNG hỏi lại.
 * Ví dụ: "Python là gì" -> {"type":"direct","tool":null,"args":{},"text":"Python là ngôn ngữ lập trình phổ biến, dễ đọc và dùng nhiều cho AI."}
@@ -515,7 +514,8 @@ def capture_utterance(
 
 def think(question: str, model: str, max_tokens: int,
           use_search: bool = False,
-          audio_pcm: bytes | None = None) -> tuple[str, float, list[str]]:
+          audio_pcm: bytes | None = None,
+          history: list[tuple[str, str]] | None = None) -> tuple[str, float, list[str]]:
     """Router JSON 1-call duy nhat: Gemini chi hieu cau hoi.
 
     - direct -> text trong JSON la dap an cuoi (khong goi them).
@@ -546,7 +546,16 @@ def think(question: str, model: str, max_tokens: int,
         config_args["thinking_config"] = types.ThinkingConfig(
             thinking_budget=0)
     config = types.GenerateContentConfig(**config_args)
-    contents: object = question
+    history_lines = []
+    for role, text in (history or [])[-6:]:
+        cleaned = " ".join(str(text or "").split())
+        if cleaned:
+            history_lines.append(f"{role}: {cleaned}")
+    context_prefix = (
+        "Ngữ cảnh hội thoại gần nhất:\n" + "\n".join(history_lines) + "\n\n"
+        if history_lines else ""
+    )
+    contents: object = context_prefix + question
     if audio_pcm:
         glossary = os.getenv(
             "BE_XINH_SPEECH_GLOSSARY",
@@ -565,7 +574,7 @@ def think(question: str, model: str, max_tokens: int,
                 "mixed. Thực hiện yêu cầu theo đúng giao thức JSON trong "
                 "system instruction.\n"
                 f"Từ vựng/tên riêng ưu tiên nếu âm thanh phù hợp: {glossary}.\n"
-                f"Transcript gợi ý: {question}"
+                f"{context_prefix}Transcript gợi ý: {question}"
             ),
             types.Part.from_bytes(
                 data=pcm_to_wav_bytes(audio_pcm), mime_type="audio/wav"),
@@ -911,6 +920,7 @@ def main() -> None:
     out_dir = ROOT / "output" / "qa_cache"
     out_dir.mkdir(parents=True, exist_ok=True)
     done_rounds = 0
+    chat_history: deque[tuple[str, str]] = deque(maxlen=8)
     wake_miss = 0
     empty_wake = 0  # dem doan on STT ra rong (de heartbeat, khoi tuong chet)
     # A quota failure is normally project/model-scoped, not a useful signal to
@@ -1041,7 +1051,8 @@ def main() -> None:
                     try:
                         ans, tls, used = think(
                             question, target_model, args.max_tokens,
-                            args.with_search, audio_pcm=pcm)
+                            args.with_search, audio_pcm=pcm,
+                            history=list(chat_history))
                         one.update(answer=ans, tool_s=tls, used=used)
                     except Exception as error:  # noqa: BLE001
                         one.update(error=error)
@@ -1147,6 +1158,8 @@ def main() -> None:
                 continue
             print(f"[BeXinhChat] dap ({llm_s:.2f}s, tool {tool_s:.2f}s "
                   f"{result.get('used', [])}): {answer}", flush=True)
+            chat_history.append(("Người dùng", question))
+            chat_history.append(("Bé Xinh", answer))
 
             # -- SPEAK (loa camera P2P) --
             t0 = time.monotonic()

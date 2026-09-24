@@ -384,6 +384,16 @@ class CameraCheckInAnnouncer:
         finally:
             self._speaking.clear()
 
+    def open_pcm_stream(self, *, input_sample_rate: int = 24_000):
+        """Open a low-latency raw PCM stream to the camera speaker.
+
+        Gemini Live returns mono signed-16 PCM at 24 kHz.  The VisualTalk
+        helper already accepts an input sample rate and performs AAC/output
+        resampling, so Live audio can be forwarded chunk-by-chunk without
+        waiting for a complete WAV/TTS file.
+        """
+        return CameraPcmStream(self, input_sample_rate=input_sample_rate)
+
     def _run(self) -> None:
         # Production runtime is cache-first. Do NOT load ZeroTTS here: YOLO +
         # InsightFace are already using CUDA and loading another large model at
@@ -777,6 +787,7 @@ class CameraCheckInAnnouncer:
 
 __all__ = [
     "CameraCheckInAnnouncer",
+    "CameraPcmStream",
     "PRIORITY_GESTURE",
     "PRIORITY_ARRIVAL",
     "PRIORITY_APPROACH",
@@ -784,3 +795,120 @@ __all__ = [
     "PRIORITY_REMINDER",
     "PRIORITY_PREWARM",
 ]
+
+
+class CameraPcmStream:
+    """Incremental VisualTalk stream used by realtime voice agents.
+
+    The stream owns one helper process for one model turn. ``write`` may be
+    called as soon as Gemini emits the first 24 kHz audio chunk.
+    """
+
+    def __init__(self, announcer: CameraCheckInAnnouncer, *, input_sample_rate: int = 24_000) -> None:
+        self.announcer = announcer
+        self.input_sample_rate = max(8_000, int(input_sample_rate))
+        self.process: subprocess.Popen | None = None
+        self._reader: threading.Thread | None = None
+        self._line_queue: Queue[str | None] = Queue()
+        self._closed = False
+        self._start()
+
+    def _start(self) -> None:
+        owner = self.announcer
+        if owner._closed.is_set() or owner._muted.is_set():
+            raise RuntimeError("Bé Xinh direct speaker is unavailable")
+        command = [
+            sys.executable, "-u", str(owner.helper_path),
+            "--direct", "--host", owner.host, "--port", str(owner.port),
+            "--serial", "CAMERA_AIM_BE_XINH_LIVE",
+            "--username", owner.username, "--password", owner.password,
+            "--channel", "1", "--subtype", "0", "--type", "0",
+            "--startup-delay", "0", "--input-codec", "s16le",
+            "--input-sample-rate", str(self.input_sample_rate),
+            "--output-codec", "aac-adts",
+            "--sample-rate", str(PCM_SAMPLE_RATE),
+            "--aac-bitrate", "48000",
+            "--volume-gain", str(owner.gain), "--debug",
+        ]
+        process = subprocess.Popen(
+            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=False, bufsize=0,
+        )
+        self.process = process
+        with owner._talk_process_lock:
+            owner._talk_process = process
+        owner._speaking.set()
+
+        def _read() -> None:
+            assert process.stdout is not None
+            try:
+                while True:
+                    raw = process.stdout.readline()
+                    if not raw:
+                        break
+                    line = raw.decode("utf-8", errors="replace").rstrip()
+                    if line:
+                        print(f"[IMOU-Live] {line}")
+                    self._line_queue.put(line)
+            finally:
+                self._line_queue.put(None)
+
+        self._reader = threading.Thread(target=_read, name="imou-live-talk-output", daemon=True)
+        self._reader.start()
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                self.close(abort=True)
+                raise RuntimeError(f"VisualTalk helper exited early ({process.returncode})")
+            try:
+                line = self._line_queue.get(timeout=0.20)
+            except Empty:
+                continue
+            if line is None:
+                break
+            if "talk started" in line.lower():
+                time.sleep(0.05)
+                return
+        self.close(abort=True)
+        raise RuntimeError("VisualTalk did not report 'talk started'")
+
+    def write(self, pcm: bytes) -> None:
+        if self._closed or not pcm:
+            return
+        process = self.process
+        if process is None or process.poll() is not None or process.stdin is None:
+            raise RuntimeError("VisualTalk realtime stream is not available")
+        process.stdin.write(pcm)
+
+    def close(self, *, abort: bool = False) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        process = self.process
+        owner = self.announcer
+        try:
+            if process is not None and process.stdin is not None and not process.stdin.closed:
+                process.stdin.close()
+        except Exception:
+            pass
+        if process is not None:
+            if abort and process.poll() is None:
+                process.kill()
+            elif process.poll() is None:
+                try:
+                    process.wait(timeout=8.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+        if self._reader is not None:
+            self._reader.join(timeout=1.0)
+        with owner._talk_process_lock:
+            if owner._talk_process is process:
+                owner._talk_process = None
+        owner._speaking.clear()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close(abort=exc is not None)
+        return False

@@ -136,6 +136,16 @@ class SupabaseStore:
             self._error = str(error)
             return False
 
+    def insert_attendance_audit(self, row: dict) -> bool:
+        if not self.connect():
+            return False
+        try:
+            self._client.table("attendance_audit_log").insert(row).execute()
+            return True
+        except Exception as error:  # noqa: BLE001
+            self._error = str(error)
+            return False
+
     def fetch_attendance_day(self, day: str) -> list[dict]:
         """Lấy attendance đã tick trong ngày để preload sau restart.
 
@@ -144,12 +154,28 @@ class SupabaseStore:
         if not self.connect():
             return []
         try:
-            response = (
-                self._client.table("attendance_daily")
-                .select("date,person_id,person_name,global_id,check_in_at,face_score")
-                .eq("date", day)
-                .execute()
-            )
+            query = self._client.table("attendance_daily")
+            try:
+                response = (
+                    query.select(
+                        "date,person_id,person_name,global_id,check_in_at,"
+                        "check_out_at,face_score,liveness_score,"
+                        "verification_method,automatic,status"
+                    )
+                    .eq("date", day)
+                    .execute()
+                )
+            except Exception:
+                # Rolling deployment: stay compatible until the V2 migration
+                # is applied, while still preventing duplicate check-ins.
+                response = (
+                    self._client.table("attendance_daily")
+                    .select(
+                        "date,person_id,person_name,global_id,check_in_at,face_score"
+                    )
+                    .eq("date", day)
+                    .execute()
+                )
             return list(getattr(response, "data", None) or [])
         except Exception as error:  # noqa: BLE001
             self._error = str(error)

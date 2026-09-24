@@ -617,7 +617,11 @@ def _flush_queue(
         is_known_crop = kind == "face_crop" and "/known/" in payload.get(
             "storage_path", ""
         ).replace("\\", "/")
-        is_attendance = kind == "attendance" or is_check_in or is_known_crop
+        is_attendance = (
+            kind in {"attendance", "attendance_audit"}
+            or is_check_in
+            or is_known_crop
+        )
         if attendance_only and not is_attendance:
             continue
         if defer_attendance and is_attendance:
@@ -633,6 +637,8 @@ def _flush_queue(
             done = supabase.upsert_current_state(payload)
         elif kind == "event":
             done = supabase.insert_event(payload)
+        elif kind == "attendance_audit":
+            done = supabase.insert_attendance_audit(payload)
         elif kind == "face_crop":
             done = supabase.upload_face_crop(
                 payload.get("local_path", ""), payload.get("storage_path", "")
@@ -1212,6 +1218,18 @@ def main() -> None:
         "ATTENDANCE_AUTOMATION_ENABLED",
         "false" if production_mode else "true",
     ).strip().lower() in {"1", "true", "yes", "on"}
+    entry_channel = os.getenv("ATTENDANCE_ENTRY_CHANNEL", "B").strip().upper() or "B"
+    from camera_tracking.face.liveness import LivenessGate
+    try:
+        liveness_gate = LivenessGate.from_env(
+            required=bool(production_mode and attendance_automation_enabled)
+        )
+    except (RuntimeError, ValueError) as error:
+        raise SystemExit(
+            "Automatic attendance is blocked: configure an audited liveness "
+            "provider, or set ATTENDANCE_AUTOMATION_ENABLED=false. "
+            f"Detail: {error}"
+        ) from error
     face_embedder = shared_face_embedder
     face_matcher = face_gallery = attendance = face_consumer = None
     face_roster: list[dict[str, object]] = []
@@ -1313,17 +1331,18 @@ def main() -> None:
                     continue
                 gid_to_person[restored_gid] = restored.employee_id
                 gid_to_display[restored_gid] = person.display_name
-            if attendance_automation_enabled:
-                attendance = FaceAttendanceService(
-                    debounce_hits=config.attendance.debounce_hits,
-                    window_s=config.attendance.window_s,
-                    active_hour_start=config.attendance.active_hour_start,
-                    active_hour_end=config.attendance.active_hour_end,
-                )
-            else:
+            # Identity recognition must remain available in monitor-only mode;
+            # only the attendance write is gated below.
+            attendance = FaceAttendanceService(
+                debounce_hits=config.attendance.debounce_hits,
+                window_s=config.attendance.window_s,
+                active_hour_start=config.attendance.active_hour_start,
+                active_hour_end=config.attendance.active_hour_end,
+            )
+            if not attendance_automation_enabled:
                 print(
                     "Attendance automation: MONITOR-ONLY. Face recognition remains "
-                    "active, but automatic biometric writes are disabled."
+                    "active; biometric attendance writes are disabled."
                 )
             print(f"Face gallery: {len(face_gallery)} nguoi tu {face_cfg.gallery_dir} "
                   f"| threshold={face_threshold} margin={face_cfg.min_margin} "
@@ -1345,6 +1364,11 @@ def main() -> None:
                 max_job_age_s=float(getattr(
                     config.voice, "face_max_job_age_s", 5.0
                 )),
+                liveness_gate=liveness_gate,
+                liveness_channel=entry_channel,
+                liveness_required=lambda day, person_id: bool(
+                    person_id and not attendance.is_ticked(day, person_id)
+                ),
             )
             face_worker.start()
             print(f"Face worker: async, once-per-track, "
@@ -1390,6 +1414,12 @@ def main() -> None:
         leave_confirm_window_s=config.room_fusion.leave_confirm_window_s,
         absent_fallback_s=config.room_fusion.absent_fallback_s,
     )
+    from camera_tracking.attendance import (
+        AttendanceLifecycleEngine,
+        AttendanceLifecycleRecord,
+        AttendanceState,
+    )
+    attendance_lifecycle = AttendanceLifecycleEngine()
     # Preload attendance đã tick trong ngày từ Supabase để restart giữa ngày
     # không tick trùng (RAM-only trước đây là lỗ hổng thực tế).
     if attendance is not None:
@@ -1397,23 +1427,54 @@ def main() -> None:
             from camera_tracking.face.attendance import AttendanceRecord as _AR
 
             preloaded = []
-            for row in supabase.fetch_attendance_day(startup_day):
+            lifecycle_preloaded = []
+            attendance_rows = supabase.fetch_attendance_day(startup_day)
+            for row in attendance_rows:
                 try:
+                    row_day = str(row.get("date", startup_day))
+                    person_id = str(row.get("person_id", ""))
+                    display_name = str(row.get("person_name") or person_id)
+                    global_id = int(row.get("global_id") or 0)
+                    face_score = float(row.get("face_score") or 0.0)
                     preloaded.append(_AR(
-                        day=str(row.get("date", startup_day)),
-                        person_id=str(row.get("person_id", "")),
+                        day=row_day,
+                        person_id=person_id,
                         display_name=str(row.get("person_name")
-                                         or row.get("person_id", "")),
-                        global_id=int(row.get("global_id") or 0),
+                                         or person_id),
+                        global_id=global_id,
                         first_seen_at=0.0,
                         wall_time=str(row.get("check_in_at") or ""),
-                        face_score=float(row.get("face_score") or 0.0),
+                        face_score=face_score,
+                    ))
+                    raw_state = str(row.get("status") or "PRESENT").upper()
+                    try:
+                        state = AttendanceState(raw_state)
+                    except ValueError:
+                        state = AttendanceState.PRESENT
+                    lifecycle_preloaded.append(AttendanceLifecycleRecord(
+                        day=row_day,
+                        person_id=person_id,
+                        display_name=display_name,
+                        state=state,
+                        check_in_at=str(row.get("check_in_at") or "") or None,
+                        check_out_at=str(row.get("check_out_at") or "") or None,
+                        last_event_at=str(
+                            row.get("check_out_at") or row.get("check_in_at") or ""
+                        ) or None,
+                        global_id=global_id,
+                        confidence=face_score,
+                        verification_method=str(
+                            row.get("verification_method") or "tracking+face"
+                        ),
+                        automatic=bool(row.get("automatic", True)),
                     ))
                 except (TypeError, ValueError):
                     continue
             preloaded = [r for r in preloaded if r.person_id]
+            lifecycle_preloaded = [r for r in lifecycle_preloaded if r.person_id]
             if preloaded:
                 attendance.preload(preloaded)
+                attendance_lifecycle.preload(lifecycle_preloaded)
                 day_cache.preload_attendance(
                     startup_day, [r.person_id for r in preloaded])
                 print(f"Preloaded {len(preloaded)} attendance từ DB ({startup_day})")
@@ -2072,6 +2133,7 @@ def main() -> None:
     def _handle_one_face(*, channel: str, frame, track, crop, det, match,
                            sharp, quality: float = 1.0,
                            identity_confirmed: bool = True,
+                           liveness_result=None,
                            face_marks: list, day_str: str,
                            wall_iso: str, time_tag: str, now_s: float) -> None:
         """Apply 1 face observation: bind/reconcile/attendance/greet/crop-save.
@@ -2338,23 +2400,61 @@ def main() -> None:
                     det.embedding,
                     index=len(match.person.prototypes),
                 )
-            ticked = attendance.observe(
-                day=day_str, global_id=identity_gid,
-                person_id=employee_id,
-                display_name=match.person.display_name,
-                score=match.score, now_s=now_s,
-                wall_time_iso=wall_iso,
+            ticked = None
+            liveness_score = None
+            attendance_candidate = (
+                attendance_automation_enabled
+                and channel.upper() == entry_channel
             )
+            if attendance_candidate:
+                liveness_ok = liveness_gate is None
+                if liveness_gate is not None and liveness_result is not None:
+                    liveness_ok = bool(getattr(liveness_result, "verified", False))
+                    liveness_score = float(getattr(liveness_result, "score", 0.0))
+                    if not liveness_ok:
+                        print(
+                            f"[Liveness][{channel}] REJECT "
+                            f"{match.person.display_name} "
+                            f"score={liveness_score:.2f} "
+                            f"reason={getattr(liveness_result, 'reason', 'rejected')}"
+                        )
+                if liveness_ok:
+                    ticked = attendance.observe(
+                        day=day_str, global_id=identity_gid,
+                        person_id=employee_id,
+                        display_name=match.person.display_name,
+                        score=match.score, now_s=now_s,
+                        wall_time_iso=wall_iso,
+                    )
             if (
                 ticked is not None
                 and day_cache.attendance_should_write(day_str, ticked.person_id)
             ):
+                    verification_method = (
+                        "tracking+face+liveness" if liveness_gate is not None
+                        else "tracking+face-dev"
+                    )
+                    attendance_lifecycle.observe_enter(
+                        day=day_str,
+                        person_id=ticked.person_id,
+                        display_name=ticked.display_name,
+                        global_id=ticked.global_id,
+                        at_iso=wall_iso,
+                        channel=channel,
+                        confidence=ticked.face_score,
+                        verification_method=verification_method,
+                        automatic=True,
+                    )
                     _store_or_queue(write_queue, supabase, "attendance", {
                         "date": day_str, "person_id": ticked.person_id,
                         "person_name": ticked.display_name,
                         "global_id": ticked.global_id,
                         "attended": True, "check_in_at": wall_iso,
+                        "check_out_at": None, "status": "PRESENT",
                         "face_score": ticked.face_score,
+                        "liveness_score": liveness_score,
+                        "verification_method": verification_method,
+                        "automatic": True,
                         # Tick biên (vừa đủ ngưỡng) cần admin review tay.
                         "needs_review": bool(ticked.face_score < 0.80),
                     })
@@ -2363,6 +2463,22 @@ def main() -> None:
                         "person_id": ticked.person_id,
                         "event": "CHECK_IN", "channel": channel,
                         "at": wall_iso,
+                    })
+                    _store_or_queue(write_queue, supabase, "attendance_audit", {
+                        "date": day_str,
+                        "person_id": ticked.person_id,
+                        "action": "CHECK_IN",
+                        "before_value": None,
+                        "after_value": {
+                            "status": "PRESENT",
+                            "check_in_at": wall_iso,
+                            "global_id": ticked.global_id,
+                            "face_score": ticked.face_score,
+                            "liveness_score": liveness_score,
+                            "verification_method": verification_method,
+                        },
+                        "reason": "verified_entry",
+                        "actor": "camera-system",
                     })
                     _note_event(
                         event="CHECK_IN", global_id=ticked.global_id,
@@ -2599,6 +2715,7 @@ def main() -> None:
                         identity_confirmed=getattr(
                             res, "identity_confirmed", True
                         ),
+                        liveness_result=getattr(res, "liveness_result", None),
                         face_marks=marks, day_str=res.day_str,
                         wall_iso=res.wall_iso, time_tag=res.time_tag,
                         now_s=res.now_s,
@@ -3168,6 +3285,82 @@ def main() -> None:
                             person_id=gid_to_person.get(wgid),
                             person_name=gid_to_display.get(wgid),
                         )
+                    employee_id = gid_to_person.get(wgid)
+                    if (
+                        attendance_automation_enabled
+                        and employee_id
+                        and (st.just_left_office or st.just_returned)
+                    ):
+                        if st.just_left_office:
+                            lifecycle_events = attendance_lifecycle.observe_exit(
+                                day=day_str,
+                                person_id=employee_id,
+                                display_name=gid_to_display.get(wgid),
+                                global_id=wgid,
+                                at_iso=wall_iso,
+                                channel="B",
+                                confidence=gid_to_score.get(wgid),
+                                final=False,
+                            )
+                        else:
+                            lifecycle_events = attendance_lifecycle.observe_enter(
+                                day=day_str,
+                                person_id=employee_id,
+                                display_name=gid_to_display.get(wgid),
+                                global_id=wgid,
+                                at_iso=wall_iso,
+                                channel="A",
+                                confidence=gid_to_score.get(wgid),
+                            )
+                        lifecycle_record = attendance_lifecycle.record_of(
+                            day_str, employee_id
+                        )
+                        if lifecycle_record is not None and lifecycle_events:
+                            _store_or_queue(write_queue, supabase, "attendance", {
+                                "date": day_str,
+                                "person_id": employee_id,
+                                "person_name": lifecycle_record.display_name,
+                                "global_id": wgid,
+                                "attended": True,
+                                "check_in_at": lifecycle_record.check_in_at,
+                                "check_out_at": lifecycle_record.check_out_at,
+                                "status": lifecycle_record.state.value,
+                                "face_score": lifecycle_record.confidence,
+                                "liveness_score": None,
+                                "verification_method": (
+                                    lifecycle_record.verification_method
+                                ),
+                                "automatic": lifecycle_record.automatic,
+                                "needs_review": False,
+                            })
+                            for lifecycle_event in lifecycle_events:
+                                _store_or_queue(
+                                    write_queue, supabase, "attendance_audit", {
+                                        "date": day_str,
+                                        "person_id": employee_id,
+                                        "action": lifecycle_event.event,
+                                        "before_value": None,
+                                        "after_value": {
+                                            "status": lifecycle_record.state.value,
+                                            "check_in_at": lifecycle_record.check_in_at,
+                                            "check_out_at": lifecycle_record.check_out_at,
+                                            "global_id": wgid,
+                                        },
+                                        "reason": "room_fusion_transition",
+                                        "actor": "camera-system",
+                                    },
+                                )
+                                # RETURN is already persisted by room fusion.
+                                if lifecycle_event.event == "RETURN":
+                                    continue
+                                _store_or_queue(write_queue, supabase, "event", {
+                                    "date": day_str,
+                                    "global_id": wgid,
+                                    "person_id": employee_id,
+                                    "event": lifecycle_event.event,
+                                    "channel": lifecycle_event.channel,
+                                    "at": lifecycle_event.at_iso,
+                                })
                     if write_row and established:
                         row = day_cache.status_of(day_str, wgid)
                         if row is None:
@@ -3646,18 +3839,29 @@ def main() -> None:
                                 else None
                             ),
                         })
-                    attendance_today = [] if attendance is None else [
-                        {
-                            "date": record.day,
-                            "person_id": record.person_id,
-                            "person_name": record.display_name,
-                            "global_id": record.global_id,
-                            "attended": True,
-                            "check_in_at": record.wall_time,
-                            "face_score": record.face_score,
-                        }
-                        for record in attendance.records_for_day(day_str)
-                    ]
+                    attendance_today = []
+                    if attendance is not None:
+                        for record in attendance.records_for_day(day_str):
+                            lifecycle_record = attendance_lifecycle.record_of(
+                                day_str, record.person_id
+                            )
+                            attendance_today.append({
+                                "date": record.day,
+                                "person_id": record.person_id,
+                                "person_name": record.display_name,
+                                "global_id": record.global_id,
+                                "attended": True,
+                                "check_in_at": record.wall_time,
+                                "check_out_at": (
+                                    lifecycle_record.check_out_at
+                                    if lifecycle_record is not None else None
+                                ),
+                                "status": (
+                                    lifecycle_record.state.value
+                                    if lifecycle_record is not None else "PRESENT"
+                                ),
+                                "face_score": record.face_score,
+                            })
                     presence = summarize_presence(
                         live_people,
                         aliases=gid_alias,

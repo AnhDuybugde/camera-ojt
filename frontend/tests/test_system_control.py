@@ -85,3 +85,45 @@ def test_voice_volume_migrates_old_normal_level(tmp_path):
     )
 
     assert controller.voice_volume().percent == 65
+
+
+def test_start_chat_reads_live_mode_from_dotenv(tmp_path, monkeypatch):
+    workspace = _workspace(tmp_path)
+    (workspace / "backend" / ".env").write_text(
+        "GEMINI_API_KEY=test-key-value\n"
+        "BE_XINH_REALTIME_MODE=live\n"
+        "GEMINI_LIVE_MODEL=gemini-3.8-live\n",
+        encoding="utf-8",
+    )
+    controller = SystemController(workspace)
+    monkeypatch.setattr(
+        controller, "chat_status", lambda: SimpleNamespace(running=False)
+    )
+    captured = {}
+
+    def fake_spawn(name, args, stdout, stderr):
+        captured["args"] = args
+        return SimpleNamespace(pid=2468)
+
+    monkeypatch.setattr(controller, "_spawn", fake_spawn)
+    controller.start_chat()
+
+    assert "scripts/be_xinh_live_assistant.py" in captured["args"]
+    assert "gemini-3.8-live" in captured["args"]
+
+
+def test_start_chat_defaults_to_classic_mode(tmp_path, monkeypatch):
+    controller = SystemController(_workspace(tmp_path))
+    monkeypatch.setattr(
+        controller, "chat_status", lambda: SimpleNamespace(running=False)
+    )
+    captured = {}
+
+    def fake_spawn(name, args, stdout, stderr):
+        captured["args"] = args
+        return SimpleNamespace(pid=1357)
+    monkeypatch.setattr(controller, "_spawn", fake_spawn)
+
+    controller.start_chat()
+
+    assert "scripts/be_xinh_assistant.py" in captured["args"]

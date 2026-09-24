@@ -274,21 +274,45 @@ def run(config_path: Path, *, strict: bool) -> int:
         "ATTENDANCE_AUTOMATION_ENABLED",
         "false" if app_env == "production" else "true",
     ).strip().lower() in {"1", "true", "yes", "on"}
-    liveness_provider = os.getenv("BIOMETRIC_LIVENESS_PROVIDER", "").strip()
-    if automatic_attendance and strict:
-        report.blocker(
-            "Automatic biometric attendance cannot pass strict release yet: "
-            "the backend liveness/anti-spoof gate is not implemented"
-        )
-    elif automatic_attendance:
-        report.warning(
-            "Automatic biometric attendance is enabled before the backend liveness gate "
-            f"is implemented (declared provider: {liveness_provider or 'none'})"
-        )
+    liveness_provider = os.getenv("BIOMETRIC_LIVENESS_PROVIDER", "").strip().lower()
+    if automatic_attendance:
+        try:
+            from camera_tracking.face.liveness import LivenessGate
+            gate = LivenessGate.from_env(required=True)
+            if gate is not None:
+                report.pass_(f"Biometric liveness gate configured ({liveness_provider})")
+        except Exception as error:  # noqa: BLE001
+            report.blocker(f"Automatic attendance requires a working liveness gate: {error}")
     else:
         report.pass_(
             "Automatic biometric attendance is disabled (safe monitor-only mode)"
         )
+
+    voice_enabled = os.getenv("BE_XINH_VOICE_ENABLED", "false").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    realtime_mode = os.getenv("BE_XINH_REALTIME_MODE", "classic").strip().lower()
+    if not voice_enabled:
+        report.pass_("Bé Xinh voice is disabled for this release profile")
+    elif realtime_mode == "live":
+        if not _has_env("GEMINI_API_KEY"):
+            report.blocker("Bé Xinh Live requires GEMINI_API_KEY")
+        else:
+            report.pass_(
+                f"Bé Xinh realtime mode enabled "
+                f"({os.getenv('GEMINI_LIVE_MODEL', 'gemini-3.8-live')})"
+            )
+        if not _has_env("IMOU_TALK_HELPER"):
+            report.blocker(
+                "Bé Xinh Live requires IMOU_TALK_HELPER for camera audio"
+            )
+    elif realtime_mode == "classic":
+        if not _has_env("GEMINI_API_KEY"):
+            report.blocker("Bé Xinh classic mode requires GEMINI_API_KEY")
+        else:
+            report.pass_("Bé Xinh classic voice mode is configured")
+    else:
+        report.blocker(f"Unsupported BE_XINH_REALTIME_MODE={realtime_mode!r}")
 
     print(
         f"\nPreflight summary: {report.ok} pass, {report.warn} warning, "

@@ -1,6 +1,7 @@
 """FaceWorker: async once-per-track, không block main loop."""
 import threading
 import time
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -113,3 +114,65 @@ def test_model_lock_shared() -> None:
     lock = threading.Lock()
     worker = FaceWorker(_EmptyConsumer(), model_lock=lock)
     assert worker.model_lock is lock
+
+
+def test_liveness_runs_in_worker_only_for_verified_entry_face() -> None:
+    class _Consumer:
+        def consume(self, event, now_s):
+            return [SimpleNamespace(
+                detection=SimpleNamespace(bbox=(8, 8, 56, 56)),
+                match=SimpleNamespace(is_known=True),
+                sharpness=80.0,
+                quality=0.9,
+                identity_confirmed=True,
+            )]
+
+    class _Gate:
+        def __init__(self):
+            self.calls = 0
+
+        def verify(self, image):
+            self.calls += 1
+            assert image.shape[:2] == (48, 48)
+            return SimpleNamespace(verified=True, score=0.98, reason="verified")
+
+    gate = _Gate()
+    worker = FaceWorker(_Consumer(), liveness_gate=gate, liveness_channel="B")
+    entry_job = _job(21)
+    entry_job.channel = "B"
+    result = worker._run_job(entry_job)
+    assert gate.calls == 1
+    assert result[0].liveness_result.verified is True
+
+    non_entry_job = _job(22)
+    non_entry_job.channel = "A"
+    assert worker._run_job(non_entry_job)[0].liveness_result is None
+    assert gate.calls == 1
+
+
+def test_liveness_is_skipped_after_person_is_already_attended() -> None:
+    person = SimpleNamespace(employee_id="E01", person_id="p01")
+
+    class _Consumer:
+        def consume(self, event, now_s):
+            return [SimpleNamespace(
+                detection=SimpleNamespace(bbox=(8, 8, 56, 56)),
+                match=SimpleNamespace(is_known=True, person=person),
+                sharpness=80.0,
+                quality=0.9,
+                identity_confirmed=True,
+            )]
+
+    class _Gate:
+        def verify(self, image):  # pragma: no cover - must not run
+            raise AssertionError("liveness provider should have been skipped")
+
+    worker = FaceWorker(
+        _Consumer(),
+        liveness_gate=_Gate(),
+        liveness_channel="B",
+        liveness_required=lambda day, person_id: person_id != "E01",
+    )
+    job = _job(23)
+    job.channel = "B"
+    assert worker._run_job(job)[0].liveness_result is None

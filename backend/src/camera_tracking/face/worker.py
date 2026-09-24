@@ -70,6 +70,7 @@ class FaceResult:
     wall_iso: str
     time_tag: str
     now_s: float
+    liveness_result: object | None = None
 
 
 class FaceWorker:
@@ -82,11 +83,17 @@ class FaceWorker:
         max_queue: int = 8,
         model_lock: threading.Lock | None = None,
         max_job_age_s: float = 2.0,
+        liveness_gate=None,
+        liveness_channel: str = "B",
+        liveness_required=None,
     ) -> None:
         self.consumer = consumer
         self.max_queue = max(1, int(max_queue))
         self.model_lock = model_lock or threading.Lock()
         self.max_job_age_s = max(0.5, float(max_job_age_s))
+        self.liveness_gate = liveness_gate
+        self.liveness_channel = str(liveness_channel).strip().upper() or "B"
+        self.liveness_required = liveness_required
         self._jobs: queue.PriorityQueue[_PrioritizedJob] = queue.PriorityQueue(
             maxsize=self.max_queue)
         self._job_sequence = 0
@@ -256,7 +263,7 @@ class FaceWorker:
 
     def _run_job(self, job: FaceJob) -> list[FaceResult]:
         from camera_tracking.domain import Frame, TrackEvent
-        from camera_tracking.face.consumer import _crop as _crop_fn  # noqa
+        from camera_tracking.face.consumer import _crop_box
 
         # Dựng TrackEvent giả với frame=crop để tái dùng FaceTrackConsumer
         # (gating + quality + consensus đã có sẵn, đã được test).
@@ -287,6 +294,28 @@ class FaceWorker:
             observations = self.consumer.consume(event, job.now_s)
         results: list[FaceResult] = []
         for obs in observations:
+            liveness_result = None
+            person = getattr(obs.match, "person", None)
+            person_id = (
+                getattr(person, "employee_id", None)
+                or getattr(person, "person_id", None)
+            )
+            needs_liveness = True
+            if self.liveness_required is not None:
+                needs_liveness = bool(
+                    self.liveness_required(job.day_str, person_id)
+                )
+            if (
+                self.liveness_gate is not None
+                and job.channel.upper() == self.liveness_channel
+                and bool(getattr(obs.match, "is_known", False))
+                and bool(getattr(obs, "identity_confirmed", True))
+                and needs_liveness
+            ):
+                face_crop = _crop_box(job.crop_bgr, obs.detection.bbox)
+                if face_crop is not None and face_crop.size:
+                    # Provider I/O stays off the realtime camera loop.
+                    liveness_result = self.liveness_gate.verify(face_crop)
             # Trả track gốc (toạ độ full-frame) để main loop vẽ/bind đúng.
             results.append(FaceResult(
                 channel=job.channel,
@@ -302,6 +331,7 @@ class FaceWorker:
                 wall_iso=job.wall_iso,
                 time_tag=job.time_tag,
                 now_s=job.now_s,
+                liveness_result=liveness_result,
             ))
         # Giữ face_marks tương thích: detection bbox đang tương đối theo crop,
         # main loop sẽ cộng offset person (x1,y1) khi vẽ.

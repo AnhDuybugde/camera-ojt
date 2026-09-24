@@ -87,7 +87,10 @@ class SystemController:
 
     def chat_status(self) -> ServiceStatus:
         pid = self._pid("chat")
-        running = bool(pid and self._is_named_process(pid, "be_xinh_assistant.py"))
+        running = bool(pid and (
+            self._is_named_process(pid, "be_xinh_live_assistant.py")
+            or self._is_named_process(pid, "be_xinh_assistant.py")
+        ))
         return ServiceStatus(
             running, running, pid if running else None,
             "Đang nghe câu gọi" if running else "Đã tắt",
@@ -136,12 +139,23 @@ class SystemController:
             self._kill_tree(audio_pid)
         self._write_pid("audio", 0)
 
-        process = self._spawn(
-            "chat",
-            [
+        realtime_mode = self._env_value("BE_XINH_REALTIME_MODE", "classic").lower()
+        if realtime_mode == "live":
+            chat_args = [
+                "-X", "utf8", "-u", "scripts/be_xinh_live_assistant.py",
+                "--model", self._env_value("GEMINI_LIVE_MODEL", "gemini-3.8-live"),
+            ]
+        elif realtime_mode == "classic":
+            chat_args = [
                 "-X", "utf8", "-u", "scripts/be_xinh_assistant.py",
-                "--model", "gemini-3.5-flash-lite",
-            ],
+                "--model", self._env_value("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+            ]
+        else:
+            raise SystemControlError(
+                f"BE_XINH_REALTIME_MODE không hợp lệ: {realtime_mode!r}"
+            )
+        process = self._spawn(
+            "chat", chat_args,
             "be-xinh-chat.out.log", "be-xinh-chat.err.log",
         )
         self._write_pid("chat", process.pid)
@@ -149,7 +163,13 @@ class SystemController:
         return ServiceStatus(True, True, process.pid, "Đang khởi động")
 
     def stop_chat(self) -> ServiceStatus:
-        self._stop_verified("chat", "be_xinh_assistant.py")
+        pid = self._pid("chat")
+        if pid and (
+            self._is_named_process(pid, "be_xinh_live_assistant.py")
+            or self._is_named_process(pid, "be_xinh_assistant.py")
+        ):
+            self._kill_tree(pid)
+        self._write_pid("chat", 0)
         self._write_chat_preference(False)
         return ServiceStatus(False, False, None, "Đã tắt")
 
@@ -165,6 +185,26 @@ class SystemController:
             raise SystemControlError("Thiếu backend/.env")
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
+
+    def _env_value(self, name: str, default: str = "") -> str:
+        inherited = os.getenv(name)
+        if inherited is not None and inherited.strip():
+            return inherited.strip()
+        try:
+            lines = (self.backend_dir / ".env").read_text(
+                encoding="utf-8-sig"
+            ).splitlines()
+        except OSError:
+            return default
+        value = default
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, candidate = stripped.split("=", 1)
+            if key.strip() == name:
+                value = candidate.strip().strip('"').strip("'")
+        return value
 
     def _spawn(self, _name: str, args: list[str], out_name: str, err_name: str):
         flags = 0
