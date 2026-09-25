@@ -44,15 +44,9 @@ Trang **Hệ thống AI & Trợ lý** dành cho quản trị viên hiển thị 
 camera, bridge, voice, Gemini/Tavily và cho phép hỏi Hà Linh bằng văn bản.
 Gemini/Tavily chỉ chạy ở backend nên API key không được gửi xuống trình duyệt.
 
-Chạy hai tiến trình:
-
-```bash
-# Từ thư mục camera-ojt
-python3 scripts/run_workstate.py --stream-host 0.0.0.0
-
-# Từ thư mục ai-mind-attendance
-streamlit run app.py
-```
+Chạy từ repo root bằng `camera-ojt run` (backend `:8767` + pipeline `:8765`
++ UI `:8501` trong một lệnh). Không chạy `streamlit run app.py` riêng lẻ —
+UI cần backend `:8767` đang nghe (biến `CAMERA_API_URL`).
 
 Các lớp chính:
 
@@ -61,7 +55,7 @@ Các lớp chính:
 - `FaceRecognizer`: cache ma trận embedding và so khớp vector hóa.
 - `AttendanceService`: transaction SQLite nguyên tử cho một nhân viên/một ngày.
 - `SyncWorker`: thử đồng bộ định kỳ mà không chặn luồng nhận diện.
-- `ui/*`: mỗi màn hình là một module riêng.
+- `frontend/src/pages/*`: mỗi màn hình là một module riêng.
 
 ## Cài đặt trên Windows
 

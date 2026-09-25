@@ -3,7 +3,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai-mind-attendance"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "apps" / "attendance"))
 
 from camera_tracking.store.aimind_bridge import (
     AIMIND_TICK_KIND,

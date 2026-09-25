@@ -92,7 +92,6 @@ tests/                Kiểm thử nghiệp vụ và nhận diện
 var/                  Embedding, backup, báo cáo local — không commit
 ```
 
-`ai-mind-attendance` là đường dẫn tương thích tới `apps/attendance`.
 Xem [bản đồ cấu trúc chi tiết](docs/STRUCTURE.md),
 [camera inventory](config/cameras.yaml) và [docker-compose](docker-compose.yml).
 Dashboard React đã được thay thế. Các script `run_workstate*.py` vẫn hoạt động,

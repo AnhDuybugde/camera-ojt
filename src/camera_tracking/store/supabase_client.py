@@ -1,7 +1,7 @@
 """Supabase client (optional): bat khi .env co SUPABASE_URL + KEY.
 
 - Backend pipeline dung SERVICE_KEY (ghi DB + upload Storage).
-- Dashboard dung ANON_KEY + RLS (xem file supabase/schema.sql).
+- Dashboard dung ANON_KEY + RLS (xem migrations/supabase/).
 - Thieu env hoac thieu lib -> che do local-only, moi call tra False va
   caller day vao WriteQueue de flush sau.
 """
