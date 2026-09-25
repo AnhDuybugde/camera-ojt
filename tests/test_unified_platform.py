@@ -15,8 +15,8 @@ from camera_tracking.store.embeddings import EmbeddingStore
 from camera_tracking.store.event_log import EventSync
 from camera_tracking.store.replication import SQLiteReplica
 from camera_tracking.workstate.door import DoorTransitions
-from attendance.attendance_service import AttendanceService
-from database.db import Database
+from backend.app.services.attendance_service import AttendanceService
+from backend.app.database.database import Database
 
 
 @pytest.fixture

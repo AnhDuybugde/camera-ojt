@@ -21,10 +21,10 @@ def load_services():
     # The presentation app's business modules remain import-compatible during
     # the transition. Only this backend process constructs their services.
     sys.path.insert(0, str(ROOT / "apps" / "attendance"))
-    from attendance.attendance_service import AttendanceService
-    from attendance.admin_service import AttendanceAdminService
+    from backend.app.services.attendance_service import AttendanceService
+    from backend.app.services.attendance_admin_service import AttendanceAdminService
     from auth.service import AuthService
-    from database.db import Database
+    from backend.app.database.database import Database
     from google_sheets.sheets_client import SheetsClient
     from google_sheets.sync_service import SyncService
 
@@ -39,7 +39,7 @@ def run_backend(stop=None, port=8767):
     from camera_tracking.config import load_config
     embedding_path = db.path
     from backend.app.api.enrollment import Enrollment
-    from face.detector import FaceDetector
+    from backend.app.recognition.face_detector import FaceDetector
     identity = SupabaseAuth() if os.getenv("SUPABASE_URL") else auth
     api = ApplicationAPI(db, identity, admin, sheets, Operations(db, attendance, embedding_path),
                          Enrollment(FaceDetector()))
