@@ -9,17 +9,17 @@ import streamlit as st
 
 from auth.permissions import ADMIN, EMPLOYEE, require_permission
 from config import settings
-import ui.components as ui_components
-from ui import (
+import frontend.src.components.components as ui_components
+from frontend.src.pages import (
     audit_log, dashboard, employees, google_sync, history, live_attendance, login,
     register_face, settings as settings_page, spatial_analytics, statistics,
     work_schedule, my_attendance, system_integration,
 )
-from ui.common import (
+from frontend.src.hooks.common import (
     get_attendance_admin_service, get_attendance_service, get_auth_service, get_db,
     get_detector, get_recognizer, get_sync_service, get_sync_worker,
 )
-from ui.theme import apply_theme
+from frontend.src.components.theme import apply_theme
 from utils.logger import setup_logging
 
 setup_logging()
