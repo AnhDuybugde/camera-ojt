@@ -111,7 +111,7 @@ class MjpegStreamer:
                 self.send_header("Access-Control-Allow-Origin", os.getenv("CAMERA_UI_ORIGIN", "http://localhost:8501"))
 
             def _authorized(self):
-                from camera_tracking.api.access import authorized
+                from backend.app.api.access import authorized
                 if authorized(self.path, self.headers.get("Authorization", ""), streamer._access_key):
                     return True
                 self._send_json({"ok": False, "message": "Authentication required"}, 403)

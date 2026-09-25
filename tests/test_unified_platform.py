@@ -9,8 +9,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "apps/attendance"))
 
-from camera_tracking.api.service import ApplicationAPI
-from camera_tracking.api.supabase_auth import SupabaseAuth
+from backend.app.api.service import ApplicationAPI
+from backend.app.api.supabase_auth import SupabaseAuth
 from camera_tracking.store.embeddings import EmbeddingStore
 from camera_tracking.store.event_log import EventSync
 from camera_tracking.store.replication import SQLiteReplica

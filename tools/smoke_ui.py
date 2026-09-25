@@ -4,8 +4,8 @@ from pathlib import Path
 import tempfile
 import threading
 
-from camera_tracking.api.server import make_server
-from camera_tracking.api.service import ApplicationAPI
+from backend.app.api.server import make_server
+from backend.app.api.service import ApplicationAPI
 from camera_tracking.application.backend import load_services
 
 
@@ -14,7 +14,7 @@ def main():
         os.environ["CAMERA_DATABASE_PATH"] = str(Path(temporary) / "test.db")
         os.environ["CAMERA_ADMIN_PASSWORD"] = "isolated-smoke-password"
         db, auth, attendance, admin, sync = load_services()
-        from camera_tracking.api.operations import Operations
+        from backend.app.api.operations import Operations
         api = ApplicationAPI(db, auth, admin, sync,
                              Operations(db, attendance, db.path), None)
         server = make_server(api, port=0)

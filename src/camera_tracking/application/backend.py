@@ -7,9 +7,9 @@ from pathlib import Path
 import sys
 import threading
 
-from camera_tracking.api.server import make_server
-from camera_tracking.api.service import ApplicationAPI
-from camera_tracking.api.supabase_auth import SupabaseAuth
+from backend.app.api.server import make_server
+from backend.app.api.service import ApplicationAPI
+from backend.app.api.supabase_auth import SupabaseAuth
 from camera_tracking.store.aimind_bridge import drain_once, load_person_map
 from camera_tracking.store.event_log import EventSync
 from camera_tracking.store.queue import WriteQueue
@@ -35,10 +35,10 @@ def load_services():
 def run_backend(stop=None, port=8767):
     stop = stop or threading.Event()
     db, auth, attendance, admin, sheets = load_services()
-    from camera_tracking.api.operations import Operations
+    from backend.app.api.operations import Operations
     from camera_tracking.config import load_config
     embedding_path = db.path
-    from camera_tracking.api.enrollment import Enrollment
+    from backend.app.api.enrollment import Enrollment
     from face.detector import FaceDetector
     identity = SupabaseAuth() if os.getenv("SUPABASE_URL") else auth
     api = ApplicationAPI(db, identity, admin, sheets, Operations(db, attendance, embedding_path),

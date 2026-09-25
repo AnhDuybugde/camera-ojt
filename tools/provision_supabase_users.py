@@ -46,7 +46,7 @@ def main():
     from dotenv import load_dotenv
     load_dotenv(ROOT / ".env")
     from camera_tracking.application.backend import load_services
-    from camera_tracking.api.supabase_auth import SupabaseAuth
+    from backend.app.api.supabase_auth import SupabaseAuth
     db, *_ = load_services()
     employee_ids = {row["employee_id"] for row in db.list_employees()}
     rows = read_rows(args.csv, employee_ids)

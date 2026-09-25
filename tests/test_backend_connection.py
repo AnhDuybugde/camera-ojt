@@ -10,9 +10,9 @@ from pathlib import Path
 
 import pytest
 
-from camera_tracking.api.codec import decode, encode
-from camera_tracking.api.server import make_server
-from camera_tracking.api.service import ApplicationAPI
+from backend.app.api.codec import decode, encode
+from backend.app.api.server import make_server
+from backend.app.api.service import ApplicationAPI
 
 
 class _StubDetector:
@@ -47,8 +47,8 @@ def live_backend(tmp_path, monkeypatch):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "apps/attendance"))
     try:
         from camera_tracking.application.backend import load_services
-        from camera_tracking.api.operations import Operations
-        from camera_tracking.api.enrollment import Enrollment
+        from backend.app.api.operations import Operations
+        from backend.app.api.enrollment import Enrollment
         db, auth, attendance, admin, sync = load_services()
         api = ApplicationAPI(db, auth, admin, sync,
                              Operations(db, attendance, db.path),
@@ -101,7 +101,7 @@ def test_enrollment_endpoint_wired_without_models(live_backend):
 def test_pipeline_stream_auth_and_status(monkeypatch):
     monkeypatch.setenv("CAMERA_INTERNAL_TOKEN", "test-token-conn")
     from camera_tracking.streaming.mjpeg import MjpegStreamer
-    from camera_tracking.api.access import signed_stream_url
+    from backend.app.api.access import signed_stream_url
     streamer = MjpegStreamer(port=0)
     assert streamer.start()
     try:

@@ -25,7 +25,7 @@ def send(url, key, path, payload=None, method=None):
 def main():
     from dotenv import load_dotenv
     load_dotenv(ROOT / ".env")
-    from camera_tracking.api.supabase_auth import SupabaseAuth
+    from backend.app.api.supabase_auth import SupabaseAuth
 
     base = os.environ["SUPABASE_URL"].rstrip("/")
     service = os.environ["SUPABASE_SERVICE_KEY"]

@@ -7,7 +7,7 @@ from urllib.request import Request, urlopen
 
 import streamlit as st
 
-from camera_tracking.api.codec import decode, encode
+from backend.app.api.codec import decode, encode
 
 
 class RemoteService:

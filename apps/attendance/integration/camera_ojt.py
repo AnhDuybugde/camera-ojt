@@ -56,7 +56,7 @@ class CameraOjtClient:
 
     def stream_url(self, channel: str) -> str:
         safe = "b" if channel.upper() == "B" else "a"
-        from camera_tracking.api.access import signed_stream_url
+        from backend.app.api.access import signed_stream_url
         return signed_stream_url(self.base_url, f"/cam_{safe}.mjpg")
 
 
