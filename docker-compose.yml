@@ -1,0 +1,78 @@
+# Unified camera platform — backend :8767 + pipeline :8765 + UI :8501.
+# Single-machine deployment. Secrets stay in `.env` (never committed);
+# see `.env.example` for the full variable list.
+#
+# Usage:
+#   docker compose up --build            # backend + ui (pipeline needs host camera/GPU)
+#   docker compose --profile camera up --build   # also start the pipeline service
+#
+# NOTE: the pipeline service needs host camera access (RTSP via .env IMOU_*)
+# and preferably a GPU (see README: install torch for your CUDA first).
+# For most dev machines, run the pipeline natively instead:
+#   camera-ojt run --device cpu   (or --profile webcam --device cpu)
+
+services:
+  backend:
+    build: .
+    image: camera-ojt-backend:local
+    command: ["python", "-m", "camera_tracking.cli", "backend"]
+    env_file: [".env"]
+    environment:
+      PYTHONPATH: "/app/src"
+      CAMERA_API_URL: "http://backend:8767"
+      CAMERA_UI_ORIGIN: "http://localhost:8501"
+    ports:
+      - "127.0.0.1:8767:8767"
+    volumes:
+      - ./apps/attendance/data:/app/apps/attendance/data
+      - ./data:/app/data
+      - ./output:/app/output
+      - ./var:/app/var
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+        "import json,urllib.request;urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8767/api/v1/operations/diagnostics',data=json.dumps({'args':[],'kwargs':{}}).encode(),headers={'Content-Type':'application/json'}),timeout=5)"]
+      interval: 15s
+      timeout: 6s
+      retries: 3
+      start_period: 20s
+
+  ui:
+    build: .
+    image: camera-ojt-ui:local
+    command: ["streamlit", "run", "apps/attendance/app.py",
+              "--server.address", "0.0.0.0",
+              "--browser.gatherUsageStats", "false",
+              "--server.enableStaticServing", "true"]
+    env_file: [".env"]
+    environment:
+      PYTHONPATH: "/app/src"
+      CAMERA_API_URL: "http://backend:8767"
+      CAMERA_OJT_URL: "http://pipeline:8765"
+      CAMERA_OJT_SUPERVISOR_URL: "http://pipeline:8766"
+      CAMERA_UI_ORIGIN: "http://localhost:8501"
+    ports:
+      - "127.0.0.1:8501:8501"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Optional: pipeline needs camera network + models. Disabled by default.
+  pipeline:
+    profiles: ["camera"]
+    build: .
+    image: camera-ojt-pipeline:local
+    command: ["python", "scripts/run_workstate.py", "--no-supervisor", "--device", "cpu"]
+    env_file: [".env"]
+    environment:
+      PYTHONPATH: "/app/src"
+    ports:
+      - "127.0.0.1:8765:8765"
+      - "127.0.0.1:8766:8766"
+    volumes:
+      - ./data:/app/data
+      - ./output:/app/output
+      - ./models:/app/models:ro
+      - ./config:/app/config:ro
+    restart: unless-stopped

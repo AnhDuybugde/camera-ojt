@@ -14,7 +14,9 @@ def main():
         os.environ["CAMERA_DATABASE_PATH"] = str(Path(temporary) / "test.db")
         os.environ["CAMERA_ADMIN_PASSWORD"] = "isolated-smoke-password"
         db, auth, attendance, admin, sync = load_services()
-        api = ApplicationAPI(db, auth, admin, sync)
+        from camera_tracking.api.operations import Operations
+        api = ApplicationAPI(db, auth, admin, sync,
+                             Operations(db, attendance, db.path), None)
         server = make_server(api, port=0)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()

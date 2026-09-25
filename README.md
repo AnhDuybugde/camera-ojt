@@ -82,6 +82,8 @@ giản hỗ trợ trả lời local. Lỗi nhà cung cấp không dừng điểm
 ```text
 apps/attendance/       Streamlit và nghiệp vụ đang chuyển tiếp
 src/camera_tracking/   API, runtime chung, vision, voice và lưu trữ
+backend/               Facade docs: backend/app/* ↔ src/camera_tracking/*, apps/attendance/*
+frontend/              Facade docs: frontend/src/* ↔ apps/attendance/ui|integration/*
 config/               Cấu hình camera/model/vùng, không chứa bí mật
 migrations/supabase/   Migration cloud có phiên bản
 tools/                Import, migration, đồng bộ, kiểm tra publish
@@ -91,6 +93,8 @@ var/                  Embedding, backup, báo cáo local — không commit
 ```
 
 `ai-mind-attendance` là đường dẫn tương thích tới `apps/attendance`.
+Xem [bản đồ cấu trúc chi tiết](docs/STRUCTURE.md),
+[camera inventory](config/cameras.yaml) và [docker-compose](docker-compose.yml).
 Dashboard React đã được thay thế. Các script `run_workstate*.py` vẫn hoạt động,
 nhưng lệnh `camera-ojt run` quản lý đầy đủ backend và UI.
 
@@ -98,7 +102,10 @@ nhưng lệnh `camera-ojt run` quản lý đầy đủ backend và UI.
 
 ```bash
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q tests/test_unified_platform.py
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q tests/test_backend_connection.py
 python tools/smoke_ui.py
+python tools/check_backend_connection.py  # backend :8767 + pipeline :8765 healthcheck
+camera-ojt doctor  # modules + keys + ports + backend reachability
 camera-ojt replay --source-a path/to/video-a.mp4 --source-b path/to/video-b.mp4 \
   --device cpu --identity-log var/predictions.csv
 python scripts/evaluate_replay.py --truth annotations.csv --predictions var/predictions.csv

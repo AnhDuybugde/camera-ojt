@@ -1,6 +1,7 @@
 """Administration operations backed by the same database as attendance."""
 from datetime import datetime
 import json
+import os
 from uuid import uuid5, NAMESPACE_URL
 
 from camera_tracking.store.replication import SQLiteReplica, TABLES, ENROLLMENT_TABLES
@@ -9,6 +10,42 @@ from camera_tracking.store.replication import SQLiteReplica, TABLES, ENROLLMENT_
 class Operations:
     def __init__(self, db, attendance, embedding_path):
         self.db, self.attendance, self.embedding_path = db, attendance, embedding_path
+
+    def ai_status(self):
+        """Backend AI/voice configuration for Streamlit when pipeline is offline.
+
+        Keys mirror the pipeline streamer ``services`` payload so the UI can
+        render a single status card from either source.
+        """
+        tavily = bool(os.getenv("TAVILY_API_KEY", "").strip())
+        serper = bool(os.getenv("SERPER_API_KEY", "").strip())
+        brave = bool(os.getenv("BRAVE_API_KEY", "").strip())
+        exa = bool(os.getenv("EXA_API_KEY", "").strip())
+        provider = "tavily" if tavily else (
+            "serper" if serper else ("brave" if brave else ("exa" if exa else "fallback")))
+        return {
+            "gemini_configured": bool(os.getenv("GEMINI_API_KEY", "").strip()),
+            "gemini_model": (os.getenv("GEMINI_MODEL", "").strip() or "gemini-3.6-flash"),
+            "search_provider": provider,
+            "supabase_configured": bool(os.getenv("SUPABASE_URL", "").strip()
+                                        and os.getenv("SUPABASE_SERVICE_KEY", "").strip()),
+            "biometric_sync": os.getenv("CAMERA_SYNC_BIOMETRIC", "0") == "1",
+            "voice_enabled": True,
+        }
+
+    def ask(self, question):
+        """Text assistant owned by the backend; keys never leave this process."""
+        cleaned = " ".join(str(question or "").split())
+        if not 2 <= len(cleaned) <= 500:
+            raise ValueError("Câu hỏi cần từ 2 đến 500 ký tự.")
+        from camera_tracking.voice.query import think
+        model = os.getenv("GEMINI_MODEL", "").strip() or "gemini-3.6-flash"
+        try:
+            answer, tool_s, tools = think(cleaned, model, 300, search_results=5)
+        except RuntimeError as error:
+            raise RuntimeError("Trợ lý tạm không khả dụng. Kiểm tra GEMINI_API_KEY.") from error
+        return {"ok": True, "answer": answer, "tools": tools,
+                "tool_time_s": round(float(tool_s), 3)}
 
     def diagnostics(self):
         def scalar(sql):

@@ -29,18 +29,32 @@ class ApplicationAPI:
 
     def login(self, email, password):
         account = self.auth.login(email, password)
+        if not account:
+            raise PermissionError("Tên đăng nhập hoặc mật khẩu không chính xác")
         return self._start_session(account)
 
     def _start_session(self, account):
-        role, employee_id = account["role"], account["employee_id"]
+        if not account:
+            raise PermissionError("Tên đăng nhập hoặc mật khẩu không chính xác")
+        # SupabaseAuth returns {role, employee_id, user_id, email, expires_in}.
+        # Legacy local AuthService returns {"role": "ADMIN"} or an
+        # employee_accounts row; normalize so both can start a session.
+        role = account.get("role") or ("EMPLOYEE" if account.get("employee_id") else "ADMIN")
+        employee_id = account.get("employee_id") or ""
+        user_id = account.get("user_id") or employee_id or role
+        email = account.get("email") or ""
+        try:
+            expires_in = max(60, min(3600, int(account.get("expires_in", 3600))))
+        except (TypeError, ValueError):
+            expires_in = 3600
         token = secrets.token_urlsafe(32)
         with self.lock:
             now = time.monotonic()
             self.sessions = {k: v for k, v in self.sessions.items() if v[4] > now}
-            self.sessions[token] = (role, employee_id, account["user_id"],
-                                    account["email"], now + account["expires_in"])
+            self.sessions[token] = (role, employee_id, user_id,
+                                    email, now + expires_in)
         return {"token": token, "role": role, "employee_id": employee_id,
-                "email": account["email"], "expires_in": account["expires_in"]}
+                "email": email, "expires_in": expires_in}
 
     def dispatch(self, service, method, args, kwargs, token):
         if (service, method) == ("auth", "login"):
@@ -58,7 +72,8 @@ class ApplicationAPI:
         role, employee_id, user_id, email, _ = session
         allowed = {"employees": DB_METHODS, "auth": AUTH_METHODS,
                    "attendance": {"update_attendance"}, "sync": {"sync_pending"},
-                   "operations": {"diagnostics", "review_events", "review", "conflicts", "resolve_conflict"},
+                   "operations": {"diagnostics", "review_events", "review", "conflicts", "resolve_conflict",
+                                  "ask", "ai_status"},
                    "enrollment": {"detect"}}
         if method not in allowed.get(service, set()):
             raise PermissionError("Operation is not exposed")

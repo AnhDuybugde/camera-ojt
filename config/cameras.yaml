@@ -1,0 +1,44 @@
+# Camera inventory — human-readable source of truth for physical cameras.
+# Runtime wiring still comes from `.env` (IMOU_*) + `config/default.yaml`;
+# this file documents WHICH camera is WHERE so zones/attendance can be tuned
+# per channel. Keep secrets in `.env`, never here.
+#
+# Channel convention in this repo:
+#   A = room/overview camera (presence, workstation state, wave greeting)
+#   B = door camera (directional CHECK_IN/CHECK_OUT, face-trigger greeting)
+
+cameras:
+  - id: A
+    name: "Phòng chính (room)"
+    profile: imou
+    # RTSP built at runtime from IMOU_USER/IMOU_PASSWORD/IMOU_IP, channel 1.
+    channel: 1
+    subtype: 1
+    role: room
+    zones: ["R1", "R2", "R3"]
+    face_channels: false
+    gesture: wave
+
+  - id: B
+    name: "Cửa ra vào (door)"
+    profile: imou
+    # RTSP built at runtime from IMOU_USER/IMOU_PASSWORD/IMOU_IP, channel 2.
+    channel: 2
+    subtype: 1
+    role: door
+    zones: ["R2", "R3"]
+    face_channels: true
+    gesture: "off"
+
+# Local-dev override (no IMOU hardware):
+#   camera-ojt run --profile webcam --device cpu
+webcam_fallback:
+  profile: webcam
+  source: 0
+
+network:
+  # Must match the ports in src/camera_tracking/cli.py + application/workstate.py.
+  backend_api: "http://127.0.0.1:8767"   # business API (login, employees, attendance, operations)
+  stream: "http://127.0.0.1:8765"        # MJPEG + /status.json (pipeline)
+  supervisor: "http://127.0.0.1:8766"    # embedded pipeline supervisor (optional)
+  ui: "http://127.0.0.1:8501"            # Streamlit

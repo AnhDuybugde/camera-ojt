@@ -419,13 +419,15 @@ def imou_url(channel: int, subtype: int = 1) -> str | None:
     return f"rtsp://{user}:{pw}@{ip}:554/cam/realmonitor?channel={channel}&subtype={subtype}"
 
 
-def source_label(source: int | str) -> str:
+def source_label(source: int | str | None) -> str:
     """Describe a source without exposing RTSP credentials in terminal logs."""
+    if source is None:
+        return "disabled"
     if isinstance(source, int):
         return f"webcam {source}"
-    if "://" in source:
+    if "://" in str(source):
         return "RTSP stream"
-    return source
+    return str(source)
 
 
 def parse_args(profile: str = "imou") -> argparse.Namespace:
