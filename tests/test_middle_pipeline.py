@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from camera_tracking.streaming import mjpeg
+from backend.app.camera import stream as mjpeg
 from camera_tracking.store.queue import WriteQueue
 from camera_tracking.workstate.channel_status import ChannelBusinessTracker, PersonBusinessState
 

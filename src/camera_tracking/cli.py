@@ -82,7 +82,7 @@ def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stop.set())
     if args.command == "backend":
-        from camera_tracking.application.backend import run_backend
+        from backend.app.main import run_backend
         run_backend(stop)
         return 0
     children = []

@@ -17,7 +17,7 @@ from camera_tracking.workstate.image_zones import (
 )
 from camera_tracking.workstate.reconcile import IdentityReconciler
 from camera_tracking.workstate.reid import OsnetEmbedding, cosine_similarity
-from camera_tracking.workstate.room_fusion import (
+from backend.app.services.room_status_service import (
     LABEL_AT_DOOR,
     LABEL_AWAY,
     LABEL_OUT_OF_DOOR,

@@ -6,7 +6,7 @@ import threading
 
 from backend.app.api.server import make_server
 from backend.app.api.service import ApplicationAPI
-from camera_tracking.application.backend import load_services
+from backend.app.main import load_services
 
 
 def main():

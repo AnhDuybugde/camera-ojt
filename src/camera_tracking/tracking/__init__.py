@@ -1,5 +1,5 @@
 """Multi-object tracking modules."""
-from camera_tracking.tracking.byte import ByteTrackTracker
+from backend.app.recognition.tracker import ByteTrackTracker
 from camera_tracking.tracking.global_identity import (
     GlobalIdentityConfig,
     GlobalIdentityManager,

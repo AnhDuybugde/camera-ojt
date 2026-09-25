@@ -46,7 +46,7 @@ def live_backend(tmp_path, monkeypatch):
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "apps/attendance"))
     try:
-        from camera_tracking.application.backend import load_services
+        from backend.app.main import load_services
         from backend.app.api.operations import Operations
         from backend.app.api.enrollment import Enrollment
         db, auth, attendance, admin, sync = load_services()
@@ -100,7 +100,7 @@ def test_enrollment_endpoint_wired_without_models(live_backend):
 
 def test_pipeline_stream_auth_and_status(monkeypatch):
     monkeypatch.setenv("CAMERA_INTERNAL_TOKEN", "test-token-conn")
-    from camera_tracking.streaming.mjpeg import MjpegStreamer
+    from backend.app.camera.stream import MjpegStreamer
     from backend.app.api.access import signed_stream_url
     streamer = MjpegStreamer(port=0)
     assert streamer.start()
