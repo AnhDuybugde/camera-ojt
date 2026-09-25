@@ -1,29 +1,41 @@
-# Repo structure — requested `camera-attendance/` layout vs actual paths
+# Repo structure — `camera-attendance/` layout (real code, not facades)
 
 The repo root **is** the `camera-attendance/` project (named `camera-ojt`
-from history). Code was deliberately **not moved** so imports, tests and
-`camera-ojt run` keep working. Use this table to navigate:
+from history). Canonical code lives in `backend/` + `frontend/`; old paths
+remain as one-line compatibility shims (re-exporting the new modules) so
+existing imports, tests and `camera-ojt run` keep working.
 
 ```text
 camera-attendance/
-├── frontend/                  # facade docs → real UI in apps/attendance/
+├── frontend/                  # Streamlit UI (canonical)
 │   ├── src/
-│   │   ├── pages/             # → apps/attendance/ui/*.py
-│   │   ├── components/        # → apps/attendance/ui/components.py, theme.py
-│   │   ├── services/          # → apps/attendance/integration/backend.py (RemoteService :8767)
-│   │   └── hooks/             # → apps/attendance/ui/common.py (cache_resource singletons)
-│   └── README.md              # (no package.json — Streamlit, not React)
-├── backend/                   # facade docs → real backend code
-│   ├── app/
-│   │   ├── api/               # → src/camera_tracking/api/ (server.py :8767, service.py)
-│   │   ├── camera/            # → src/camera_tracking/camera/ + streaming/mjpeg.py (:8765)
-│   │   ├── recognition/       # → src/camera_tracking/face/ + tracking/ + apps/attendance/face/
-│   │   ├── services/          # → apps/attendance/attendance/ + src/camera_tracking/workstate/
-│   │   ├── database/          # → apps/attendance/database/
-│   │   └── main.py            # → src/camera_tracking/application/backend.py (run_backend)
+│   │   ├── pages/             # 14 pages (dashboard, live_attendance, login, …)
+│   │   ├── components/        # components.py, theme.py
+│   │   ├── services/          # backend.py (RemoteService :8767), camera_ojt.py (:8765)
+│   │   ├── hooks/             # common.py (cache_resource singletons)
+│   │   └── assets/            # style.css
+│   ├── package.json           # scripts only (dev, smoke, check-backend)
 │   └── README.md
-├── models/                    # → models/ (face_recognition packs, ReID cache, STT)
-├── data/                      # → data/faces|images|samples (+ logs in apps/attendance/logs/)
+├── backend/                   # business services + API (canonical)
+│   ├── app/
+│   │   ├── api/               # server.py (:8767), service.py, codec.py, access.py,
+│   │   │                      # operations.py, enrollment.py, supabase_auth.py
+│   │   │                      # + attendance.py, members.py, rooms.py (domain routers)
+│   │   ├── camera/            # stream.py (MJPEG :8765), capture.py
+│   │   ├── recognition/       # face_detector.py, face_recognition.py, tracker.py
+│   │   ├── services/          # attendance_service.py, attendance_admin_service.py,
+│   │   │                      # attendance_rules.py, room_status_service.py
+│   │   ├── database/          # database.py, models.py
+│   │   └── main.py            # load_services + run_backend
+│   ├── requirements.txt       # backend install (pip install -r backend/requirements.txt)
+│   └── README.md
+├── apps/attendance/           # Streamlit entry (app.py) + remaining cores
+│                              # (config, auth, google_sheets, spatial, utils, camera,
+│                              #  face/embedding, static/) + compat shims
+├── src/camera_tracking/       # pipeline runtime (vision/tracking/voice/store/workstate)
+│                              # + compat shims for moved modules
+├── models/                    # face_recognition packs, ReID cache, STT
+├── data/                      # faces|images|samples (+ logs in apps/attendance/logs/)
 ├── config/
 │   └── cameras.yaml           # camera inventory (A=room, B=door) + port map
 ├── docker-compose.yml         # backend :8767 + ui :8501 (+ pipeline :8765 profile)
@@ -31,6 +43,10 @@ camera-attendance/
 ├── .gitignore
 └── README.md
 ```
+
+Install notes: `backend` + `frontend` are real Python packages installed
+editable (`pip install -e .` from root), so `import backend…` / `import
+frontend…` works from any cwd — no `sys.path` hacks in entry points.
 
 Connection flow (see `tools/check_backend_connection.py`):
 

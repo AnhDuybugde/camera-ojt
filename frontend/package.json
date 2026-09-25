@@ -1,0 +1,11 @@
+{
+  "name": "camera-attendance-frontend",
+  "version": "2.5.0",
+  "private": true,
+  "description": "Streamlit frontend for camera-attendance (no Node/React build — pages are Python in src/). This file only documents the standard scripts.",
+  "scripts": {
+    "dev": "streamlit run ../apps/attendance/app.py --server.address 127.0.0.1 --browser.gatherUsageStats false --server.enableStaticServing true",
+    "smoke": "python ../tools/smoke_ui.py",
+    "check-backend": "python ../tools/check_backend_connection.py"
+  }
+}

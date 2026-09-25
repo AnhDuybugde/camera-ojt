@@ -1,0 +1,6 @@
+# Backend service dependencies — install from the REPO ROOT:
+#   python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#   python -m pip install -r backend/requirements.txt
+# (For CUDA, install the matching torch wheel first, see root README.)
+-c ../constraints.txt
+-e ..[face,store,dev]

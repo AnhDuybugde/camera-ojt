@@ -1,16 +1,19 @@
 # Frontend — Streamlit UI `:8501` (no Node/React in this repo)
 
-The requested `frontend/src/pages|components|services|hooks + package.json`
-layout describes a React app. This repo's frontend is **Streamlit**
-(`apps/attendance/app.py`), so there is no `package.json`. Mapping:
+Canonical code lives here (`frontend/src/...`). Old locations under
+`apps/attendance/ui/` + `apps/attendance/integration/` remain as one-line
+compatibility shims. Entry point stays `apps/attendance/app.py` (Streamlit
+static serving requires `apps/attendance/static/` next to it).
 
-| Requested (`frontend/src/...`) | Actual code |
+| `frontend/src/...` | Origin (git history preserved) |
 |---|---|
-| `pages/` | `apps/attendance/ui/` (`dashboard`, `employees`, `history`, `live_attendance`, `login`, `register_face`, `statistics`, `system_integration`, ...) |
-| `components/` | `apps/attendance/ui/components.py` + `apps/attendance/ui/theme.py` |
-| `services/` | `apps/attendance/integration/backend.py` (`RemoteService` → backend `:8767`) + `apps/attendance/integration/camera_ojt.py` (`CameraOjtClient` → pipeline `:8765`) |
-| `hooks/` | `apps/attendance/ui/common.py` (`get_db`, `get_detector`, `get_auth_service`, ... — Streamlit `cache_resource` singletons) |
-| `package.json` | n/a — Python deps in `pyproject.toml` (`ui` extra) + `apps/attendance/requirements.txt` |
+| `pages/` (14 pages: dashboard, employees, history, live_attendance, login, register_face, statistics, system_integration, …) | `apps/attendance/ui/*.py` |
+| `components/components.py`, `components/theme.py` | `apps/attendance/ui/components.py`, `theme.py` |
+| `services/backend.py` (`RemoteService` → backend `:8767`) | `apps/attendance/integration/backend.py` |
+| `services/camera_ojt.py` (`CameraOjtClient` → pipeline `:8765`) | `apps/attendance/integration/camera_ojt.py` |
+| `hooks/common.py` (`get_db`, `get_detector`, … singletons) | `apps/attendance/ui/common.py` |
+| `assets/style.css` | `apps/attendance/assets/style.css` |
+| `package.json` | scripts only (`dev`, `smoke`, `check-backend`) — no Node deps |
 
 Key rule: the UI **never touches the database directly** — every page goes
 through `RemoteService` to backend `:8767` (`CAMERA_API_URL`).
