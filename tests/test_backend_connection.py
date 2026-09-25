@@ -140,3 +140,46 @@ def test_camera_inventory_matches_runtime_ports():
     assert inventory["network"]["stream"].endswith(":8765")
     assert {camera["id"] for camera in inventory["cameras"]} == {"A", "B"}
     assert inventory["network"]["ui"].endswith(":8501")
+
+
+def test_domain_routers_cover_members_attendance_rooms(live_backend):
+    from backend.app.api._http import connect
+    from backend.app.api.attendance import AttendanceAPI
+    from backend.app.api.members import MembersAPI
+    from backend.app.api.rooms import RoomsAPI
+    base, _ = live_backend
+    code, session = _post(base, "auth", "login", ["ADMIN", "conn-check-password"])
+    assert code == 200
+    call = connect(base, session["token"])
+
+    members = MembersAPI(call)
+    members.add_member({"employee_id": "NV01", "full_name": "Router Check"})
+    assert members.get_member("NV01")["full_name"] == "Router Check"
+    assert any(row["employee_id"] == "NV01" for row in members.list_members())
+    members.save_schedule("NV01", "2026-09-21", "ON", "MORNING")
+    assert members.get_schedule("NV01", "2026-09-21", "MORNING")["work_status"] == "ON"
+    assert members.list_schedules("2026-09-21", "2026-09-21", "NV01")
+    members.update_member("NV01", {"full_name": "Router Renamed"})
+    assert members.get_member("NV01")["full_name"] == "Router Renamed"
+
+    attendance = AttendanceAPI(call)
+    assert attendance.list_attendance() == []
+    assert attendance.review_events() == []
+
+    rooms = RoomsAPI(call)
+    summary = rooms.status_summary()
+    assert summary["pending_events"] == 0 and summary["conflicts"] == 0
+    assert rooms.ai_status()["voice_enabled"] is True
+    assert rooms.conflicts() == []
+
+    members.delete_member("NV01")
+    assert members.get_member("NV01") is None
+
+
+def test_routers_reject_bad_token(live_backend):
+    import pytest as _pytest
+    from backend.app.api._http import ApiError, connect
+    from backend.app.api.rooms import RoomsAPI
+    base, _ = live_backend
+    with _pytest.raises(ApiError):
+        RoomsAPI(connect(base, "bogus-token")).diagnostics()
